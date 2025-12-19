@@ -169,3 +169,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+#slurm
+*.out
+slurm_logs/
+
+#wandb
+wandb/
+*.json

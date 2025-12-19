@@ -390,6 +390,16 @@ def main():
     args = parser.parse_args()
 
     print("JAX devices:", jax.devices())
+    print('env name:', args.env_name)
+    print('total timesteps:', args.total_timesteps)
+    print('batch size:', args.batch_size)
+    print('start timesteps:', args.start_timesteps)
+    print('exploration noise:', args.exploration_noise)
+    print('max action:', args.max_action)
+    print('seed:', args.seed)
+    print('log interval:', args.log_interval)
+    print('actor lr:', args.actor_lr)
+    print('critic lr:', args.critic_lr)
 
     cfg = Config(
         env_name=args.env_name,
@@ -417,11 +427,11 @@ def main():
             name=f"{cfg.env_name}-pixels-ddpg",
         )
 
-        writer = SummaryWriter(f"runs/{run_name}")
-        writer.add_text(
-            "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-        )
+        # writer = SummaryWriter(f"runs/{run_name}")
+        # writer.add_text(
+        #     "hyperparameters",
+        #     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        # )
 
 
     np.random.seed(cfg.seed)
@@ -568,12 +578,12 @@ def main():
                 "charts/buffer_size": replay_buffer.size,
             }
 
-            # wandb.log(log_data, step=global_step)
+            wandb.log(log_data, step=global_step)
 
-            # wandb.log({
-            #     "losses/critic_loss": float(critic_loss_val),
-            #     "losses/actor_loss": float(actor_loss_val),
-            # }, step=global_step)
+            wandb.log({
+                "losses/critic_loss": float(critic_loss_val),
+                "losses/actor_loss": float(actor_loss_val),
+            }, step=global_step)
 
             print(
                 f"step={global_step} "
