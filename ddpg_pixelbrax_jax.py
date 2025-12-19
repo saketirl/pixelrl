@@ -568,12 +568,12 @@ def main():
                 "charts/buffer_size": replay_buffer.size,
             }
 
-            wandb.log(log_data, step=global_step)
+            # wandb.log(log_data, step=global_step)
 
-            wandb.log({
-                "losses/critic_loss": float(critic_loss_val),
-                "losses/actor_loss": float(actor_loss_val),
-            }, step=global_step)
+            # wandb.log({
+            #     "losses/critic_loss": float(critic_loss_val),
+            #     "losses/actor_loss": float(actor_loss_val),
+            # }, step=global_step)
 
             print(
                 f"step={global_step} "

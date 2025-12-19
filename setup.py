@@ -23,7 +23,7 @@ from setuptools import find_packages
 from setuptools import setup
 import sys
 
-sys.path.insert(0, "/oscar/data/gdk/stiwari4/pixelenvs/pixelbrax/brax")
+sys.path.insert(0, "/users/apraka15/arjun/pixelrl/pixelbrax/brax")
 
 
 setup(
