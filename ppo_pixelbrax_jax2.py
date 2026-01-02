@@ -96,6 +96,14 @@ class Args:
     augment_pad: int = 4
     """Padding size for random shift augmentation"""
 
+    # Frame stacking
+    frame_stack: int = 4
+    """Number of frames to stack for temporal information"""
+
+    # Action repeat
+    action_repeat: int = 1
+    """Number of times to repeat each action (frame skip)"""
+
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -213,6 +221,80 @@ class EpisodeStatistics:
 
 
 @flax.struct.dataclass
+class FrameStack:
+    """
+    Frame stacking buffer for temporal information in pixel-based RL.
+    Stores the last N frames and provides stacked observations.
+    """
+    frames: jnp.ndarray  # Shape: (n_envs, num_frames, H, W, C)
+
+    @classmethod
+    def create(cls, n_envs: int, num_frames: int, obs_shape: tuple):
+        """Initialize frame stack with zeros."""
+        h, w, c = obs_shape
+        frames = jnp.zeros((n_envs, num_frames, h, w, c), dtype=jnp.uint8)
+        return cls(frames=frames)
+
+    def reset(self, obs: jnp.ndarray, done: jnp.ndarray = None):
+        """
+        Reset frame stack for environments that are done.
+        If done is None, reset all environments with the given observation.
+
+        Args:
+            obs: New observation of shape (n_envs, H, W, C)
+            done: Boolean mask of shape (n_envs,) indicating which envs to reset
+        """
+        # Stack the same observation num_frames times for reset
+        n_envs = obs.shape[0]
+        num_frames = self.frames.shape[1]
+        new_frames = jnp.broadcast_to(
+            obs[:, None, :, :, :],
+            (n_envs, num_frames, obs.shape[1], obs.shape[2], obs.shape[3])
+        )
+
+        if done is None:
+            return self.replace(frames=new_frames)
+        else:
+            # Only reset environments that are done
+            frames = jnp.where(
+                done[:, None, None, None, None],
+                new_frames,
+                self.frames
+            )
+            return self.replace(frames=frames)
+
+    def push(self, obs: jnp.ndarray):
+        """
+        Add a new frame to the stack, shifting out the oldest.
+
+        Args:
+            obs: New observation of shape (n_envs, H, W, C)
+
+        Returns:
+            Updated FrameStack
+        """
+        # Shift frames left (drop oldest) and add new frame at the end
+        new_frames = jnp.concatenate([
+            self.frames[:, 1:, :, :, :],
+            obs[:, None, :, :, :]
+        ], axis=1)
+        return self.replace(frames=new_frames)
+
+    def get_stacked(self) -> jnp.ndarray:
+        """
+        Get stacked observation by concatenating frames along channel dimension.
+
+        Returns:
+            Stacked observation of shape (n_envs, H, W, C * num_frames)
+        """
+        # Reshape from (n_envs, num_frames, H, W, C) to (n_envs, H, W, C * num_frames)
+        n_envs, num_frames, h, w, c = self.frames.shape
+        # Transpose to (n_envs, H, W, num_frames, C) then reshape
+        frames_transposed = jnp.transpose(self.frames, (0, 2, 3, 1, 4))
+        return frames_transposed.reshape(n_envs, h, w, c * num_frames)
+
+
+@flax.struct.dataclass
 class RewardNormalizer:
     """
     Reward normalization using discounted returns (CleanRL style).
@@ -285,6 +367,7 @@ def make_pixelbrax_envs(args):
         video_path="datasets/DAVIS",
         video_set="train",
         return_float32=False,
+        action_repeat=args.action_repeat,
     )
     
     try:
@@ -366,8 +449,13 @@ if __name__ == "__main__":
     # Get observation shape
     reset_rng = jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs)
     init_env_state = envs.reset(reset_rng)
-    obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
-    print(f"obs_shape: {obs_shape}")
+    raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
+    # Stacked observation shape: channels are multiplied by frame_stack
+    obs_shape = (raw_obs_shape[0], raw_obs_shape[1], raw_obs_shape[2] * args.frame_stack)
+    print(f"raw_obs_shape: {raw_obs_shape}")
+    print(f"frame_stack: {args.frame_stack}")
+    print(f"action_repeat: {args.action_repeat}")
+    print(f"obs_shape (with {args.frame_stack} stacked frames): {obs_shape}")
     
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
@@ -573,31 +661,40 @@ if __name__ == "__main__":
     # Start the game
     global_step = 0
     start_time = time.time()
-    
+
     # Reset environment
     key, reset_key = jax.random.split(key)
     reset_rngs = jax.random.split(reset_key, args.n_envs)
     env_state = envs.reset(reset_rngs)
-    next_obs = env_state.pixels
+
+    # Initialize frame stack with initial observation
+    frame_stack = FrameStack.create(args.n_envs, args.frame_stack, raw_obs_shape)
+    frame_stack = frame_stack.reset(env_state.pixels)  # Fill all frames with initial obs
+    next_obs = frame_stack.get_stacked()  # Get stacked observation
     next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
-    
+
     # Initialize reward normalizer (discounted return-based, like CleanRL)
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
     def step_once(carry, step):
-        agent_state, episode_stats, reward_norm, env_state, obs, done, key = carry
+        agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
-        
+
         # Step environment
         env_state = envs.step(env_state, action)
-        next_obs = env_state.pixels
+        raw_obs = env_state.pixels  # Raw single-frame observation
         raw_reward = env_state.reward
         next_done = env_state.done.astype(jnp.bool_)  # Ensure bool type
-        
+
+        # Update frame stack: push new frame, then reset for done envs
+        fs = fs.push(raw_obs)
+        fs = fs.reset(raw_obs, next_done)  # Reset done envs to copies of new obs
+        next_obs = fs.get_stacked()  # Get stacked observation
+
         # Update reward normalizer and normalize reward (discounted return-based)
         reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
         reward = reward_norm.normalize(raw_reward)
-        
+
         # Update episode statistics (use raw reward for tracking true returns)
         new_episode_return = episode_stats.episode_returns + raw_reward
         new_episode_length = episode_stats.episode_lengths + 1
@@ -612,7 +709,7 @@ if __name__ == "__main__":
                 next_done, new_episode_length, episode_stats.returned_episode_lengths
             ).astype(jnp.int32),
         )
-        
+
         storage = Storage(
             obs=obs,
             actions=action,
@@ -623,13 +720,13 @@ if __name__ == "__main__":
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
-        return (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage
+        return (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage
 
-    def rollout(agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key, max_steps):
-        (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage = jax.lax.scan(
-            step_once, (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), jnp.arange(max_steps)
+    def rollout(agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
+        (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage = jax.lax.scan(
+            step_once, (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), jnp.arange(max_steps)
         )
-        return agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, storage, key
+        return agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, storage, key
 
     rollout = partial(rollout, max_steps=args.num_steps)
     rollout = jax.jit(rollout)
@@ -637,8 +734,8 @@ if __name__ == "__main__":
     print("Starting training...")
     for iteration in range(1, args.num_updates + 1):
         iteration_time_start = time.time()
-        agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, storage, key = rollout(
-            agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, key
+        agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, storage, key = rollout(
+            agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, key
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
