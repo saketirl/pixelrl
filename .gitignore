@@ -170,6 +170,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# cleanrl reference
+clean_rl_reference/
+
 #slurm
 *.out
 slurm_logs/

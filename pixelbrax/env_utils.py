@@ -64,7 +64,6 @@ def make_pixel_brax(
     alpha=0.5,
     action_repeat=1,
     return_float32=True,
-    experimental=False
 ):
     assert backend in ["generalized", "positional", "spring"]
     assert video_set in ["train", "test"]
@@ -238,8 +237,7 @@ def make_pixel_brax(
         """An object to be rendered in the scene.
 
         Assume the system is unchanged throughout the rendering.
-
-        col is accessed from the batched geoms `sys.geoms`, representing one geom.
+        Geometry data is accessed via sys.mj_model.geom_* attributes.
         """
 
         
@@ -251,91 +249,6 @@ def make_pixel_brax(
         """col.transform.rot"""
         instance: Optional[Instance] = None
         """An instance to be rendered in the scene, defined by jaxrenderer."""
-
-    @jax.jit
-    def _build_objects(sys: brax.System) -> list[Obj]:
-        """
-        Converts a brax System to a list of Obj.
-
-        Args:
-          sys:
-
-        Returns:
-
-        """
-        objs: list[Obj] = []
-
-        def take_i(obj, i):
-            return jax.tree_map(lambda x: jnp.take(x, i, axis=0), obj)
-
-        testing = []
-        for batch in sys.geoms:
-            num_geoms = len(batch.friction)
-            inner = []
-            for i in range(num_geoms):
-                inner.append(take_i(batch, i))
-            testing.append(inner)
-
-        for geom in testing:
-            for col in geom:
-                tex = col.rgba[:3].reshape((1, 1, 3))
-                # reference: https://github.com/erwincoumans/tinyrenderer/blob/89e8adafb35ecf5134e7b17b71b0f825939dc6d9/model.cpp#L215
-                specular_map = jax.lax.full(tex.shape[:2], 2.0)
-
-                if isinstance(col, base.Capsule):
-                    half_height = col.length / 2
-                    model = create_capsule(
-                        radius=col.radius,
-                        half_height=half_height,
-                        up_axis=UpAxis.Z,
-                        diffuse_map=tex,
-                        specular_map=specular_map,
-                    )
-                elif isinstance(col, base.Box):
-                    model = create_cube(
-                        half_extents=col.halfsize,
-                        diffuse_map=tex,
-                        texture_scaling=jnp.array(16.0),
-                        specular_map=specular_map,
-                    )
-                elif isinstance(col, base.Sphere):
-                    model = create_capsule(
-                        radius=col.radius,
-                        half_height=jnp.array(0.0),
-                        up_axis=UpAxis.Z,
-                        diffuse_map=tex,
-                        specular_map=specular_map,
-                    )
-                elif isinstance(col, base.Plane):
-                    tex = _GROUND
-                    model = create_cube(
-                        half_extents=jnp.array([1000.0, 1000.0, 0.0001]),
-                        diffuse_map=tex,
-                        texture_scaling=jnp.array(8192.0),
-                        specular_map=specular_map,
-                    )
-                elif isinstance(col, base.Convex):
-                    # convex objects are not visual
-                    continue
-                elif isinstance(col, base.Mesh):
-                    tm = trimesh.Trimesh(vertices=col.vert, faces=col.face)
-                    model = RendererMesh.create(
-                        verts=tm.vertices,
-                        norms=tm.vertex_normals,
-                        uvs=jnp.zeros((tm.vertices.shape[0], 2), dtype=int),
-                        faces=tm.faces,
-                        diffuse_map=tex,
-                    )
-                else:
-                    raise RuntimeError(f"unrecognized collider: {type(col)}")
-
-                i: int = col.link_idx if col.link_idx is not None else -1
-                instance = Instance(model=model)
-                off = col.transform.pos
-                rot = col.transform.rot
-                obj = Obj(instance=instance, link_idx=i, off=off, rot=rot)
-                objs.append(obj)
-        return objs
 
     def _with_state(objs: Iterable[Obj], x: brax.Transform) -> list[Instance]:
         """x must have at least 1 element. This can be ensured by calling
@@ -517,18 +430,11 @@ def make_pixel_brax(
     def render_pixels(sys: brax.System, pipeline_states: brax.State):
         # (1) grab the cameras and the view targets. The camera object contains its own view target
         # the extra bit we grab with _get_targets() is only used to render shadows. Maybe we can remove?
-        # print(f'Within render pixels')
-
-        # The "current_frame" arg is meant to work for the "video distractor" case
         batched_camera = _get_cameras(sys, pipeline_states)
-        # print(f'after batched_camera')
         batched_target = _get_targets(pipeline_states)
-        # print(f'after batched_target')
-        objs = _build_objects(sys)
-        # print(f'after _build_objects')
+        # Use the MuJoCo-based geometry building (compatible with brax v0.12.1)
+        objs = _build_objects_experimental(sys, pipeline_states)
         images = _render(objs, pipeline_states, batched_camera, batched_target)
-        # print(f'after _render')
-        # return None
         return images
 
     @struct.dataclass
@@ -773,117 +679,113 @@ def make_pixel_brax(
         return model, rot, off
 
 
-    @jax.jit
     def _build_objects_experimental(sys: brax.System, pipeline_states: brax.State) -> list[Obj]:
         """
-        Converts a brax System to a list of Obj.
+        Converts a brax System to a list of Obj using MuJoCo model attributes.
 
-        Args:
-          sys:
-
-        Returns:
-
+        This builds one renderable object per geometry in the system.
+        The batching across environments is handled by vmap in the rendering pipeline.
         """
-
         objs: list[Obj] = []
 
-        def take_i(obj, i):
-            return jax.tree_map(lambda x: jnp.take(x, i, axis=0), obj)
-
-        # Loop through each geom type (sys.mj_model.geom_type) in the list of the
-        # environment's geoms. Within each step in the loop, loop over each of the
-        # batched envs, create the N geoms (N = num of parallel envs) in a list
-        # final outer list is len of ngeom, and len of each inner list is len of
-        # N.
-
-        # print(f"dof_parentid: {sys.dof_parentid} // {sys.dof_parentid.shape}")
-        #print(f"bbox: {sys.geom_size} // {sys.geom_size.shape}")
-        # qqq
-        # cuboid.verts
         for idx, geom_id in enumerate(sys.mj_model.geom_type):
-            print(f"geom_id: {geom_id}")
             tex = sys.mj_model.geom_rgba[idx, :3].reshape((1, 1, 3))
-            # reference: https://github.com/erwincoumans/tinyrenderer/blob/89e8adafb35ecf5134e7b17b71b0f825939dc6d9/model.cpp#L215
             specular_map = jax.lax.full(tex.shape[:2], 2.0)
 
-            # Can we use the idx from sys.geom_bodyid to query sys.body_parentid?
-            # link_idx = sys.body_parentid[sys.geom_bodyid[idx] - 1]
-
-            # copying this thing:
-            # https://github.com/google/brax/blob/main/brax/io/json.py#L129
+            # Get link index (body 0 is world, so subtract 1)
             link_idx = sys.geom_bodyid[idx] - 1
 
-            # TODO: temporary for dev. remove when done
-            if geom_id in [0, 1, 2, 3, 4, 5, 6, 7]:  # [0, 1, 2, 3]:
-                model, rot, off = _vmap_build(
-                    sys,
-                    pipeline_states,
-                    specular_map,
-                    tex,
-                    geom_id,
-                    idx,
-                    # sys.geom_bodyid[idx],
+            # Get position and rotation from system
+            off = sys.geom_pos[idx]
+            rot = sys.geom_quat[idx]
+
+            model = None
+
+            # Plane
+            if geom_id == 0:
+                model = create_cube(
+                    half_extents=jnp.array([1000.0, 1000.0, 0.0001]),
+                    texture_scaling=jnp.array(8192.0),
+                    diffuse_map=_GROUND,
+                    specular_map=specular_map,
+                )
+            # Sphere
+            elif geom_id == 2:
+                radius = sys.mj_model.geom_size[idx][0]
+                model = create_capsule(
+                    radius=radius,
+                    half_height=jnp.array(0.0),
+                    up_axis=UpAxis.Z,
+                    diffuse_map=tex,
+                    specular_map=specular_map,
+                )
+            # Capsule
+            elif geom_id == 3:
+                radius = sys.mj_model.geom_size[idx][0]
+                half_height = sys.mj_model.geom_size[idx][1]
+                model = create_capsule(
+                    radius=radius,
+                    half_height=half_height,
+                    up_axis=UpAxis.Z,
+                    diffuse_map=tex,
+                    specular_map=specular_map,
+                )
+            # Box
+            elif geom_id == 6:
+                half_extents = sys.mj_model.geom_size[idx]
+                model = create_cube(
+                    half_extents=half_extents,
+                    diffuse_map=tex,
+                    texture_scaling=jnp.array(16.0),
+                    specular_map=specular_map,
+                )
+            # Mesh
+            elif geom_id == 7:
+                mesh_idx = sys.mj_model.geom_dataid[idx]
+                last_mesh = (mesh_idx + 1) >= sys.mj_model.nmesh
+                vert_idx_start = sys.mj_model.mesh_vertadr[mesh_idx]
+                vert_idx_end = (
+                    sys.mj_model.mesh_vertadr[mesh_idx + 1]
+                    if not last_mesh
+                    else sys.mj_model.mesh_vert.shape[0]
+                )
+                vertices = sys.mj_model.mesh_vert[vert_idx_start:vert_idx_end]
+
+                face_idx_start = sys.mj_model.mesh_faceadr[mesh_idx]
+                face_idx_end = (
+                    sys.mj_model.mesh_faceadr[mesh_idx + 1]
+                    if not last_mesh
+                    else sys.mj_model.mesh_face.shape[0]
+                )
+                faces = sys.mj_model.mesh_face[face_idx_start:face_idx_end]
+
+                # Use material color if available
+                material_id = sys.mj_model.geom_matid[idx]
+                if material_id >= 0:
+                    tex = sys.mj_model.mat_rgba[material_id][:3].reshape((1, 1, 3))
+
+                # Compute normals
+                face_normals, _triangles = compute_face_normals_and_triangles(vertices, faces)
+                face_angles = compute_face_angles(_triangles)
+                vertex_normals = compute_vertex_normals(
+                    vertices, faces, face_normals, face_angles
                 )
 
-                outs = [
-                    (
-                        Instance(model=jax.tree_map(lambda x: x[i], model)),
-                        jax.tree_map(lambda x: x[i], rot),
-                        jax.tree_map(lambda x: x[i], off),
-                    )
-                    for i in range(model.verts.shape[0])
-                ]
+                model = RendererMesh.create(
+                    verts=vertices,
+                    norms=vertex_normals,
+                    uvs=jnp.zeros((vertices.shape[0], 2), dtype=int),
+                    faces=faces,
+                    diffuse_map=tex,
+                )
 
-                print(f"outs: {type(outs)} // {len(outs)}")
-                outs = [
-                    Obj(instance=instance, link_idx=link_idx, rot=rot, off=off)
-                    for (instance, rot, off) in outs
-                ]
-            else:
-                outs = []
-
-            objs.extend(outs)
+            if model is not None:
+                instance = Instance(model=model)
+                obj = Obj(instance=instance, link_idx=link_idx, off=off, rot=rot)
+                objs.append(obj)
 
         return objs
 
-    def build_objects_for_cache(sys: brax.System, n_envs: int):
-        objs = _build_objects(sys)
-
-        # we now have a list of Obj(), but they are not t"``racedarrays
-        jax_objs = []
-        for obj in objs:
-            #print(f"bool: {obj.instance.double_sided}")
-            #print(obj.instance.double_sided.shape)
-            #print(len(obj.instance.double_sided.shape) > 0)
-            obj = Obj(link_idx=obj.link_idx, off=obj.off, rot=obj.rot, instance=obj.instance._replace(double_sided=jnp.array(obj.instance.double_sided).reshape(1,)))
-            #obj = obj.replace(instance=obj.instance._replace(double_sided=jnp.array(obj.instance.double_sided).reshape(1,)))
-            #obj.instance = obj.instance._replace(double_sided = jnp.array(obj.instance.double_sided).reshape(1,))
-            jax_objs.append(jax.tree_map(lambda x: jnp.array(x), obj))
-            #print(f"bool: {obj.instance.double_sided}")
-            #print(obj.instance.double_sided.shape)
-            #qqq
-            # try:
-            #    print(
-            #        f"{jax_objs[-1].instance.model.verts.shape} // {jax_objs[-1].instance.model.faces.shape}"
-            #    )
-            # except:
-            #    print("This one has no verts...")
-            #    print(jax_objs[-1])
-            #    qqq
-        
-        vmappable_objs = Obj(
-            #instance=jax.tree_map(lambda *x: jnp.concatenate([jnp.expand_dims(_x, 0) for _x in x], axis=0), *zip([i.instance for i in jax_objs]))[0],
-            rot=jnp.concatenate([x.rot[None] for x in jax_objs], axis=0),
-            off=jnp.concatenate([x.off[None] for x in jax_objs], axis=0),
-            link_idx=jnp.concatenate(
-                [jnp.array(x.link_idx)[None] for x in jax_objs], axis=0
-            ),
-        )
-        #print(f"new instances: {vmappable_objs.instance.transform.shape}")
-        #qqq
-
-        return jax_objs, vmappable_objs
-    
     def get_camera_experimental(
         state: brax.State,
         width: int,
@@ -976,164 +878,6 @@ def make_pixel_brax(
 
 
 
-    class PixelEnvExperimental(PipelineEnv):
-        def __init__(self, env):
-            super().__init__(sys=env.sys, backend=env.backend)
-            self.env = env
-            self.seed = ret
-            self._reset_fn = jax.jit(jax.vmap(env.reset))
-            self._step_fn = jax.jit(jax.vmap(env.step))
-
-            #self.cached_objects, self.vmappable_objects = build_objects_for_cache(
-            #    self.env.sys, n_envs
-            #)
-
-        @property
-        def action_size(self):
-            return self.env.action_size
-
-        @property
-        def observation_sample(self):
-            return jnp.zeros(
-                (hw, hw, 9), dtype=jnp.float32 if return_float32 else jnp.uint8
-            )
-
-        @property
-        def observation_size(self):
-            return self.env.observation_size
-
-        @property
-        def max_episode_steps(self):
-            return 1000
-
-        def reset(self, rng: jax.Array):
-            raw_state = self._reset_fn(rng)
-
-            # This is only used for the video distractors. This API design is kinda gross, but oh well...
-            video_idx = jax.random.choice(
-                rng[0], jnp.arange(start=0, stop=len(BG_FRAMES)), shape=(n_envs,)
-            )
-
-            #frames = render_pixels_with_cached_objs(
-            #    raw_state.pipeline_state,
-            #    self.cached_objects,
-            #    self.vmappable_objects,
-            #    hw,
-            #)
-            frames = jax.vmap(image.render_array, in_axes=(None, 0, None, None))(self.sys, raw_state.pipeline_state, hw, hw)
-            print("here...")
-            qqq
-
-            if distractor == "colors":
-                # When doing color distractions, we want a singular value for each color channel [R,G,B]. However,
-                # we also want a different initial color for each of the environments
-                if return_float32:
-                    noise = jax.random.uniform(
-                        key=rng[0], shape=(n_envs, 1, 1, 3), minval=-0.3, maxval=0.3
-                    )
-                    _frames = jnp.clip(frames + noise, a_min=0.0, a_max=1.0)
-                else:
-                    noise = jax.random.uniform(
-                        key=rng[0],
-                        shape=(n_envs, 1, 1, 3),
-                        minval=-0.3 * 255,
-                        maxval=0.3 * 255,
-                    ).astype(jnp.int8)
-                    _frames = jnp.clip(frames + noise, a_min=0, a_max=255).astype(
-                        jnp.uint8
-                    )
-
-                video_idx = jnp.zeros(shape=(n_envs,), dtype=jnp.int8)
-
-            elif distractor == "videos":
-                if return_float32:
-                    frames = alpha * frames + (1 - alpha) * (
-                        BG_FRAMES[video_idx][:, 0] / 255.0
-                    )
-                else:
-                    frames = (
-                        alpha * frames + (1 - alpha) * BG_FRAMES[video_idx][:, 0]
-                    ).astype(jnp.uint8)
-
-            else:
-                video_idx = jnp.zeros(shape=(n_envs,), dtype=jnp.int8)
-
-            _frames = jnp.concatenate([frames, frames, frames], axis=-1)
-
-            return State(
-                raw_state.pipeline_state,
-                raw_state.obs,
-                _frames,
-                raw_state.reward,
-                raw_state.done,
-                rng,
-                jnp.zeros(shape=(n_envs,), dtype=jnp.int8),
-                video_idx,
-                raw_state.metrics,
-                raw_state.info,
-            )
-
-        def step(self, states, actions):
-            raw_next_states = self._step_fn(states, actions)
-            frame_idx = states.frame_idx
-
-            next_frames = render_pixels_with_cached_objs(
-                raw_next_states.pipeline_state,
-                self.cached_objects,
-                self.vmappable_objects,
-                hw,
-            )
-
-            if not return_float32:
-                next_frames = (next_frames * 255).astype(jnp.uint8)
-
-            if distractor == "colors":
-                key = jax.vmap(jax.random.split)(states.key)[:, 0]
-                # noise = jax.random.uniform(key=key[0], shape=(n_envs, 1, 1, 3), minval=-0.3, maxval=0.3)
-                if return_float32:
-                    noise = jax.random.normal(key=key[0], shape=(n_envs, 1, 1, 3)) * 0.3
-                    next_frames = jnp.clip(next_frames + noise, a_min=0.0, a_max=1.0)
-                else:
-                    noise = (
-                        jax.random.normal(key=key[0], shape=(n_envs, 1, 1, 3))
-                        * 0.3
-                        * 255
-                    ).astype(jnp.int8)
-                    next_frames = jnp.clip(
-                        next_frames + noise, a_min=0, a_max=255
-                    ).astype(jnp.uint8)
-
-            elif distractor == "videos":
-                frame_idx = (states.frame_idx + 1) % VIDEO_LEN
-                if return_float32:
-                    next_frames = alpha * next_frames + (1 - alpha) * (
-                        BG_FRAMES[states.video_idx, frame_idx] / 255.0
-                    )
-                else:
-                    next_frames = (
-                        alpha * next_frames
-                        + (1 - alpha) * BG_FRAMES[states.video_idx, frame_idx]
-                    ).astype(jnp.uint8)
-                key = states.key
-            else:
-                key = states.key
-
-            next_frames = jnp.concatenate(
-                [states.pixels[:, :, :, 3:], next_frames], axis=-1
-            )
-
-            return states.replace(
-                pipeline_state=raw_next_states.pipeline_state,
-                obs=raw_next_states.obs,
-                reward=raw_next_states.reward,
-                done=raw_next_states.done,
-                pixels=next_frames,
-                info=raw_next_states.info,
-                key=key,
-                frame_idx=frame_idx.astype(jnp.int8),
-            )
-
-
     class PixelEnv(PipelineEnv):
         def __init__(self, env):
             super().__init__(sys=env.sys, backend=env.backend)
@@ -1169,9 +913,7 @@ def make_pixel_brax(
                 rng[0], jnp.arange(start=0, stop=len(BG_FRAMES)), shape=(n_envs,)
             )
 
-            frames = render_pixels(
-                self.env.sys.replace(dt=self.env.dt), raw_state.pipeline_state
-            )
+            frames = render_pixels(self.env.sys, raw_state.pipeline_state)
             if not return_float32:
                 frames = (frames * 255).astype(jnp.uint8)
 
@@ -1230,9 +972,7 @@ def make_pixel_brax(
 
             frame_idx = states.frame_idx
 
-            next_frames = render_pixels(
-                self.env.sys.replace(dt=self.env.dt), raw_next_states.pipeline_state
-            )
+            next_frames = render_pixels(self.env.sys, raw_next_states.pipeline_state)
             if not return_float32:
                 next_frames = (next_frames * 255).astype(jnp.uint8)
 
@@ -1282,10 +1022,7 @@ def make_pixel_brax(
                 frame_idx=frame_idx.astype(jnp.int8),
             )
     
-    if not experimental:
-        return PixelEnv(env), PixelEnv(env).reset(ret), ret
-    else:
-        return PixelEnvExperimental(env), PixelEnvExperimental(env).reset(ret), ret
+    return PixelEnv(env), PixelEnv(env).reset(ret), ret
 
 
 # adapted from https://github.com/openai/baselines/blob/master/baselines/common/vec_env/vec_normalize.py

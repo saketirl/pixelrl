@@ -1,0 +1,3 @@
+[submodule "pixelbrax/brax"]
+	path = pixelbrax/brax
+	url = https://github.com/google/brax.git

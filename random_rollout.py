@@ -4,7 +4,7 @@ import csv
 import jax
 import jax.numpy as jnp
 from functools import partial
-from clean_rl_reference.pure_jax_wrapper import BraxGymnaxWrapper
+from pure_jax_wrapper import BraxGymnaxWrapper
 
 
 def random_rollout(
