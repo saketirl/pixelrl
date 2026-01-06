@@ -1,79 +1,62 @@
 #!/usr/bin/env python
-"""
-PPO for PixelBrax environments with pixel observations.
-Adapted from pure JAX PPO implementation to work with pixelbrax.
-"""
 
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
-import numpy as np
-import optax
-from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any
-from flax.training.train_state import TrainState
-import distrax
 import argparse
 import time
+from typing import NamedTuple, Any
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.training.train_state import TrainState
+from flax.linen.initializers import constant, orthogonal
+import optax
+import distrax
 import wandb
 
 import sys
 sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/brax")
-import pixelbrax
+import pixelbrax  # pip install . in the pixelbrax repo
 from pixelbrax.env_utils import make_pixel_brax
 
+
+# --------------------------------------------------------
+#  Actor/Critic network for pixel observations
+# --------------------------------------------------------
 
 class PixelActorCritic(nn.Module):
     """CNN-based Actor-Critic for pixel observations."""
     action_dim: int
-    activation: str = "relu"
 
     @nn.compact
     def __call__(self, x):
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
-            
-        # x: (B, H, W, C) uint8 or float - normalize to [0, 1]
+        # x: (B, H, W, C) uint8 or float
         x = x.astype(jnp.float32) / 255.0
-        
-        # CNN encoder
-        x = nn.Conv(features=32, kernel_size=(8, 8), strides=(4, 4),
-                    kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        x = nn.Conv(features=64, kernel_size=(4, 4), strides=(2, 2),
-                    kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1),
-                    kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        
+
+        # CNN encoder (shared between actor and critic)
+        x = nn.Conv(features=32, kernel_size=(8, 8), strides=(4, 4))(x)
+        x = nn.relu(x)
+        x = nn.Conv(features=64, kernel_size=(4, 4), strides=(2, 2))(x)
+        x = nn.relu(x)
+        x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1))(x)
+        x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))  # flatten
-        
+
         # Shared dense layer
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+
         # Actor head
-        actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        actor_mean = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_mean)
+        actor_logstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         # Critic head
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        critic = nn.relu(critic)
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
 
         return pi, jnp.squeeze(critic, axis=-1)
 
@@ -85,17 +68,20 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    # Episode tracking
+    episode_return: jnp.ndarray  # cumulative return at this step
+    episode_length: jnp.ndarray  # cumulative length at this step
 
 
-def make_train(config):
-    config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-    config["MINIBATCH_SIZE"] = (
-        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
-    
-    # Create pixelbrax environment
+# --------------------------------------------------------
+#  PixelBrax env wrapper
+# --------------------------------------------------------
+
+def make_pixelbrax_envs(config):
+    """
+    Create PixelBrax environments.
+    Returns envs and action_dim.
+    """
     envs, _, _ = make_pixel_brax(
         backend=config["BACKEND"],
         env_name=config["ENV_NAME"],
@@ -107,11 +93,30 @@ def make_train(config):
         video_set="train",
         return_float32=False,
     )
-    
+
     try:
         action_dim = envs.action_size
     except AttributeError:
         action_dim = envs.env.action_size
+
+    return envs, action_dim
+
+
+# --------------------------------------------------------
+#  Pure JAX PPO Training
+# --------------------------------------------------------
+
+def make_train(config, envs, action_dim, obs_shape):
+    """Create the pure JAX training function."""
+
+    config["NUM_UPDATES"] = (
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    config["MINIBATCH_SIZE"] = (
+        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+    )
+
+    network = PixelActorCritic(action_dim=action_dim)
 
     def linear_schedule(count):
         frac = (
@@ -123,14 +128,10 @@ def make_train(config):
 
     def train(rng):
         # INIT NETWORK
-        network = PixelActorCritic(
-            action_dim, activation=config["ACTIVATION"]
-        )
         rng, _rng = jax.random.split(rng)
-        # Dummy obs for initialization: (1, H, W, C)
-        init_x = jnp.zeros((1, config["HW"], config["HW"], 9))  # 3 frames * 3 channels
-        network_params = network.init(_rng, init_x)
-        
+        dummy_obs = jnp.zeros((1,) + obs_shape, dtype=jnp.float32)
+        network_params = network.init(_rng, dummy_obs)
+
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -151,41 +152,57 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         env_state = envs.reset(reset_rng)
-        obsv = env_state.pixels  # (NUM_ENVS, H, W, C)
+        obs = env_state.pixels  # (n_envs, H, W, C)
+
+        # Initialize episode tracking
+        episode_returns = jnp.zeros(config["NUM_ENVS"])
+        episode_lengths = jnp.zeros(config["NUM_ENVS"])
 
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, update_idx):
+            train_state, env_state, last_obs, episode_returns, episode_lengths, rng = runner_state
+
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, rng = runner_state
+                train_state, env_state, last_obs, episode_returns, episode_lengths, rng = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
-                
-                # Clip actions
-                action = jnp.clip(action, -1.0, 1.0)
+
+                # Clip action
+                action = jnp.clip(action, -config["MAX_ACTION"], config["MAX_ACTION"])
 
                 # STEP ENV
                 env_state = envs.step(env_state, action)
-                obsv = env_state.pixels
+                next_obs = env_state.pixels
                 reward = env_state.reward
                 done = env_state.done
-                
+
+                # Update episode tracking
+                episode_returns = episode_returns + reward
+                episode_lengths = episode_lengths + 1
+
                 transition = Transition(
-                    done, action, value, reward, log_prob, last_obs
+                    done, action, value, reward, log_prob, last_obs,
+                    episode_returns, episode_lengths
                 )
-                runner_state = (train_state, env_state, obsv, rng)
+
+                # Reset episode stats where done
+                episode_returns = jnp.where(done, 0.0, episode_returns)
+                episode_lengths = jnp.where(done, 0, episode_lengths)
+
+                runner_state = (train_state, env_state, next_obs, episode_returns, episode_lengths, rng)
                 return runner_state, transition
 
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+                _env_step, (train_state, env_state, last_obs, episode_returns, episode_lengths, rng), None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, rng = runner_state
+            train_state, env_state, last_obs, episode_returns, episode_lengths, rng = runner_state
             _, last_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -216,7 +233,7 @@ def make_train(config):
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
-                def _update_minbatch(train_state, batch_info):
+                def _update_minibatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
 
                     def _loss_fn(params, traj_batch, gae, targets):
@@ -285,7 +302,7 @@ def make_train(config):
                     shuffled_batch,
                 )
                 train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                    _update_minibatch, train_state, minibatches
                 )
                 update_state = (train_state, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
@@ -295,132 +312,194 @@ def make_train(config):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
-            
-            # Collect metrics
-            metric = {
-                "reward": traj_batch.reward,
-                "done": traj_batch.done,
-            }
-            
             rng = update_state[-1]
-            if config.get("DEBUG"):
-                def callback(metric):
-                    # Calculate episode returns from rewards and dones
-                    rewards = metric["reward"]  # (NUM_STEPS, NUM_ENVS)
-                    dones = metric["done"]
-                    
-                    # Sum rewards per step across all envs
-                    mean_reward = jnp.mean(rewards)
-                    num_dones = jnp.sum(dones)
-                    
-                    jax.debug.print(
-                        "mean_step_reward={mean_reward}, num_episode_ends={num_dones}",
-                        mean_reward=mean_reward,
-                        num_dones=num_dones,
+
+            # Compute metrics for logging
+            total_loss = loss_info[0].mean()
+            value_loss = loss_info[1][0].mean()
+            actor_loss = loss_info[1][1].mean()
+            entropy = loss_info[1][2].mean()
+
+            # Compute global step
+            global_step = (update_idx + 1) * config["NUM_STEPS"] * config["NUM_ENVS"]
+
+            # Extract completed episode returns
+            # traj_batch.done: (num_steps, num_envs)
+            # traj_batch.episode_return: (num_steps, num_envs) - return at moment of done
+            done_mask = traj_batch.done  # episodes that completed
+            completed_returns = jnp.where(done_mask, traj_batch.episode_return, jnp.nan)
+            completed_lengths = jnp.where(done_mask, traj_batch.episode_length, jnp.nan)
+
+            # Count completed episodes and compute mean (handle case with no completions)
+            num_completed = done_mask.sum()
+            mean_episode_return = jnp.nanmean(completed_returns)
+            mean_episode_length = jnp.nanmean(completed_lengths)
+
+            metric = {
+                "global_step": global_step,
+                "mean_episode_return": mean_episode_return,
+                "mean_episode_length": mean_episode_length,
+                "num_completed_episodes": num_completed,
+                "mean_reward": traj_batch.reward.mean(),
+                "mean_value": traj_batch.value.mean(),
+                "total_loss": total_loss,
+                "value_loss": value_loss,
+                "actor_loss": actor_loss,
+                "entropy": entropy,
+                "update_idx": update_idx,
+            }
+
+            # Logging callback
+            def callback(metric):
+                update_idx = metric["update_idx"]
+                if update_idx % config["LOG_INTERVAL"] == 0:
+                    global_step = int(metric["global_step"])
+                    mean_ep_return = float(metric["mean_episode_return"])
+                    mean_ep_length = float(metric["mean_episode_length"])
+                    num_completed = int(metric["num_completed_episodes"])
+
+                    print(
+                        f"update={update_idx} step={global_step} "
+                        f"ep_return={mean_ep_return:.1f} "
+                        f"ep_len={mean_ep_length:.0f} "
+                        f"completed={num_completed} "
+                        f"loss={float(metric['total_loss']):.4f}"
                     )
 
-                jax.debug.callback(callback, metric)
+                    if config.get("TRACK"):
+                        wandb.log({
+                            "global_step": global_step,
+                            "charts/episodic_return": mean_ep_return,
+                            "charts/episodic_length": mean_ep_length,
+                            "charts/num_completed_episodes": num_completed,
+                            "charts/mean_reward": float(metric["mean_reward"]),
+                            "charts/mean_value": float(metric["mean_value"]),
+                            "losses/total_loss": float(metric["total_loss"]),
+                            "losses/actor_loss": float(metric["actor_loss"]),
+                            "losses/value_loss": float(metric["value_loss"]),
+                            "losses/entropy": float(metric["entropy"]),
+                        }, step=global_step)
 
-            runner_state = (train_state, env_state, last_obs, rng)
+            jax.debug.callback(callback, metric)
+
+            runner_state = (train_state, env_state, last_obs, episode_returns, episode_lengths, rng)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+        runner_state = (train_state, env_state, obs, episode_returns, episode_lengths, _rng)
+        runner_state, metrics = jax.lax.scan(
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state, "metrics": metric}
+        return {"runner_state": runner_state, "metrics": metrics}
 
     return train
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-name", type=str, default="halfcheetah")
     parser.add_argument("--backend", type=str, default="spring")
     parser.add_argument("--n-envs", type=int, default=64)
     parser.add_argument("--hw", type=int, default=84)
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--total-timesteps", type=int, default=10_000_000)
+    parser.add_argument("--num-steps", type=int, default=128)
+    parser.add_argument("--num-minibatches", type=int, default=4)
+    parser.add_argument("--update-epochs", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--num-steps", type=int, default=128)
-    parser.add_argument("--update-epochs", type=int, default=4)
-    parser.add_argument("--num-minibatches", type=int, default=4)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=0.0)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--max-action", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--anneal-lr", action="store_true", default=False)
-    parser.add_argument("--activation", type=str, default="relu")
-    parser.add_argument("--debug", action="store_true", default=False)
-    parser.add_argument("--track", action="store_true", default=False)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--anneal-lr", action="store_true")
+    parser.add_argument("--track", action="store_true")
     args = parser.parse_args()
-    
+
     print("JAX devices:", jax.devices())
-    
+    print('env name:', args.env_name)
+    print('total timesteps:', args.total_timesteps)
+    print('num steps per rollout:', args.num_steps)
+    print('num envs:', args.n_envs)
+    print('learning rate:', args.learning_rate)
+    print('seed:', args.seed)
+
     config = {
-        "LR": args.lr,
+        "ENV_NAME": args.env_name,
+        "BACKEND": args.backend,
         "NUM_ENVS": args.n_envs,
+        "HW": args.hw,
+        "TOTAL_TIMESTEPS": args.total_timesteps,
         "NUM_STEPS": args.num_steps,
-        "TOTAL_TIMESTEPS": int(args.total_timesteps),
-        "UPDATE_EPOCHS": args.update_epochs,
         "NUM_MINIBATCHES": args.num_minibatches,
+        "UPDATE_EPOCHS": args.update_epochs,
+        "LR": args.learning_rate,
         "GAMMA": args.gamma,
         "GAE_LAMBDA": args.gae_lambda,
         "CLIP_EPS": args.clip_eps,
         "ENT_COEF": args.ent_coef,
         "VF_COEF": args.vf_coef,
         "MAX_GRAD_NORM": args.max_grad_norm,
-        "ACTIVATION": args.activation,
-        "ENV_NAME": args.env_name,
-        "BACKEND": args.backend,
-        "HW": args.hw,
+        "MAX_ACTION": args.max_action,
         "SEED": args.seed,
+        "LOG_INTERVAL": args.log_interval,
         "ANNEAL_LR": args.anneal_lr,
-        "DEBUG": args.debug,
+        "TRACK": args.track,
     }
-    
-    print("Config:")
-    for k, v in config.items():
-        print(f"  {k}: {v}")
-    
+
+    # Compute derived values
+    num_updates = config["TOTAL_TIMESTEPS"] // (config["NUM_STEPS"] * config["NUM_ENVS"])
+    minibatch_size = (config["NUM_ENVS"] * config["NUM_STEPS"]) // config["NUM_MINIBATCHES"]
+
+    print(f"num_updates: {num_updates}")
+    print(f"minibatch_size: {minibatch_size}")
+
     if args.track:
         wandb.init(
             project="benchmark",
             config=config,
             name=f"{config['ENV_NAME']}-pixels-ppo",
         )
-    
-    rng = jax.random.PRNGKey(args.seed)
-    
+
+    np.random.seed(config["SEED"])
+
+    # Create environments
+    envs, action_dim = make_pixelbrax_envs(config)
+    print(f"action_dim: {action_dim}")
+
+    # Get observation shape from a test reset
+    test_rng = jax.random.split(jax.random.PRNGKey(0), config["NUM_ENVS"])
+    test_state = envs.reset(test_rng)
+    obs_shape = test_state.pixels.shape[1:]  # (H, W, C)
+    print(f"obs_shape: {obs_shape}")
+
+    # Create training function
+    train_fn = make_train(config, envs, action_dim, obs_shape)
+
+    # JIT compile
+    print("JIT compiling training function...")
     t0 = time.time()
-    train_fn = make_train(config)
     train_jit = jax.jit(train_fn)
-    
-    print("Compiling...")
+
+    # Run training
+    rng = jax.random.PRNGKey(config["SEED"])
+    print("Starting training...")
     out = train_jit(rng)
-    
-    # Block until computation is done
+
+    # Block until done
     jax.block_until_ready(out)
-    
+
     elapsed = time.time() - t0
     total_steps = config["TOTAL_TIMESTEPS"]
-    print(f"Training finished in {elapsed:.1f}s")
-    print(f"Steps per second: {total_steps / elapsed:.0f}")
-    
-    # Log final metrics
+    print(f"\nTraining finished in {elapsed:.1f}s")
+    print(f"Average SPS: {total_steps / elapsed:.0f}")
+
     if args.track:
-        metrics = out["metrics"]
-        # metrics["reward"] has shape (NUM_UPDATES, NUM_STEPS, NUM_ENVS)
-        mean_rewards = jnp.mean(metrics["reward"], axis=(1, 2))  # (NUM_UPDATES,)
-        
-        for i, mean_rew in enumerate(mean_rewards):
-            step = (i + 1) * config["NUM_STEPS"] * config["NUM_ENVS"]
-            wandb.log({
-                "charts/mean_step_reward": float(mean_rew),
-                "global_step": step,
-            })
-        
         wandb.finish()
+
+
+if __name__ == "__main__":
+    main()

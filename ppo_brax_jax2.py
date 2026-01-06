@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
-PPO for PixelBrax environments - CleanRL style adaptation.
-Adapted from CleanRL's PPO Atari implementation for continuous control with pixel observations.
+PPO for Brax environments with state observations - CleanRL style adaptation.
+Adapted from CleanRL's PPO implementation for continuous control with state observations.
+This serves as a baseline to verify the algorithm works before testing pixel observations.
 """
 import os
 import random
@@ -21,10 +22,10 @@ import distrax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 
+# Import Brax from local source (pixelbrax/brax/brax)
 import sys
-sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/brax")
-import pixelbrax
-from pixelbrax.env_utils import make_pixel_brax
+sys.path.insert(0, "/users/apraka15/arjun/pixelrl/pixelbrax/brax")
+from brax import envs as brax_envs
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -53,13 +54,11 @@ class Args:
     """the physics backend (spring, generalized, positional)"""
     n_envs: int = 512
     """the number of parallel game environments"""
-    hw: int = 84
-    """height/width of the observation images"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-5
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
@@ -89,16 +88,6 @@ class Args:
     """maximum action value for clipping"""
     log_interval: int = 10
     """logging interval (in updates)"""
-    
-    # Data augmentation (DrQ-style)
-    use_augmentation: bool = False
-    """Toggle random shift data augmentation (DrQ-style)"""
-    augment_pad: int = 4
-    """Padding size for random shift augmentation"""
-
-    # Frame stacking
-    frame_stack: int = 4
-    """Number of frames to stack for temporal information"""
 
     # Action repeat
     action_repeat: int = 1
@@ -114,51 +103,15 @@ class Args:
 
 
 class Network(nn.Module):
-    """CNN encoder for pixel observations with LayerNorm for stability."""
+    """MLP encoder for state observations."""
     
     @nn.compact
     def __call__(self, x):
-        # x: (B, H, W, C) - already in NHWC format from PixelBrax
-        x = x.astype(jnp.float32) / 255.0
-        
-        # Conv layers with LayerNorm for stable training
-        x = nn.Conv(
-            32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        
-        x = nn.Conv(
-            64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        
-        x = nn.Conv(
-            64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.LayerNorm()(x)
-        x = nn.tanh(x)  # tanh for bounded features, helps with stability
+        # x: (B, obs_dim) - 1D state observations
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.tanh(x)
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.tanh(x)
         return x
 
 
@@ -218,80 +171,6 @@ class EpisodeStatistics:
     episode_lengths: jnp.array
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
-
-
-@flax.struct.dataclass
-class FrameStack:
-    """
-    Frame stacking buffer for temporal information in pixel-based RL.
-    Stores the last N frames and provides stacked observations.
-    """
-    frames: jnp.ndarray  # Shape: (n_envs, num_frames, H, W, C)
-
-    @classmethod
-    def create(cls, n_envs: int, num_frames: int, obs_shape: tuple):
-        """Initialize frame stack with zeros."""
-        h, w, c = obs_shape
-        frames = jnp.zeros((n_envs, num_frames, h, w, c), dtype=jnp.uint8)
-        return cls(frames=frames)
-
-    def reset(self, obs: jnp.ndarray, done: jnp.ndarray = None):
-        """
-        Reset frame stack for environments that are done.
-        If done is None, reset all environments with the given observation.
-
-        Args:
-            obs: New observation of shape (n_envs, H, W, C)
-            done: Boolean mask of shape (n_envs,) indicating which envs to reset
-        """
-        # Stack the same observation num_frames times for reset
-        n_envs = obs.shape[0]
-        num_frames = self.frames.shape[1]
-        new_frames = jnp.broadcast_to(
-            obs[:, None, :, :, :],
-            (n_envs, num_frames, obs.shape[1], obs.shape[2], obs.shape[3])
-        )
-
-        if done is None:
-            return self.replace(frames=new_frames)
-        else:
-            # Only reset environments that are done
-            frames = jnp.where(
-                done[:, None, None, None, None],
-                new_frames,
-                self.frames
-            )
-            return self.replace(frames=frames)
-
-    def push(self, obs: jnp.ndarray):
-        """
-        Add a new frame to the stack, shifting out the oldest.
-
-        Args:
-            obs: New observation of shape (n_envs, H, W, C)
-
-        Returns:
-            Updated FrameStack
-        """
-        # Shift frames left (drop oldest) and add new frame at the end
-        new_frames = jnp.concatenate([
-            self.frames[:, 1:, :, :, :],
-            obs[:, None, :, :, :]
-        ], axis=1)
-        return self.replace(frames=new_frames)
-
-    def get_stacked(self) -> jnp.ndarray:
-        """
-        Get stacked observation by concatenating frames along channel dimension.
-
-        Returns:
-            Stacked observation of shape (n_envs, H, W, C * num_frames)
-        """
-        # Reshape from (n_envs, num_frames, H, W, C) to (n_envs, H, W, C * num_frames)
-        n_envs, num_frames, h, w, c = self.frames.shape
-        # Transpose to (n_envs, H, W, num_frames, C) then reshape
-        frames_transposed = jnp.transpose(self.frames, (0, 2, 3, 1, 4))
-        return frames_transposed.reshape(n_envs, h, w, c * num_frames)
 
 
 @flax.struct.dataclass
@@ -355,57 +234,22 @@ class RewardNormalizer:
         return jnp.clip(normalized, -clip, clip)
 
 
-def make_pixelbrax_envs(args):
-    """Create PixelBrax environments."""
-    envs, _, _ = make_pixel_brax(
-        backend=args.backend,
+def make_brax_envs(args):
+    """Create Brax environments with state observations."""
+    # Use brax.envs.create() which applies standard wrappers
+    env = brax_envs.create(
         env_name=args.env_name,
-        n_envs=args.n_envs,
-        seed=args.seed,
-        hw=args.hw,
-        distractor=None,
-        video_path="datasets/DAVIS",
-        video_set="train",
-        return_float32=False,
+        backend=args.backend,
+        episode_length=1000,
         action_repeat=args.action_repeat,
+        auto_reset=True,
+        batch_size=args.n_envs,
     )
     
-    try:
-        action_dim = envs.action_size
-    except AttributeError:
-        action_dim = envs.env.action_size
+    action_dim = env.action_size
+    obs_dim = env.observation_size
     
-    return envs, action_dim
-
-
-def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.ndarray:
-    """
-    DrQ-style random shift augmentation.
-    Pads the image and then takes a random crop back to original size.
-    
-    Args:
-        key: JAX random key
-        x: Image tensor of shape (B, H, W, C)
-        pad: Padding size (default 4 pixels)
-    
-    Returns:
-        Augmented image tensor of same shape
-    """
-    b, h, w, c = x.shape
-    
-    # Pad the image with edge values
-    x_padded = jnp.pad(x, ((0, 0), (pad, pad), (pad, pad), (0, 0)), mode='edge')
-    
-    # Generate random crop offsets for each image in batch
-    key1, key2 = jax.random.split(key)
-    crop_h = jax.random.randint(key1, (b,), 0, 2 * pad + 1)
-    crop_w = jax.random.randint(key2, (b,), 0, 2 * pad + 1)
-    
-    # Use vmap to apply random crops to each image
-    def crop_single(x_pad, ch, cw):
-        return jax.lax.dynamic_slice(x_pad, (ch, cw, 0), (h, w, c))
-    
-    return jax.vmap(crop_single)(x_padded, crop_h, crop_w)
+    return env, action_dim, obs_dim
 
 
 if __name__ == "__main__":
@@ -443,19 +287,14 @@ if __name__ == "__main__":
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
     
-    envs, action_dim = make_pixelbrax_envs(args)
+    envs, action_dim, obs_dim = make_brax_envs(args)
     print(f"action_dim: {action_dim}")
-    
-    # Get observation shape
-    reset_rng = jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs)
-    init_env_state = envs.reset(reset_rng)
-    raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
-    # Stacked observation shape: channels are multiplied by frame_stack
-    obs_shape = (raw_obs_shape[0], raw_obs_shape[1], raw_obs_shape[2] * args.frame_stack)
-    print(f"raw_obs_shape: {raw_obs_shape}")
-    print(f"frame_stack: {args.frame_stack}")
+    print(f"obs_dim: {obs_dim}")
     print(f"action_repeat: {args.action_repeat}")
-    print(f"obs_shape (with {args.frame_stack} stacked frames): {obs_shape}")
+    
+    # Observation shape is 1D for state-based observations
+    obs_shape = (obs_dim,)
+    print(f"obs_shape: {obs_shape}")
     
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
@@ -573,11 +412,7 @@ if __name__ == "__main__":
         )
         return storage
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values, aug_key):
-        # Apply random shift augmentation if enabled
-        if args.use_augmentation:
-            x = random_shift(aug_key, x, pad=args.augment_pad)
-        
+    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values):
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
@@ -616,7 +451,7 @@ if __name__ == "__main__":
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
-            key, subkey, aug_key = jax.random.split(key, 3)
+            key, subkey = jax.random.split(key)
 
             def flatten(x):
                 return x.reshape((-1,) + x.shape[2:])
@@ -628,13 +463,9 @@ if __name__ == "__main__":
 
             flatten_storage = jax.tree_map(flatten, storage)
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
-            
-            # Generate keys for each minibatch (for augmentation)
-            aug_keys = jax.random.split(aug_key, args.num_minibatches)
 
-            def update_minibatch(carry, inputs):
+            def update_minibatch(carry, minibatch):
                 agent_state = carry
-                minibatch, mb_aug_key = inputs
                 (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
@@ -643,13 +474,12 @@ if __name__ == "__main__":
                     minibatch.advantages,
                     minibatch.returns,
                     minibatch.values,
-                    mb_aug_key,
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
                 return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
             agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-                update_minibatch, agent_state, (shuffled_storage, aug_keys)
+                update_minibatch, agent_state, shuffled_storage
             )
             return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
@@ -664,32 +494,24 @@ if __name__ == "__main__":
 
     # Reset environment
     key, reset_key = jax.random.split(key)
-    reset_rngs = jax.random.split(reset_key, args.n_envs)
-    env_state = envs.reset(reset_rngs)
-
-    # Initialize frame stack with initial observation
-    frame_stack = FrameStack.create(args.n_envs, args.frame_stack, raw_obs_shape)
-    frame_stack = frame_stack.reset(env_state.pixels)  # Fill all frames with initial obs
-    next_obs = frame_stack.get_stacked()  # Get stacked observation
+    env_state = envs.reset(reset_key)
+    
+    # For state-based observations, directly use env_state.obs
+    next_obs = env_state.obs
     next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
 
     # Initialize reward normalizer (discounted return-based, like CleanRL)
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
     def step_once(carry, step):
-        agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
+        agent_state, episode_stats, reward_norm, env_state, obs, done, key = carry
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
         # Step environment
         env_state = envs.step(env_state, action)
-        raw_obs = env_state.pixels  # Raw single-frame observation
+        next_obs = env_state.obs  # State-based observation
         raw_reward = env_state.reward
         next_done = env_state.done.astype(jnp.bool_)  # Ensure bool type
-
-        # Update frame stack: push new frame, then reset for done envs
-        fs = fs.push(raw_obs)
-        fs = fs.reset(raw_obs, next_done)  # Reset done envs to copies of new obs
-        next_obs = fs.get_stacked()  # Get stacked observation
 
         # Update reward normalizer and normalize reward (discounted return-based)
         reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
@@ -720,23 +542,22 @@ if __name__ == "__main__":
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
-        return (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage
+        return (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage
 
-    def rollout(agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
-        (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage = jax.lax.scan(
-            step_once, (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), jnp.arange(max_steps)
+    def rollout(agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key, max_steps):
+        (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage = jax.lax.scan(
+            step_once, (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), jnp.arange(max_steps)
         )
-        return agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, storage, key
+        return agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, storage, key
 
     rollout = partial(rollout, max_steps=args.num_steps)
     rollout = jax.jit(rollout)
 
     print("Starting training...")
-    cumulative_episodic_return = 0.0
     for iteration in range(1, args.num_updates + 1):
         iteration_time_start = time.time()
-        agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, storage, key = rollout(
-            agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, key
+        agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, storage, key = rollout(
+            agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, key
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
@@ -780,4 +601,5 @@ if __name__ == "__main__":
     print(f"\nTraining finished in {elapsed:.1f}s")
     print(f"Average SPS: {args.total_timesteps / elapsed:.0f}")
     
-    if
+    if args.track:
+        wandb.finish()

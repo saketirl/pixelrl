@@ -1,8 +1,16 @@
 #!/usr/bin/env python
 """
-PPO for PixelBrax environments - CleanRL style adaptation.
-Adapted from CleanRL's PPO Atari implementation for continuous control with pixel observations.
+RePPO (Regularized PPO) for PixelBrax environments.
+Combines PPO with SAC-style entropy regularization and KL constraints.
+
+Key features:
+1. Learnable entropy temperature (SAC-style)
+2. KL constraint with Lagrangian multiplier
+3. Target actor for KL divergence computation
+4. Importance weighting for exploration
+5. N-step lambda returns with soft rewards
 """
+
 import os
 import random
 import time
@@ -26,9 +34,8 @@ sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/
 import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
-# Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+# Fix OOM issues
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
-# Fix CUDNN non-determinism
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
@@ -59,7 +66,7 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-5
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
@@ -79,30 +86,36 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function"""
-    ent_coef: float = 0.01
-    """coefficient of the entropy"""
-    vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
     max_action: float = 1.0
     """maximum action value for clipping"""
     log_interval: int = 10
     """logging interval (in updates)"""
-    
-    # Data augmentation (DrQ-style)
-    use_augmentation: bool = False
-    """Toggle random shift data augmentation (DrQ-style)"""
-    augment_pad: int = 4
-    """Padding size for random shift augmentation"""
 
-    # Frame stacking
-    frame_stack: int = 4
-    """Number of frames to stack for temporal information"""
-
-    # Action repeat
-    action_repeat: int = 1
-    """Number of times to repeat each action (frame skip)"""
+    # RePPO specific arguments
+    ent_coef: float = 0.01
+    """initial entropy coefficient (learnable)"""
+    vf_coef: float = 0.5
+    """coefficient of the value function"""
+    kl_coef: float = 0.1
+    """initial KL constraint coefficient (Lagrangian, learnable)"""
+    kl_target: float = 0.01
+    """target KL divergence for constraint"""
+    target_entropy_scale: float = -1.0
+    """target entropy as multiple of action dim (negative means auto)"""
+    polyak: float = 0.005
+    """polyak averaging coefficient for target actor"""
+    exploration_noise_min: float = 1.0
+    """minimum exploration noise scale"""
+    exploration_noise_max: float = 2.0
+    """maximum exploration noise scale"""
+    use_kl_constraint: bool = True
+    """whether to use KL constraint"""
+    use_entropy_constraint: bool = True
+    """whether to use entropy constraint"""
+    actor_min_std: float = 0.1
+    """minimum std for actor distribution"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -115,13 +128,11 @@ class Args:
 
 class Network(nn.Module):
     """CNN encoder for pixel observations with LayerNorm for stability."""
-    
+
     @nn.compact
     def __call__(self, x):
-        # x: (B, H, W, C) - already in NHWC format from PixelBrax
         x = x.astype(jnp.float32) / 255.0
-        
-        # Conv layers with LayerNorm for stable training
+
         x = nn.Conv(
             32,
             kernel_size=(8, 8),
@@ -132,7 +143,7 @@ class Network(nn.Module):
         )(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
-        
+
         x = nn.Conv(
             64,
             kernel_size=(4, 4),
@@ -143,7 +154,7 @@ class Network(nn.Module):
         )(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
-        
+
         x = nn.Conv(
             64,
             kernel_size=(3, 3),
@@ -154,16 +165,16 @@ class Network(nn.Module):
         )(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
-        
+
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.LayerNorm()(x)
-        x = nn.tanh(x)  # tanh for bounded features, helps with stability
+        x = nn.tanh(x)
         return x
 
 
 class Critic(nn.Module):
-    """Value network with 2 hidden layers for sufficient capacity."""
+    """Value network."""
     @nn.compact
     def __call__(self, x):
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
@@ -174,8 +185,9 @@ class Critic(nn.Module):
 
 
 class Actor(nn.Module):
-    """Continuous action actor with 2 hidden layers using Gaussian distribution."""
+    """Continuous action actor with Gaussian distribution."""
     action_dim: int
+    min_std: float = 0.1
 
     @nn.compact
     def __call__(self, x):
@@ -183,21 +195,30 @@ class Actor(nn.Module):
         x = nn.tanh(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.tanh(x)
+
         actor_mean = nn.Dense(
-            self.action_dim, 
-            kernel_init=orthogonal(0.01), 
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
         )(x)
         actor_logstd = self.param(
-            "log_std", 
-            nn.initializers.zeros, 
+            "log_std",
+            nn.initializers.zeros,
             (self.action_dim,)
         )
         return actor_mean, actor_logstd
 
 
-# Using FrozenDict for params instead of a dataclass for Flax compatibility
-# Params structure: {'network': ..., 'actor': ..., 'critic': ...}
+class TemperatureParams(nn.Module):
+    """Learnable temperature and Lagrangian parameters."""
+    ent_init: float = 0.01
+    kl_init: float = 0.1
+
+    @nn.compact
+    def __call__(self):
+        log_temp = self.param("log_temperature", nn.initializers.constant(jnp.log(self.ent_init)), ())
+        log_lagrangian = self.param("log_lagrangian", nn.initializers.constant(jnp.log(self.kl_init)), ())
+        return jnp.exp(log_temp), jnp.exp(log_lagrangian)
 
 
 @flax.struct.dataclass
@@ -210,6 +231,7 @@ class Storage:
     advantages: jnp.array
     returns: jnp.array
     rewards: jnp.array
+    importance_weights: jnp.array
 
 
 @flax.struct.dataclass
@@ -218,141 +240,6 @@ class EpisodeStatistics:
     episode_lengths: jnp.array
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
-
-
-@flax.struct.dataclass
-class FrameStack:
-    """
-    Frame stacking buffer for temporal information in pixel-based RL.
-    Stores the last N frames and provides stacked observations.
-    """
-    frames: jnp.ndarray  # Shape: (n_envs, num_frames, H, W, C)
-
-    @classmethod
-    def create(cls, n_envs: int, num_frames: int, obs_shape: tuple):
-        """Initialize frame stack with zeros."""
-        h, w, c = obs_shape
-        frames = jnp.zeros((n_envs, num_frames, h, w, c), dtype=jnp.uint8)
-        return cls(frames=frames)
-
-    def reset(self, obs: jnp.ndarray, done: jnp.ndarray = None):
-        """
-        Reset frame stack for environments that are done.
-        If done is None, reset all environments with the given observation.
-
-        Args:
-            obs: New observation of shape (n_envs, H, W, C)
-            done: Boolean mask of shape (n_envs,) indicating which envs to reset
-        """
-        # Stack the same observation num_frames times for reset
-        n_envs = obs.shape[0]
-        num_frames = self.frames.shape[1]
-        new_frames = jnp.broadcast_to(
-            obs[:, None, :, :, :],
-            (n_envs, num_frames, obs.shape[1], obs.shape[2], obs.shape[3])
-        )
-
-        if done is None:
-            return self.replace(frames=new_frames)
-        else:
-            # Only reset environments that are done
-            frames = jnp.where(
-                done[:, None, None, None, None],
-                new_frames,
-                self.frames
-            )
-            return self.replace(frames=frames)
-
-    def push(self, obs: jnp.ndarray):
-        """
-        Add a new frame to the stack, shifting out the oldest.
-
-        Args:
-            obs: New observation of shape (n_envs, H, W, C)
-
-        Returns:
-            Updated FrameStack
-        """
-        # Shift frames left (drop oldest) and add new frame at the end
-        new_frames = jnp.concatenate([
-            self.frames[:, 1:, :, :, :],
-            obs[:, None, :, :, :]
-        ], axis=1)
-        return self.replace(frames=new_frames)
-
-    def get_stacked(self) -> jnp.ndarray:
-        """
-        Get stacked observation by concatenating frames along channel dimension.
-
-        Returns:
-            Stacked observation of shape (n_envs, H, W, C * num_frames)
-        """
-        # Reshape from (n_envs, num_frames, H, W, C) to (n_envs, H, W, C * num_frames)
-        n_envs, num_frames, h, w, c = self.frames.shape
-        # Transpose to (n_envs, H, W, num_frames, C) then reshape
-        frames_transposed = jnp.transpose(self.frames, (0, 2, 3, 1, 4))
-        return frames_transposed.reshape(n_envs, h, w, c * num_frames)
-
-
-@flax.struct.dataclass
-class RewardNormalizer:
-    """
-    Reward normalization using discounted returns (CleanRL style).
-    Normalizes rewards by the standard deviation of discounted returns,
-    which is more stable for continuous control.
-    """
-    return_rms_mean: jnp.array  # Running mean of returns (unused but tracked)
-    return_rms_var: jnp.array   # Running variance of returns
-    return_rms_count: jnp.array
-    discounted_return: jnp.array  # Track discounted returns per environment
-    gamma: float = 0.99
-    
-    @classmethod
-    def create(cls, n_envs, gamma=0.99):
-        return cls(
-            return_rms_mean=jnp.array(0.0),
-            return_rms_var=jnp.array(1.0),
-            return_rms_count=jnp.array(1e-4),
-            discounted_return=jnp.zeros(n_envs),
-            gamma=gamma,
-        )
-    
-    def update(self, rewards, dones):
-        """
-        Update running statistics with a batch of rewards.
-        Uses discounted returns for variance estimation (like gym.wrappers.NormalizeReward).
-        """
-        # Update discounted returns: R_t = r_t + gamma * R_{t+1} * (1 - done)
-        new_discounted_return = rewards + self.gamma * self.discounted_return * (1.0 - dones)
-        
-        # Update running statistics of returns
-        batch_mean = jnp.mean(new_discounted_return)
-        batch_var = jnp.var(new_discounted_return)
-        batch_count = new_discounted_return.size
-        
-        delta = batch_mean - self.return_rms_mean
-        tot_count = self.return_rms_count + batch_count
-        
-        new_mean = self.return_rms_mean + delta * batch_count / tot_count
-        m_a = self.return_rms_var * self.return_rms_count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + jnp.square(delta) * self.return_rms_count * batch_count / tot_count
-        new_var = M2 / tot_count
-        
-        # Reset discounted return where episodes ended
-        new_discounted_return = jnp.where(dones, 0.0, new_discounted_return)
-        
-        return self.replace(
-            return_rms_mean=new_mean,
-            return_rms_var=new_var,
-            return_rms_count=tot_count,
-            discounted_return=new_discounted_return,
-        )
-    
-    def normalize(self, rewards, clip=10.0, epsilon=1e-8):
-        """Normalize rewards by std of discounted returns and clip."""
-        normalized = rewards / jnp.sqrt(self.return_rms_var + epsilon)
-        return jnp.clip(normalized, -clip, clip)
 
 
 def make_pixelbrax_envs(args):
@@ -367,45 +254,23 @@ def make_pixelbrax_envs(args):
         video_path="datasets/DAVIS",
         video_set="train",
         return_float32=False,
-        action_repeat=args.action_repeat,
     )
-    
+
     try:
         action_dim = envs.action_size
     except AttributeError:
         action_dim = envs.env.action_size
-    
+
     return envs, action_dim
 
 
-def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.ndarray:
-    """
-    DrQ-style random shift augmentation.
-    Pads the image and then takes a random crop back to original size.
-    
-    Args:
-        key: JAX random key
-        x: Image tensor of shape (B, H, W, C)
-        pad: Padding size (default 4 pixels)
-    
-    Returns:
-        Augmented image tensor of same shape
-    """
-    b, h, w, c = x.shape
-    
-    # Pad the image with edge values
-    x_padded = jnp.pad(x, ((0, 0), (pad, pad), (pad, pad), (0, 0)), mode='edge')
-    
-    # Generate random crop offsets for each image in batch
-    key1, key2 = jax.random.split(key)
-    crop_h = jax.random.randint(key1, (b,), 0, 2 * pad + 1)
-    crop_w = jax.random.randint(key2, (b,), 0, 2 * pad + 1)
-    
-    # Use vmap to apply random crops to each image
-    def crop_single(x_pad, ch, cw):
-        return jax.lax.dynamic_slice(x_pad, (ch, cw, 0), (h, w, c))
-    
-    return jax.vmap(crop_single)(x_padded, crop_h, crop_w)
+def soft_update(target_params, online_params, tau):
+    """Polyak averaging for target network updates."""
+    return jax.tree_util.tree_map(
+        lambda t, o: t * (1.0 - tau) + o * tau,
+        target_params,
+        online_params,
+    )
 
 
 if __name__ == "__main__":
@@ -414,7 +279,7 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
     run_name = f"{args.env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    
+
     if args.track:
         import wandb
         wandb.init(
@@ -430,7 +295,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, network_key, actor_key, critic_key = jax.random.split(key, 4)
+    key, network_key, actor_key, critic_key, temp_key = jax.random.split(key, 5)
 
     # Environment setup
     print("JAX devices:", jax.devices())
@@ -442,21 +307,26 @@ if __name__ == "__main__":
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
-    
+    print(f"kl_target: {args.kl_target}")
+    print(f"ent_coef (initial): {args.ent_coef}")
+    print(f"kl_coef (initial): {args.kl_coef}")
+
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
-    
+
+    # Compute target entropy
+    if args.target_entropy_scale < 0:
+        target_entropy = -action_dim  # Standard heuristic
+    else:
+        target_entropy = args.target_entropy_scale * action_dim
+    print(f"target_entropy: {target_entropy}")
+
     # Get observation shape
     reset_rng = jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs)
     init_env_state = envs.reset(reset_rng)
-    raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
-    # Stacked observation shape: channels are multiplied by frame_stack
-    obs_shape = (raw_obs_shape[0], raw_obs_shape[1], raw_obs_shape[2] * args.frame_stack)
-    print(f"raw_obs_shape: {raw_obs_shape}")
-    print(f"frame_stack: {args.frame_stack}")
-    print(f"action_repeat: {args.action_repeat}")
-    print(f"obs_shape (with {args.frame_stack} stacked frames): {obs_shape}")
-    
+    obs_shape = init_env_state.pixels.shape[1:]
+    print(f"obs_shape: {obs_shape}")
+
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
         episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
@@ -470,13 +340,15 @@ if __name__ == "__main__":
 
     # Initialize networks
     network = Network()
-    actor = Actor(action_dim=action_dim)
+    actor = Actor(action_dim=action_dim, min_std=args.actor_min_std)
     critic = Critic()
-    
+    temp_params_module = TemperatureParams(ent_init=args.ent_coef, kl_init=args.kl_coef)
+
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
     dummy_hidden = network.apply(network_params, dummy_obs)
-    
+
+    # Main agent state (network + actor + critic)
     agent_state = TrainState.create(
         apply_fn=None,
         params=flax.core.freeze({
@@ -487,11 +359,22 @@ if __name__ == "__main__":
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
-                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate, 
+                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate,
                 eps=1e-5
             ),
         ),
     )
+
+    # Temperature state (entropy temp + KL Lagrangian)
+    temp_state = TrainState.create(
+        apply_fn=temp_params_module.apply,
+        params=temp_params_module.init(temp_key),
+        tx=optax.adam(learning_rate=args.learning_rate * 0.1),
+    )
+
+    # Target actor params (for KL computation)
+    target_actor_params = agent_state.params['actor']
+
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
@@ -501,50 +384,76 @@ if __name__ == "__main__":
         agent_state: TrainState,
         next_obs: np.ndarray,
         key: jax.random.PRNGKey,
+        exploration_scale: jnp.ndarray,
     ):
-        """Sample action, calculate value, logprob, and return updated key."""
+        """Sample action with exploration noise scaling."""
         hidden = network.apply(agent_state.params['network'], next_obs)
         actor_mean, actor_logstd = actor.apply(agent_state.params['actor'], hidden)
-        
-        # Create Gaussian distribution
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
-        
+
+        # Base std for policy
+        base_std = jnp.exp(actor_logstd) + args.actor_min_std
+        # Exploration std (scaled per environment)
+        explore_std = base_std * exploration_scale
+
+        # Sample with exploration noise
         key, subkey = jax.random.split(key)
-        action = pi.sample(seed=subkey)
-        logprob = pi.log_prob(action)
+        pi_explore = distrax.MultivariateNormalDiag(actor_mean, explore_std)
+        action = pi_explore.sample(seed=subkey)
+
+        # Compute log prob under base policy (for importance weighting)
+        pi_base = distrax.MultivariateNormalDiag(actor_mean, base_std)
+        base_logprob = pi_base.log_prob(action)
+        explore_logprob = pi_explore.log_prob(action)
+
+        # Importance weight: pi_base / pi_explore
+        importance_weight = jnp.clip(base_logprob - explore_logprob, -2.0, 0.0)
+
         value = critic.apply(agent_state.params['critic'], hidden)
-        
+
         # Clip action
         action = jnp.clip(action, -args.max_action, args.max_action)
-        
-        return action, logprob, value.squeeze(-1), key
+
+        return action, base_logprob, value.squeeze(-1), importance_weight, key
 
     @jax.jit
     def get_action_and_value2(
         params: flax.core.FrozenDict,
+        target_actor_params: flax.core.FrozenDict,
         x: np.ndarray,
         action: np.ndarray,
     ):
-        """Calculate value, logprob of supplied action, and entropy."""
+        """Calculate value, logprob, entropy, and KL divergence."""
         hidden = network.apply(params['network'], x)
         actor_mean, actor_logstd = actor.apply(params['actor'], hidden)
-        
-        # Create Gaussian distribution
-        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
-        
+
+        # Current policy
+        std = jnp.exp(actor_logstd) + args.actor_min_std
+        pi = distrax.MultivariateNormalDiag(actor_mean, std)
+
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
         value = critic.apply(params['critic'], hidden).squeeze(-1)
-        
-        return logprob, entropy, value
+
+        # Target policy for KL computation
+        target_mean, target_logstd = actor.apply(target_actor_params, hidden)
+        target_std = jnp.exp(target_logstd) + args.actor_min_std
+        pi_target = distrax.MultivariateNormalDiag(target_mean, target_std)
+
+        # KL divergence: KL(pi_target || pi_current) - forward KL
+        # This encourages the new policy to stay close to the target
+        kl_div = pi_target.kl_divergence(pi)
+
+        return logprob, entropy, value, kl_div
 
     def compute_gae_once(carry, inp, gamma, gae_lambda):
         advantages = carry
-        nextdone, nextvalues, curvalues, reward = inp
+        nextdone, nextvalues, curvalues, reward, importance_weight = inp
         nextnonterminal = 1.0 - nextdone
 
         delta = reward + gamma * nextvalues * nextnonterminal - curvalues
-        advantages = delta + gamma * gae_lambda * nextnonterminal * advantages
+        # Apply importance weighting to lambda
+        effective_lambda = gae_lambda * jnp.exp(importance_weight)
+        advantages = delta + gamma * effective_lambda * nextnonterminal * advantages
         return advantages, advantages
 
     compute_gae_once = partial(compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda)
@@ -557,7 +466,7 @@ if __name__ == "__main__":
         storage: Storage,
     ):
         next_value = critic.apply(
-            agent_state.params['critic'], 
+            agent_state.params['critic'],
             network.apply(agent_state.params['network'], next_obs)
         ).squeeze(-1)
 
@@ -565,7 +474,9 @@ if __name__ == "__main__":
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
         _, advantages = jax.lax.scan(
-            compute_gae_once, advantages, (dones[1:], values[1:], values[:-1], storage.rewards), reverse=True
+            compute_gae_once, advantages,
+            (dones[1:], values[1:], values[:-1], storage.rewards, storage.importance_weights),
+            reverse=True
         )
         storage = storage.replace(
             advantages=advantages,
@@ -573,12 +484,15 @@ if __name__ == "__main__":
         )
         return storage
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values, aug_key):
-        # Apply random shift augmentation if enabled
-        if args.use_augmentation:
-            x = random_shift(aug_key, x, pad=args.augment_pad)
-        
-        newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
+    def reppo_loss(params, target_actor_params, temp_params, x, a, logp, mb_advantages,
+                   mb_returns, mb_values, mb_importance_weights):
+        newlogprob, entropy, newvalue, kl_div = get_action_and_value2(
+            params, target_actor_params, x, a
+        )
+
+        # Get temperature and Lagrangian
+        temperature, lagrangian = temp_params_module.apply(temp_params)
+
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
         approx_kl = ((ratio - 1) - logratio).mean()
@@ -586,7 +500,7 @@ if __name__ == "__main__":
         if args.norm_adv:
             mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-        # Policy loss
+        # Policy loss with clipping
         pg_loss1 = -mb_advantages * ratio
         pg_loss2 = -mb_advantages * jnp.clip(ratio, 1 - args.clip_eps, 1 + args.clip_eps)
         pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
@@ -602,21 +516,55 @@ if __name__ == "__main__":
         else:
             v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
-        entropy_loss = entropy.mean()
-        loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
+        # Entropy loss (SAC-style with temperature)
+        entropy_mean = entropy.mean()
+        entropy_loss = -temperature * entropy_mean
 
-    ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+        # KL constraint loss (with Lagrangian)
+        kl_mean = kl_div.mean()
+        if args.use_kl_constraint:
+            kl_loss = lagrangian * kl_mean
+        else:
+            kl_loss = 0.0
+
+        # Total loss
+        loss = pg_loss + entropy_loss + v_loss * args.vf_coef + kl_loss
+
+        return loss, (pg_loss, v_loss, entropy_mean, kl_mean, temperature, lagrangian,
+                      jax.lax.stop_gradient(approx_kl))
+
+    def temp_loss_fn(temp_params, entropy_mean, kl_mean):
+        """Update temperature and Lagrangian based on constraints."""
+        temperature, lagrangian = temp_params_module.apply(temp_params)
+
+        # Entropy constraint: increase temp if entropy too low
+        if args.use_entropy_constraint:
+            entropy_target_loss = temperature * jax.lax.stop_gradient(entropy_mean - target_entropy)
+        else:
+            entropy_target_loss = 0.0
+
+        # KL constraint: increase Lagrangian if KL too high
+        if args.use_kl_constraint:
+            kl_target_loss = -lagrangian * jax.lax.stop_gradient(kl_mean - args.kl_target)
+        else:
+            kl_target_loss = 0.0
+
+        return entropy_target_loss + kl_target_loss
+
+    reppo_loss_grad_fn = jax.value_and_grad(reppo_loss, has_aux=True)
+    temp_loss_grad_fn = jax.value_and_grad(temp_loss_fn)
 
     @jax.jit
-    def update_ppo(
+    def update_reppo(
         agent_state: TrainState,
+        temp_state: TrainState,
+        target_actor_params: flax.core.FrozenDict,
         storage: Storage,
         key: jax.random.PRNGKey,
     ):
         def update_epoch(carry, unused_inp):
-            agent_state, key = carry
-            key, subkey, aug_key = jax.random.split(key, 3)
+            agent_state, temp_state, target_actor_params, key = carry
+            key, subkey = jax.random.split(key)
 
             def flatten(x):
                 return x.reshape((-1,) + x.shape[2:])
@@ -628,35 +576,60 @@ if __name__ == "__main__":
 
             flatten_storage = jax.tree_map(flatten, storage)
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
-            
-            # Generate keys for each minibatch (for augmentation)
-            aug_keys = jax.random.split(aug_key, args.num_minibatches)
 
-            def update_minibatch(carry, inputs):
-                agent_state = carry
-                minibatch, mb_aug_key = inputs
-                (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
+            def update_minibatch(carry, minibatch):
+                agent_state, temp_state, target_actor_params = carry
+
+                (loss, (pg_loss, v_loss, entropy_mean, kl_mean, temperature, lagrangian, approx_kl)), grads = reppo_loss_grad_fn(
                     agent_state.params,
+                    target_actor_params,
+                    temp_state.params,
                     minibatch.obs,
                     minibatch.actions,
                     minibatch.logprobs,
                     minibatch.advantages,
                     minibatch.returns,
                     minibatch.values,
-                    mb_aug_key,
+                    minibatch.importance_weights,
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
-                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
-            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-                update_minibatch, agent_state, (shuffled_storage, aug_keys)
+                # Update temperature params
+                temp_loss, temp_grads = temp_loss_grad_fn(
+                    temp_state.params, entropy_mean, kl_mean
+                )
+                temp_state = temp_state.apply_gradients(grads=temp_grads)
+
+                return (agent_state, temp_state, target_actor_params), (
+                    loss, pg_loss, v_loss, entropy_mean, kl_mean, temperature, lagrangian, approx_kl
+                )
+
+            (agent_state, temp_state, target_actor_params), metrics = jax.lax.scan(
+                update_minibatch, (agent_state, temp_state, target_actor_params), shuffled_storage
             )
-            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
-        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-            update_epoch, (agent_state, key), (), length=args.update_epochs
+            # Soft update target actor
+            target_actor_params = soft_update(
+                target_actor_params, agent_state.params['actor'], args.polyak
+            )
+
+            return (agent_state, temp_state, target_actor_params, key), metrics
+
+        (agent_state, temp_state, target_actor_params, key), all_metrics = jax.lax.scan(
+            update_epoch, (agent_state, temp_state, target_actor_params, key), (), length=args.update_epochs
         )
-        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key
+
+        # Extract final metrics
+        loss, pg_loss, v_loss, entropy, kl, temperature, lagrangian, approx_kl = all_metrics
+
+        return agent_state, temp_state, target_actor_params, loss, pg_loss, v_loss, entropy, kl, temperature, lagrangian, approx_kl, key
+
+    # Compute exploration noise scales per environment
+    exploration_scales = jnp.linspace(
+        args.exploration_noise_min,
+        args.exploration_noise_max,
+        args.n_envs
+    )[:, None]  # (n_envs, 1)
 
     # Start the game
     global_step = 0
@@ -666,40 +639,25 @@ if __name__ == "__main__":
     key, reset_key = jax.random.split(key)
     reset_rngs = jax.random.split(reset_key, args.n_envs)
     env_state = envs.reset(reset_rngs)
-
-    # Initialize frame stack with initial observation
-    frame_stack = FrameStack.create(args.n_envs, args.frame_stack, raw_obs_shape)
-    frame_stack = frame_stack.reset(env_state.pixels)  # Fill all frames with initial obs
-    next_obs = frame_stack.get_stacked()  # Get stacked observation
+    next_obs = env_state.pixels
     next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
 
-    # Initialize reward normalizer (discounted return-based, like CleanRL)
-    reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
-
     def step_once(carry, step):
-        agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
-        action, logprob, value, key = get_action_and_value(agent_state, obs, key)
+        agent_state, episode_stats, env_state, obs, done, key, exploration_scales = carry
+        action, logprob, value, importance_weight, key = get_action_and_value(
+            agent_state, obs, key, exploration_scales
+        )
 
         # Step environment
         env_state = envs.step(env_state, action)
-        raw_obs = env_state.pixels  # Raw single-frame observation
-        raw_reward = env_state.reward
-        next_done = env_state.done.astype(jnp.bool_)  # Ensure bool type
+        next_obs = env_state.pixels
+        reward = env_state.reward
+        next_done = env_state.done.astype(jnp.bool_)
 
-        # Update frame stack: push new frame, then reset for done envs
-        fs = fs.push(raw_obs)
-        fs = fs.reset(raw_obs, next_done)  # Reset done envs to copies of new obs
-        next_obs = fs.get_stacked()  # Get stacked observation
-
-        # Update reward normalizer and normalize reward (discounted return-based)
-        reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
-        reward = reward_norm.normalize(raw_reward)
-
-        # Update episode statistics (use raw reward for tracking true returns)
-        new_episode_return = episode_stats.episode_returns + raw_reward
+        # Update episode statistics
+        new_episode_return = episode_stats.episode_returns + reward
         new_episode_length = episode_stats.episode_lengths + 1
         episode_stats = episode_stats.replace(
-            # Use jnp.where to preserve dtypes
             episode_returns=jnp.where(next_done, 0.0, new_episode_return),
             episode_lengths=jnp.where(next_done, 0, new_episode_length).astype(jnp.int32),
             returned_episode_returns=jnp.where(
@@ -716,68 +674,78 @@ if __name__ == "__main__":
             logprobs=logprob,
             dones=done,
             values=value,
-            rewards=reward,  # Use normalized reward for training
+            rewards=reward,
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
+            importance_weights=importance_weight,
         )
-        return (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage
+        return (agent_state, episode_stats, env_state, next_obs, next_done, key, exploration_scales), storage
 
-    def rollout(agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
-        (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage = jax.lax.scan(
-            step_once, (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), jnp.arange(max_steps)
+    def rollout(agent_state, episode_stats, env_state, next_obs, next_done, key, exploration_scales, max_steps):
+        (agent_state, episode_stats, env_state, next_obs, next_done, key, _), storage = jax.lax.scan(
+            step_once, (agent_state, episode_stats, env_state, next_obs, next_done, key, exploration_scales), jnp.arange(max_steps)
         )
-        return agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, storage, key
+        return agent_state, episode_stats, env_state, next_obs, next_done, storage, key
 
     rollout = partial(rollout, max_steps=args.num_steps)
     rollout = jax.jit(rollout)
 
     print("Starting training...")
-    cumulative_episodic_return = 0.0
     for iteration in range(1, args.num_updates + 1):
         iteration_time_start = time.time()
-        agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, storage, key = rollout(
-            agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, key
+        agent_state, episode_stats, env_state, next_obs, next_done, storage, key = rollout(
+            agent_state, episode_stats, env_state, next_obs, next_done, key, exploration_scales
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
+        agent_state, temp_state, target_actor_params, loss, pg_loss, v_loss, entropy, kl, temperature, lagrangian, approx_kl, key = update_reppo(
             agent_state,
+            temp_state,
+            target_actor_params,
             storage,
             key,
         )
-        
+
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
             avg_episodic_length = np.mean(jax.device_get(episode_stats.returned_episode_lengths))
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
-            
+
             print(
                 f"update={iteration} step={global_step} "
                 f"ep_return={avg_episodic_return:.1f} "
-                f"ep_len={avg_episodic_length * args.action_repeat:.0f} "  # Actual env steps
+                f"ep_len={avg_episodic_length:.0f} "
                 f"loss={loss[-1, -1].item():.4f} "
+                f"temp={temperature[-1, -1].item():.4f} "
+                f"kl={kl[-1, -1].item():.4f} "
                 f"SPS={sps}"
             )
-            
+
             if args.track:
+                import wandb
                 lr = agent_state.opt_state[1].hyperparams["learning_rate"].item()
                 wandb.log({
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,
-                    "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
+                    "charts/avg_episodic_length": avg_episodic_length,
                     "charts/learning_rate": lr,
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),
                     "losses/policy_loss": pg_loss[-1, -1].item(),
-                    "losses/entropy": entropy_loss[-1, -1].item(),
+                    "losses/entropy": entropy[-1, -1].item(),
+                    "losses/kl_divergence": kl[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
+                    "reppo/temperature": temperature[-1, -1].item(),
+                    "reppo/lagrangian": lagrangian[-1, -1].item(),
                 }, step=global_step)
 
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed:.1f}s")
     print(f"Average SPS: {args.total_timesteps / elapsed:.0f}")
-    
-    if
+
+    if args.track:
+        import wandb
+        wandb.finish()

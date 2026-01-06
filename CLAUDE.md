@@ -55,6 +55,8 @@ Actor/Critic Networks
 | `pure_jax_ppo.py` | Reference PPO without pixel observations (MLP baseline) |
 | `pixelbrax/brax/` | Bundled Brax physics engine source |
 | `pixelbrax/renderer/` | 3D rendering pipeline for pixel observations |
+| `clean_rl_reference/` | reference code of gold-standard implementations of RL algorithms |
+
 
 ### Environment Creation
 
