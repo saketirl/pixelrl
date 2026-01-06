@@ -749,6 +749,7 @@ if __name__ == "__main__":
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
             avg_episodic_length = np.mean(jax.device_get(episode_stats.returned_episode_lengths))
+            cumulative_episodic_return += avg_episodic_return
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
             
@@ -765,6 +766,7 @@ if __name__ == "__main__":
                 wandb.log({
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,
+                    "charts/cumulative_episodic_return": cumulative_episodic_return,
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
                     "charts/learning_rate": lr,
                     "charts/SPS": sps,
@@ -780,4 +782,6 @@ if __name__ == "__main__":
     print(f"\nTraining finished in {elapsed:.1f}s")
     print(f"Average SPS: {args.total_timesteps / elapsed:.0f}")
     
-    if
+    if args.track:
+        wandb.finish()
+

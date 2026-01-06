@@ -62,15 +62,15 @@ SEED=${2:-0}
 uv run ppo_pixelbrax_jax2.py \
   --env-name ${ENV_NAME} \
   --backend spring \
-  --n-envs 16 \
+  --n-envs 128 \
   --hw 84 \
   --total-timesteps 10000000 \
-  --num-steps 128 \
-  --num-minibatches 4 \
-  --update-epochs 10 \
-  --learning-rate 2e-4 \
+  --num-steps 10 \
+  --num-minibatches 32 \
+  --update-epochs 4 \
+  --learning-rate 3e-4 \
   --gamma 0.99 \
-  --gae-lambda 0.97 \
+  --gae-lambda 0.95 \
   --clip-eps 0.1 \
   --ent-coef 0.0 \
   --vf-coef 0.5 \
