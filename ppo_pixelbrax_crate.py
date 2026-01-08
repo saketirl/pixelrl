@@ -28,7 +28,7 @@ import numpy as np
 import optax
 import tyro
 import distrax
-from flax.linen.initializers import constant, orthogonal
+# Using default Flax initializers (lecun_normal) to match PyTorch/CRATE defaults
 from flax.training.train_state import TrainState
 
 import sys
@@ -160,10 +160,10 @@ class ISTAFeedForward(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # Learnable weight matrix W
+        # Learnable weight matrix W (kaiming_uniform like original CRATE)
         weight = self.param(
             "weight",
-            nn.initializers.kaiming_uniform(),
+            nn.initializers.he_uniform(),
             (self.dim, self.dim)
         )
 
@@ -200,11 +200,8 @@ class CRATEAttention(nn.Module):
         inner_dim = self.dim_head * self.heads
 
         # Single projection for Q, K, V (CRATE's simplification)
-        qkv = nn.Dense(
-            inner_dim,
-            use_bias=False,
-            kernel_init=orthogonal(1.0),
-        )(x)
+        # Uses default Flax init (lecun_normal, similar to PyTorch default)
+        qkv = nn.Dense(inner_dim, use_bias=False)(x)
 
         # Reshape to (B, heads, N, dim_head)
         w = qkv.reshape(B, N, self.heads, self.dim_head)
@@ -225,12 +222,8 @@ class CRATEAttention(nn.Module):
         out = jnp.transpose(out, (0, 2, 1, 3))  # (B, N, heads, dim_head)
         out = out.reshape(B, N, inner_dim)
 
-        # Output projection
-        out = nn.Dense(
-            self.dim,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-        )(out)
+        # Output projection (default init)
+        out = nn.Dense(self.dim)(out)
         out = nn.Dropout(self.dropout, deterministic=deterministic)(out)
 
         return out
@@ -314,28 +307,24 @@ class TemporalCRATEEncoder(nn.Module):
         x = x.reshape(B, T, token_dim)
 
         # Token embedding (like CRATE's patch embedding but for channel-stacked frames)
-        # LayerNorm → Linear → LayerNorm
+        # LayerNorm → Linear → LayerNorm (default init like original CRATE)
         x = nn.LayerNorm()(x)
-        x = nn.Dense(
-            self.embed_dim,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-        )(x)
+        x = nn.Dense(self.embed_dim)(x)
         x = nn.LayerNorm()(x)
 
-        # CLS token for sequence pooling
+        # CLS token for sequence pooling (torch.randn = normal(0, 1))
         cls_token = self.param(
             "cls_token",
-            nn.initializers.normal(stddev=0.02),
+            nn.initializers.normal(stddev=1.0),
             (1, 1, self.embed_dim)
         )
         cls_tokens = jnp.broadcast_to(cls_token, (B, 1, self.embed_dim))
         x = jnp.concatenate([cls_tokens, x], axis=1)  # (B, 1 + T, embed_dim)
 
-        # Temporal positional embeddings
+        # Temporal positional embeddings (torch.randn = normal(0, 1))
         pos_embed = self.param(
             "pos_embed",
-            nn.initializers.normal(stddev=0.02),
+            nn.initializers.normal(stddev=1.0),
             (1, 1 + T, self.embed_dim)
         )
         x = x + pos_embed
@@ -360,9 +349,9 @@ class TemporalCRATEEncoder(nn.Module):
         else:
             x = x[:, 0]  # CLS token
 
-        # Final layer norm and projection
+        # Final layer norm and projection (default init)
         x = nn.LayerNorm()(x)
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(512)(x)
         x = nn.LayerNorm()(x)
         x = nn.tanh(x)
 
@@ -370,33 +359,29 @@ class TemporalCRATEEncoder(nn.Module):
 
 
 class Critic(nn.Module):
-    """Value network with 2 hidden layers."""
+    """Value network with 2 hidden layers (default init like CRATE)."""
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(256)(x)
         x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(256)(x)
         x = nn.tanh(x)
-        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        return nn.Dense(1)(x)
 
 
 class Actor(nn.Module):
-    """Continuous action actor with Gaussian distribution."""
+    """Continuous action actor with Gaussian distribution (default init like CRATE)."""
     action_dim: int
     log_std_min: float = -5.0
     log_std_max: float = 2.0
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(256)(x)
         x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(256)(x)
         x = nn.tanh(x)
-        actor_mean = nn.Dense(
-            self.action_dim,
-            kernel_init=orthogonal(0.01),
-            bias_init=constant(0.0)
-        )(x)
+        actor_mean = nn.Dense(self.action_dim)(x)
         actor_logstd = self.param(
             "log_std",
             nn.initializers.zeros,
