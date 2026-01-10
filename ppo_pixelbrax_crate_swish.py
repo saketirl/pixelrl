@@ -1,17 +1,12 @@
 #!/usr/bin/env python
 """
-PPO for PixelBrax environments using Hierarchical Temporal CRATE.
+PPO for PixelBrax environments using Factorized CRATE with Swish activations.
 
-This implementation combines CNN-style and transformer-style temporal processing:
-- Channel stacking: Groups of frames are stacked along channels (local temporal, like CNNs)
-- Temporal transformer: Channel-stacked groups become tokens in a sequence (global temporal)
+Key differences from factorized version:
+- All ISTA layers use Swish activation instead of ReLU
+- Actor and Critic heads use ISTA layers with Swish instead of Dense+tanh
 
-Total frames = temporal_stack × channel_stack
-Example: temporal_stack=4, channel_stack=2 → 8 total frames
-         → 4 transformer tokens, each with 2 frames channel-stacked
-
-Uses CRATE architecture (ISTA feedforward, simplified attention)
-Based on: https://github.com/Ma-Lab-Berkeley/CRATE
+Swish: x * sigmoid(x) - smooth, doesn't hard-zero negatives like ReLU
 """
 import os
 import random
@@ -36,7 +31,6 @@ sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/
 import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
-# Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
@@ -45,120 +39,82 @@ os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
     seed: int = 0
-    """seed of the experiment"""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "benchmark"
-    """the wandb's project name"""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
 
     # Environment arguments
     env_name: str = "halfcheetah"
-    """the name of the environment"""
     backend: str = "spring"
-    """the physics backend (spring, generalized, positional)"""
     n_envs: int = 512
-    """the number of parallel game environments"""
     hw: int = 84
-    """height/width of the observation images"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 1e-4
-    """the learning rate of the optimizer (lower for transformers)"""
+    learning_rate: float = 3e-4
+    encoder_lr_scale: float = 1.0
+    weight_decay: float = 0.0
     num_steps: int = 256
-    """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = False
-    """Toggle learning rate annealing for policy and value networks"""
-    warmup_steps: int = 1000
-    """Number of steps for learning rate warmup (0 to disable)"""
+    warmup_steps: int = 10000
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
     num_minibatches: int = 32
-    """the number of mini-batches"""
     update_epochs: int = 4
-    """the K epochs to update the policy"""
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_eps: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function"""
-    ent_coef: float = 0.01
-    """coefficient of the entropy"""
+    ent_coef: float = 0.0
     vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
     max_action: float = 1.0
-    """maximum action value for clipping"""
     log_interval: int = 10
-    """logging interval (in updates)"""
-
-    # Data augmentation (DrQ-style)
-    use_augmentation: bool = False
-    """Toggle random shift data augmentation (DrQ-style)"""
-    augment_pad: int = 4
-    """Padding size for random shift augmentation"""
 
     # Debug/analysis flags
     debug_repr: bool = False
-    """Enable lightweight representation health metrics logging"""
 
     # Hierarchical frame stacking
-    # Total frames = temporal_stack × channel_stack
-    temporal_stack: int = 4
-    """Number of temporal tokens in the sequence"""
-    channel_stack: int = 2
-    """Number of frames stacked per token (channel-wise, like CNNs)"""
+    temporal_stack: int = 8
+    channel_stack: int = 4
 
     # Action repeat
-    action_repeat: int = 1
-    """Number of times to repeat each action (frame skip)"""
+    action_repeat: int = 4
 
-    # Temporal CRATE-specific arguments
+    # Factorized CRATE architecture
+    patch_size: int = 14
     embed_dim: int = 256
-    """embedding dimension for CRATE"""
-    depth: int = 6
-    """number of transformer layers"""
+    spatial_depth: int = 2
+    temporal_depth: int = 2
     num_heads: int = 4
-    """number of attention heads"""
     ista_step_size: float = 0.1
-    """step size for ISTA gradient update"""
     ista_lambda: float = 0.1
-    """sparsity regularization for ISTA"""
     emb_dropout: float = 0.0
-    """dropout after frame embedding"""
     attn_dropout: float = 0.0
-    """dropout in attention"""
-    pool: str = "cls"
-    """pooling type: 'cls' or 'mean'"""
 
     # to be filled in runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_updates: int = 0
-    """the number of updates (computed in runtime)"""
 
 
 # --------------------------------------------------------
-#  Temporal CRATE Architecture (JAX/Flax)
+#  Swish activation
 # --------------------------------------------------------
 
-class ISTAFeedForward(nn.Module):
+def swish(x):
+    """Swish activation: x * sigmoid(x)"""
+    return x * nn.sigmoid(x)
+
+
+# --------------------------------------------------------
+#  ISTA with Swish activation
+# --------------------------------------------------------
+
+class ISTASwish(nn.Module):
     """
-    ISTA-based feedforward layer from CRATE.
-    Uses gradient descent update with ReLU thresholding instead of standard MLP.
-
-    Update rule: x = ReLU(x + step_size * (W^T @ x - W^T @ W @ x) - step_size * lambda)
+    ISTA-based layer with Swish activation instead of ReLU.
+    Swish doesn't hard-zero negatives, preventing activation death.
     """
     dim: int
     step_size: float = 0.1
@@ -166,35 +122,30 @@ class ISTAFeedForward(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # Learnable weight matrix W
         weight = self.param(
             "weight",
             nn.initializers.kaiming_uniform(),
             (self.dim, self.dim)
         )
-
-        # Forward: x1 = W @ x
+        bias = self.param(
+            "bias",
+            nn.initializers.zeros,
+            (self.dim,)
+        )
         x1 = x @ weight.T
-
-        # Gradient computation for sparse coding objective
-        # grad_1 = W^T @ W @ x
         grad_1 = x1 @ weight
-        # grad_2 = W^T @ x
         grad_2 = x @ weight
-
-        # ISTA gradient update with ReLU thresholding
         grad_update = self.step_size * (grad_2 - grad_1) - self.step_size * self.lambd
-
-        # ReLU acts as soft thresholding for sparsity
-        output = nn.relu(x + grad_update)
+        output = swish(x + grad_update + bias)
         return output
 
 
+# --------------------------------------------------------
+#  CRATE Building Blocks with Swish
+# --------------------------------------------------------
+
 class CRATEAttention(nn.Module):
-    """
-    CRATE-style attention with single projection (Q=K=V).
-    This is a key simplification in CRATE's white-box design.
-    """
+    """CRATE-style attention with single projection (Q=K=V)."""
     dim: int
     heads: int = 8
     dim_head: int = 64
@@ -205,33 +156,24 @@ class CRATEAttention(nn.Module):
         B, N, _ = x.shape
         inner_dim = self.dim_head * self.heads
 
-        # Single projection for Q, K, V (CRATE's simplification)
         qkv = nn.Dense(
             inner_dim,
             use_bias=False,
             kernel_init=orthogonal(1.0),
         )(x)
 
-        # Reshape to (B, heads, N, dim_head)
         w = qkv.reshape(B, N, self.heads, self.dim_head)
-        w = jnp.transpose(w, (0, 2, 1, 3))  # (B, heads, N, dim_head)
+        w = jnp.transpose(w, (0, 2, 1, 3))
 
-        # Self-attention: W @ W^T (same projection for Q and K)
         scale = self.dim_head ** -0.5
         dots = jnp.matmul(w, jnp.transpose(w, (0, 1, 3, 2))) * scale
-
-        # Softmax attention
         attn = nn.softmax(dots, axis=-1)
         attn = nn.Dropout(self.dropout, deterministic=deterministic)(attn)
 
-        # Apply attention to values
         out = jnp.matmul(attn, w)
-
-        # Reshape back
-        out = jnp.transpose(out, (0, 2, 1, 3))  # (B, N, heads, dim_head)
+        out = jnp.transpose(out, (0, 2, 1, 3))
         out = out.reshape(B, N, inner_dim)
 
-        # Output projection
         out = nn.Dense(
             self.dim,
             kernel_init=orthogonal(1.0),
@@ -243,7 +185,13 @@ class CRATEAttention(nn.Module):
 
 
 class CRATEBlock(nn.Module):
-    """Single CRATE transformer block with pre-norm."""
+    """
+    CRATE transformer block with Swish ISTA.
+
+    Structure:
+        grad_x = PreNorm(Attention)(x) + x
+        x = PreNorm(ISTASwish)(grad_x)
+    """
     dim: int
     heads: int
     dim_head: int
@@ -253,7 +201,7 @@ class CRATEBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True):
-        # Pre-norm attention with residual
+        # Attention with residual
         y = nn.LayerNorm()(x)
         y = CRATEAttention(
             dim=self.dim,
@@ -261,66 +209,44 @@ class CRATEBlock(nn.Module):
             dim_head=self.dim_head,
             dropout=self.dropout,
         )(y, deterministic=deterministic)
-        grad_x = y + x  # Residual connection
+        grad_x = y + x
 
-        # Pre-norm ISTA feedforward
+        # ISTA with Swish (ISTASwish already applies swish internally)
         y = nn.LayerNorm()(grad_x)
-        x = ISTAFeedForward(
+        z = ISTASwish(
             dim=self.dim,
             step_size=self.ista_step_size,
             lambd=self.ista_lambda,
         )(y)
 
+        # Residual connection
+        x = x + z
+
         return x
 
 
-class TemporalCRATEEncoder(nn.Module):
-    """
-    Hierarchical Temporal CRATE encoder for pixel observations.
+# --------------------------------------------------------
+#  Factorized CRATE Encoder
+# --------------------------------------------------------
 
-    Combines CNN-style channel stacking with temporal transformer:
-    - Groups of frames are channel-stacked (local temporal info, like CNNs)
-    - Channel-stacked groups become tokens in a temporal sequence
-    - Temporal transformer attends across groups (global temporal info)
-
-    Total frames = temporal_stack × channel_stack
-    Example: temporal_stack=4, channel_stack=2 → 8 total frames
-             → 4 tokens, each with 2 frames channel-stacked
-    """
-    temporal_stack: int = 4
-    channel_stack: int = 2
+class PatchEmbed(nn.Module):
+    """CRATE-style patch embedding."""
+    patch_size: int = 14
     embed_dim: int = 256
-    depth: int = 6
-    num_heads: int = 4
-    emb_dropout: float = 0.0
-    attn_dropout: float = 0.0
-    ista_step_size: float = 0.1
-    ista_lambda: float = 0.1
-    pool: str = "cls"
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
-        """
-        Args:
-            x: (B, T, H, W, C_stacked) - batch of frame sequences
-               T = temporal_stack (number of tokens)
-               C_stacked = C * channel_stack (channel-stacked frames per token)
+    def __call__(self, x):
+        B, H, W, C = x.shape
+        p = self.patch_size
+        num_patches_h = H // p
+        num_patches_w = W // p
+        num_patches = num_patches_h * num_patches_w
+        patch_dim = p * p * C
 
-        Returns:
-            (B, 512) - encoded representation
-        """
-        B, T, H, W, C_stacked = x.shape
-        token_dim = H * W * C_stacked  # Each token: flattened channel-stacked frames
-        dim_head = self.embed_dim // self.num_heads
+        x = x.reshape(B, num_patches_h, p, num_patches_w, p, C)
+        x = jnp.transpose(x, (0, 1, 3, 2, 4, 5))
+        x = x.reshape(B, num_patches, patch_dim)
 
-        # Normalize pixel values
-        x = x.astype(jnp.float32) / 255.0
-
-        # Flatten each token: (B, T, H, W, C_stacked) → (B, T, H*W*C_stacked)
-        x = x.reshape(B, T, token_dim)
-
-        # Token embedding (like CRATE's patch embedding but for channel-stacked frames)
-        # LayerNorm → Linear → LayerNorm
         x = nn.LayerNorm()(x)
         x = nn.Dense(
             self.embed_dim,
@@ -329,27 +255,45 @@ class TemporalCRATEEncoder(nn.Module):
         )(x)
         x = nn.LayerNorm()(x)
 
-        # CLS token for sequence pooling
+        return x
+
+
+class SpatialCRATE(nn.Module):
+    """Spatial CRATE encoder for a single frame."""
+    patch_size: int = 14
+    embed_dim: int = 256
+    depth: int = 2
+    num_heads: int = 4
+    emb_dropout: float = 0.0
+    attn_dropout: float = 0.0
+    ista_step_size: float = 0.1
+    ista_lambda: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        B, H, W, C = x.shape
+        dim_head = self.embed_dim // self.num_heads
+        num_patches = (H // self.patch_size) * (W // self.patch_size)
+
+        x = PatchEmbed(patch_size=self.patch_size, embed_dim=self.embed_dim)(x)
+
         cls_token = self.param(
             "cls_token",
             nn.initializers.normal(stddev=0.02),
             (1, 1, self.embed_dim)
         )
         cls_tokens = jnp.broadcast_to(cls_token, (B, 1, self.embed_dim))
-        x = jnp.concatenate([cls_tokens, x], axis=1)  # (B, 1 + T, embed_dim)
+        x = jnp.concatenate([cls_tokens, x], axis=1)
 
-        # Temporal positional embeddings
         pos_embed = self.param(
             "pos_embed",
             nn.initializers.normal(stddev=0.02),
-            (1, 1 + T, self.embed_dim)
+            (1, 1 + num_patches, self.embed_dim)
         )
         x = x + pos_embed
 
-        # Embedding dropout
         x = nn.Dropout(self.emb_dropout, deterministic=deterministic)(x)
 
-        # CRATE transformer blocks (temporal attention)
         for _ in range(self.depth):
             x = CRATEBlock(
                 dim=self.embed_dim,
@@ -360,56 +304,172 @@ class TemporalCRATEEncoder(nn.Module):
                 ista_lambda=self.ista_lambda,
             )(x, deterministic=deterministic)
 
-        # Pooling
-        if self.pool == "mean":
-            x = x[:, 1:, :].mean(axis=1)  # Mean pool over temporal tokens
-        else:
-            x = x[:, 0]  # CLS token
+        x = nn.LayerNorm()(x)
+        return x[:, 0]
 
-        # Final layer norm and projection
+
+class TemporalCRATE(nn.Module):
+    """Temporal CRATE encoder."""
+    embed_dim: int = 256
+    depth: int = 2
+    num_heads: int = 4
+    emb_dropout: float = 0.0
+    attn_dropout: float = 0.0
+    ista_step_size: float = 0.1
+    ista_lambda: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        B, T, _ = x.shape
+        dim_head = self.embed_dim // self.num_heads
+
+        cls_token = self.param(
+            "cls_token",
+            nn.initializers.normal(stddev=0.02),
+            (1, 1, self.embed_dim)
+        )
+        cls_tokens = jnp.broadcast_to(cls_token, (B, 1, self.embed_dim))
+        x = jnp.concatenate([cls_tokens, x], axis=1)
+
+        pos_embed = self.param(
+            "pos_embed",
+            nn.initializers.normal(stddev=0.02),
+            (1, 1 + T, self.embed_dim)
+        )
+        x = x + pos_embed
+
+        x = nn.Dropout(self.emb_dropout, deterministic=deterministic)(x)
+
+        for _ in range(self.depth):
+            x = CRATEBlock(
+                dim=self.embed_dim,
+                heads=self.num_heads,
+                dim_head=dim_head,
+                dropout=self.attn_dropout,
+                ista_step_size=self.ista_step_size,
+                ista_lambda=self.ista_lambda,
+            )(x, deterministic=deterministic)
+
         x = nn.LayerNorm()(x)
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.LayerNorm()(x)
-        x = nn.tanh(x)
+        return x[:, 0]
+
+
+class FactorizedCRATEEncoder(nn.Module):
+    """Factorized Spatial-Temporal CRATE encoder with Swish ISTA."""
+    temporal_stack: int = 8
+    channel_stack: int = 4
+    patch_size: int = 14
+    embed_dim: int = 256
+    spatial_depth: int = 2
+    temporal_depth: int = 2
+    num_heads: int = 4
+    emb_dropout: float = 0.0
+    attn_dropout: float = 0.0
+    ista_step_size: float = 0.1
+    ista_lambda: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, deterministic: bool = True):
+        B, T, H, W, C_stacked = x.shape
+
+        x = x.astype(jnp.float32) / 255.0
+        x = x.reshape(B * T, H, W, C_stacked)
+
+        spatial_encoder = SpatialCRATE(
+            patch_size=self.patch_size,
+            embed_dim=self.embed_dim,
+            depth=self.spatial_depth,
+            num_heads=self.num_heads,
+            emb_dropout=self.emb_dropout,
+            attn_dropout=self.attn_dropout,
+            ista_step_size=self.ista_step_size,
+            ista_lambda=self.ista_lambda,
+        )
+        x = spatial_encoder(x, deterministic=deterministic)
+
+        x = x.reshape(B, T, self.embed_dim)
+
+        temporal_encoder = TemporalCRATE(
+            embed_dim=self.embed_dim,
+            depth=self.temporal_depth,
+            num_heads=self.num_heads,
+            emb_dropout=self.emb_dropout,
+            attn_dropout=self.attn_dropout,
+            ista_step_size=self.ista_step_size,
+            ista_lambda=self.ista_lambda,
+        )
+        x = temporal_encoder(x, deterministic=deterministic)
 
         return x
 
 
-class Critic(nn.Module):
-    """Value network with 2 hidden layers."""
+# --------------------------------------------------------
+#  Actor-Critic Heads with ISTA Swish
+# --------------------------------------------------------
+
+class ISTACritic(nn.Module):
+    """Value network with ISTA Swish layers instead of Dense+tanh."""
+    hidden_dim: int = 256
+    ista_step_size: float = 0.1
+    ista_lambda: float = 0.0
+
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
-        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+    def __call__(self, x, return_activations: bool = False):
+        # Project to hidden dim if needed
+        if x.shape[-1] != self.hidden_dim:
+            x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+
+        # ISTA layer 1
+        h1 = ISTASwish(dim=self.hidden_dim, step_size=self.ista_step_size, lambd=self.ista_lambda)(x)
+
+        # ISTA layer 2
+        h2 = ISTASwish(dim=self.hidden_dim, step_size=self.ista_step_size, lambd=self.ista_lambda)(h1)
+
+        # Output
+        out = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(h2)
+
+        if return_activations:
+            return out, (h1, h2)
+        return out
 
 
-class Actor(nn.Module):
-    """Continuous action actor with Gaussian distribution."""
+class ISTAActor(nn.Module):
+    """Continuous action actor with ISTA Swish layers instead of Dense+tanh."""
     action_dim: int
+    hidden_dim: int = 256
+    ista_step_size: float = 0.1
+    ista_lambda: float = 0.0
     log_std_min: float = -5.0
     log_std_max: float = 2.0
 
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+    def __call__(self, x, return_activations: bool = False):
+        # Project to hidden dim if needed
+        if x.shape[-1] != self.hidden_dim:
+            x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+
+        # ISTA layer 1
+        h1 = ISTASwish(dim=self.hidden_dim, step_size=self.ista_step_size, lambd=self.ista_lambda)(x)
+
+        # ISTA layer 2
+        h2 = ISTASwish(dim=self.hidden_dim, step_size=self.ista_step_size, lambd=self.ista_lambda)(h1)
+
+        # Output
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
-        )(x)
+        )(h2)
+
         actor_logstd = self.param(
             "log_std",
             nn.initializers.zeros,
             (self.action_dim,)
         )
-        # Clamp log_std to prevent extreme values
         actor_logstd = jnp.clip(actor_logstd, self.log_std_min, self.log_std_max)
+
+        if return_activations:
+            return actor_mean, actor_logstd, (h1, h2)
         return actor_mean, actor_logstd
 
 
@@ -439,17 +499,7 @@ class EpisodeStatistics:
 
 @flax.struct.dataclass
 class HierarchicalFrameStack:
-    """
-    Hierarchical frame stacking buffer that combines:
-    - Channel stacking (CNN-style, local temporal info)
-    - Temporal tokens (transformer-style, global temporal info)
-
-    Stores: (n_envs, total_frames, H, W, C)
-    Returns: (n_envs, temporal_stack, H, W, C * channel_stack)
-
-    Total frames = temporal_stack × channel_stack
-    """
-    frames: jnp.ndarray  # Shape: (n_envs, total_frames, H, W, C)
+    frames: jnp.ndarray
     temporal_stack: int = flax.struct.field(pytree_node=False)
     channel_stack: int = flax.struct.field(pytree_node=False)
 
@@ -461,27 +511,19 @@ class HierarchicalFrameStack:
         return cls(frames=frames, temporal_stack=temporal_stack, channel_stack=channel_stack)
 
     def reset(self, obs: jnp.ndarray, done: jnp.ndarray = None):
-        """Reset frame stack for environments that are done."""
         n_envs = obs.shape[0]
         total_frames = self.frames.shape[1]
-        # Fill all frames with the same observation on reset
         new_frames = jnp.broadcast_to(
             obs[:, None, :, :, :],
             (n_envs, total_frames, obs.shape[1], obs.shape[2], obs.shape[3])
         )
-
         if done is None:
             return self.replace(frames=new_frames)
         else:
-            frames = jnp.where(
-                done[:, None, None, None, None],
-                new_frames,
-                self.frames
-            )
+            frames = jnp.where(done[:, None, None, None, None], new_frames, self.frames)
             return self.replace(frames=frames)
 
     def push(self, obs: jnp.ndarray):
-        """Add new frame, shifting out the oldest."""
         new_frames = jnp.concatenate([
             self.frames[:, 1:, :, :, :],
             obs[:, None, :, :, :]
@@ -489,31 +531,15 @@ class HierarchicalFrameStack:
         return self.replace(frames=new_frames)
 
     def get_stacked(self) -> jnp.ndarray:
-        """
-        Return frames as hierarchical structure:
-        (B, temporal_stack, H, W, C * channel_stack)
-
-        Groups consecutive frames into channel-stacked tokens.
-        Example with temporal_stack=4, channel_stack=2:
-          frames [f0,f1,f2,f3,f4,f5,f6,f7] →
-          token0: [f0,f1] stacked → (H, W, 6)
-          token1: [f2,f3] stacked → (H, W, 6)
-          token2: [f4,f5] stacked → (H, W, 6)
-          token3: [f6,f7] stacked → (H, W, 6)
-        """
         n_envs, total_frames, H, W, C = self.frames.shape
-        # Reshape: (B, total_frames, H, W, C) → (B, temporal_stack, channel_stack, H, W, C)
         x = self.frames.reshape(n_envs, self.temporal_stack, self.channel_stack, H, W, C)
-        # Reorder to stack channels: (B, temporal_stack, H, W, channel_stack, C)
         x = jnp.transpose(x, (0, 1, 3, 4, 2, 5))
-        # Merge channel dimensions: (B, temporal_stack, H, W, channel_stack * C)
         x = x.reshape(n_envs, self.temporal_stack, H, W, self.channel_stack * C)
         return x
 
 
 @flax.struct.dataclass
 class RewardNormalizer:
-    """Reward normalization using discounted returns."""
     return_rms_mean: jnp.array
     return_rms_var: jnp.array
     return_rms_count: jnp.array
@@ -532,22 +558,17 @@ class RewardNormalizer:
 
     def update(self, rewards, dones):
         new_discounted_return = rewards + self.gamma * self.discounted_return * (1.0 - dones)
-
         batch_mean = jnp.mean(new_discounted_return)
         batch_var = jnp.var(new_discounted_return)
         batch_count = new_discounted_return.size
-
         delta = batch_mean - self.return_rms_mean
         tot_count = self.return_rms_count + batch_count
-
         new_mean = self.return_rms_mean + delta * batch_count / tot_count
         m_a = self.return_rms_var * self.return_rms_count
         m_b = batch_var * batch_count
         M2 = m_a + m_b + jnp.square(delta) * self.return_rms_count * batch_count / tot_count
         new_var = M2 / tot_count
-
         new_discounted_return = jnp.where(dones, 0.0, new_discounted_return)
-
         return self.replace(
             return_rms_mean=new_mean,
             return_rms_var=new_var,
@@ -561,11 +582,59 @@ class RewardNormalizer:
 
 
 # --------------------------------------------------------
-#  Environment and Augmentation
+#  Debug Metrics
+# --------------------------------------------------------
+
+def repr_health(hidden: jnp.ndarray) -> dict:
+    """Compute lightweight representation health metrics."""
+    dim_std = jnp.std(hidden, axis=0)
+    norms = jnp.linalg.norm(hidden, axis=-1)
+    return {
+        "repr/mean": jnp.mean(hidden),
+        "repr/std": jnp.std(hidden),
+        "repr/norm_mean": jnp.mean(norms),
+        "repr/norm_std": jnp.std(norms),
+        "repr/dead_dims": jnp.mean(dim_std < 0.01),
+        "repr/dim_std_min": jnp.min(dim_std),
+        "repr/dim_std_max": jnp.max(dim_std),
+        "repr/sparsity": jnp.mean(jnp.abs(hidden) < 0.01),
+    }
+
+
+def compute_grad_norms(grads: dict) -> dict:
+    """Compute gradient norms for encoder, actor, and critic."""
+    def tree_norm(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves))
+    return {
+        "grads/encoder_norm": tree_norm(grads['network']),
+        "grads/actor_norm": tree_norm(grads['actor']),
+        "grads/critic_norm": tree_norm(grads['critic']),
+    }
+
+
+def swish_activation_metrics(activations: tuple, name: str) -> dict:
+    """
+    Compute activation metrics for Swish layers.
+    Unlike tanh, Swish doesn't saturate, so we track different metrics.
+    """
+    metrics = {}
+    for i, h in enumerate(activations):
+        layer_name = f"{name}/layer{i+1}"
+        metrics[f"{layer_name}/mean"] = jnp.mean(h)
+        metrics[f"{layer_name}/std"] = jnp.std(h)
+        metrics[f"{layer_name}/min"] = jnp.min(h)
+        metrics[f"{layer_name}/max"] = jnp.max(h)
+        metrics[f"{layer_name}/dead_frac"] = jnp.mean(jnp.abs(h) < 0.01)  # Near-zero activations
+        metrics[f"{layer_name}/negative_frac"] = jnp.mean(h < 0)  # Fraction negative
+    return metrics
+
+
+# --------------------------------------------------------
+#  Environment
 # --------------------------------------------------------
 
 def make_pixelbrax_envs(args):
-    """Create PixelBrax environments."""
     envs, _, _ = make_pixel_brax(
         backend=args.backend,
         env_name=args.env_name,
@@ -578,76 +647,11 @@ def make_pixelbrax_envs(args):
         return_float32=False,
         action_repeat=args.action_repeat,
     )
-
     try:
         action_dim = envs.action_size
     except AttributeError:
         action_dim = envs.env.action_size
-
     return envs, action_dim
-
-
-def repr_health(hidden: jnp.ndarray) -> dict:
-    """
-    Compute lightweight representation health metrics.
-    hidden: (B, D) - batch of hidden representations
-    """
-    dim_std = jnp.std(hidden, axis=0)  # Std per dimension
-    norms = jnp.linalg.norm(hidden, axis=-1)
-
-    return {
-        "repr/mean": jnp.mean(hidden),
-        "repr/std": jnp.std(hidden),
-        "repr/norm_mean": jnp.mean(norms),
-        "repr/norm_std": jnp.std(norms),
-        "repr/dead_dims": jnp.mean(dim_std < 0.01),  # Fraction of collapsed dims
-        "repr/dim_std_min": jnp.min(dim_std),        # Worst dimension
-        "repr/dim_std_max": jnp.max(dim_std),        # Most active dimension
-        "repr/sparsity": jnp.mean(jnp.abs(hidden) < 0.01),  # ISTA sparsity effect
-    }
-
-
-def compute_grad_norms(grads: dict) -> dict:
-    """
-    Compute gradient norms for encoder, actor, and critic separately.
-    Helps diagnose gradient flow issues.
-    """
-    def tree_norm(tree):
-        leaves = jax.tree_util.tree_leaves(tree)
-        return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves))
-
-    return {
-        "grads/encoder_norm": tree_norm(grads['network']),
-        "grads/actor_norm": tree_norm(grads['actor']),
-        "grads/critic_norm": tree_norm(grads['critic']),
-    }
-
-
-def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.ndarray:
-    """
-    DrQ-style random shift augmentation for hierarchical temporal frames.
-    x: (B, T, H, W, C_stacked) where C_stacked = C * channel_stack
-    """
-    B, T, H, W, C_stacked = x.shape
-    # Reshape to apply same shift to all tokens in sequence
-    x_flat = x.reshape(B * T, H, W, C_stacked)
-
-    x_padded = jnp.pad(x_flat, ((0, 0), (pad, pad), (pad, pad), (0, 0)), mode='edge')
-
-    # Same crop for all tokens in a batch element
-    key1, key2 = jax.random.split(key)
-    crop_h = jax.random.randint(key1, (B,), 0, 2 * pad + 1)
-    crop_w = jax.random.randint(key2, (B,), 0, 2 * pad + 1)
-
-    # Repeat crops for each token
-    crop_h = jnp.repeat(crop_h, T)
-    crop_w = jnp.repeat(crop_w, T)
-
-    def crop_single(x_pad, ch, cw):
-        return jax.lax.dynamic_slice(x_pad, (ch, cw, 0), (H, W, C_stacked))
-
-    x_cropped = jax.vmap(crop_single)(x_padded, crop_h, crop_w)
-    return x_cropped.reshape(B, T, H, W, C_stacked)
 
 
 # --------------------------------------------------------
@@ -659,7 +663,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_name}__temporal_crate__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_name}__crate_swish__{args.seed}__{int(time.time())}"
 
     if args.track:
         import wandb
@@ -672,15 +676,13 @@ if __name__ == "__main__":
             save_code=True,
         )
 
-    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
     key, network_key, actor_key, critic_key = jax.random.split(key, 4)
 
-    # Environment setup
     print("=" * 60)
-    print("Temporal CRATE PPO")
+    print("CRATE PPO with Swish ISTA")
     print("=" * 60)
     print(f"JAX devices: {jax.devices()}")
     print(f"env name: {args.env_name}")
@@ -692,40 +694,37 @@ if __name__ == "__main__":
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
+
     total_frames = args.temporal_stack * args.channel_stack
-    print(f"\nHierarchical Temporal CRATE config:")
-    print(f"  temporal_stack: {args.temporal_stack} (transformer tokens)")
-    print(f"  channel_stack: {args.channel_stack} (frames per token)")
+    num_patches = (args.hw // args.patch_size) ** 2
+    print(f"\nFactorized CRATE Swish config:")
+    print(f"  temporal_stack: {args.temporal_stack}")
+    print(f"  channel_stack: {args.channel_stack}")
     print(f"  total_frames: {total_frames}")
+    print(f"  patch_size: {args.patch_size}")
+    print(f"  num_patches per frame: {num_patches}")
     print(f"  embed_dim: {args.embed_dim}")
-    print(f"  depth: {args.depth}")
+    print(f"  spatial_depth: {args.spatial_depth}")
+    print(f"  temporal_depth: {args.temporal_depth}")
     print(f"  num_heads: {args.num_heads}")
     print(f"  ista_step_size: {args.ista_step_size}")
     print(f"  ista_lambda: {args.ista_lambda}")
-    print(f"  pool: {args.pool}")
+    print(f"  activation: Swish (all ISTA layers)")
     print("=" * 60)
 
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
 
-    # Get observation shape
     reset_rng = jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs)
     init_env_state = envs.reset(reset_rng)
-    raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
+    raw_obs_shape = init_env_state.pixels.shape[1:]
     H, W, C = raw_obs_shape
 
-    # Hierarchical observation shape: (temporal_stack, H, W, C * channel_stack)
     C_stacked = C * args.channel_stack
     obs_shape = (args.temporal_stack, H, W, C_stacked)
-    token_dim = H * W * C_stacked
 
     print(f"raw_obs_shape: {raw_obs_shape}")
-    print(f"temporal_stack: {args.temporal_stack}")
-    print(f"channel_stack: {args.channel_stack}")
-    print(f"total_frames: {total_frames}")
     print(f"obs_shape (T, H, W, C_stacked): {obs_shape}")
-    print(f"token_dim (H*W*C_stacked): {token_dim}")
-    print(f"sequence length: {args.temporal_stack} tokens + 1 CLS = {args.temporal_stack + 1}")
 
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
@@ -735,42 +734,44 @@ if __name__ == "__main__":
     )
 
     def lr_schedule(count):
-        """Learning rate schedule with optional warmup and annealing."""
-        # count = number of optimizer steps (minibatches processed)
-        # Convert to update steps for annealing calculation
         update_step = count // (args.num_minibatches * args.update_epochs)
-
-        # Warmup phase: linear increase from 0 to target LR
         if args.warmup_steps > 0:
             warmup_ratio = jnp.minimum(count / args.warmup_steps, 1.0)
         else:
             warmup_ratio = 1.0
-
-        # Annealing phase: linear decay from target LR to 0
         if args.anneal_lr:
             anneal_ratio = 1.0 - update_step / args.num_updates
         else:
             anneal_ratio = 1.0
-
         return args.learning_rate * warmup_ratio * anneal_ratio
 
-    # Initialize Hierarchical Temporal CRATE network
-    network = TemporalCRATEEncoder(
+    # Initialize network
+    network = FactorizedCRATEEncoder(
         temporal_stack=args.temporal_stack,
         channel_stack=args.channel_stack,
+        patch_size=args.patch_size,
         embed_dim=args.embed_dim,
-        depth=args.depth,
+        spatial_depth=args.spatial_depth,
+        temporal_depth=args.temporal_depth,
         num_heads=args.num_heads,
         emb_dropout=args.emb_dropout,
         attn_dropout=args.attn_dropout,
         ista_step_size=args.ista_step_size,
         ista_lambda=args.ista_lambda,
-        pool=args.pool,
     )
-    actor = Actor(action_dim=action_dim)
-    critic = Critic()
+    # ISTA Actor and Critic with Swish
+    actor = ISTAActor(
+        action_dim=action_dim,
+        hidden_dim=256,
+        ista_step_size=args.ista_step_size,
+        ista_lambda=0.0,  # No sparsity in heads
+    )
+    critic = ISTACritic(
+        hidden_dim=256,
+        ista_step_size=args.ista_step_size,
+        ista_lambda=0.0,  # No sparsity in heads
+    )
 
-    # Dummy input: (B, temporal_stack, H, W, C_stacked)
     dummy_obs = jnp.zeros((1,) + obs_shape)
     print(f"dummy_obs shape: {dummy_obs.shape}")
 
@@ -778,29 +779,70 @@ if __name__ == "__main__":
     dummy_hidden = network.apply(network_params, dummy_obs, deterministic=True)
     print(f"encoder output shape: {dummy_hidden.shape}")
 
-    # Create optimizer (Adam with warmup)
+    # Initialize params
+    actor_params = actor.init(actor_key, dummy_hidden)
+    critic_params = critic.init(critic_key, dummy_hidden)
+    all_params = {
+        'network': network_params,
+        'actor': actor_params,
+        'critic': critic_params,
+    }
+
+    # Create optimizer
     use_schedule = args.anneal_lr or args.warmup_steps > 0
+
+    def make_optimizer(lr_scale=1.0):
+        def scaled_lr_schedule(count):
+            return lr_schedule(count) * lr_scale
+
+        if args.weight_decay > 0:
+            return optax.adamw(
+                learning_rate=scaled_lr_schedule if use_schedule else args.learning_rate * lr_scale,
+                eps=1e-5,
+                weight_decay=args.weight_decay,
+            )
+        else:
+            return optax.adam(
+                learning_rate=scaled_lr_schedule if use_schedule else args.learning_rate * lr_scale,
+                eps=1e-5,
+            )
+
+    def label_fn(params):
+        def _label(path, _):
+            return path[0]
+        flat = flax.traverse_util.flatten_dict(params)
+        labeled = {k: _label(k, v) for k, v in flat.items()}
+        return flax.core.freeze(flax.traverse_util.unflatten_dict(labeled))
+
+    param_labels = label_fn(flax.core.unfreeze(flax.core.freeze(all_params)))
+
     tx = optax.chain(
         optax.clip_by_global_norm(args.max_grad_norm),
-        optax.inject_hyperparams(optax.adam)(
-            learning_rate=lr_schedule if use_schedule else args.learning_rate,
-            eps=1e-5
+        optax.multi_transform(
+            transforms={
+                'network': make_optimizer(lr_scale=args.encoder_lr_scale),
+                'actor': make_optimizer(lr_scale=1.0),
+                'critic': make_optimizer(lr_scale=1.0),
+            },
+            param_labels=param_labels,
         ),
     )
 
     agent_state = TrainState.create(
         apply_fn=None,
-        params=flax.core.freeze({
-            'network': network_params,
-            'actor': actor.init(actor_key, dummy_hidden),
-            'critic': critic.init(critic_key, dummy_hidden),
-        }),
+        params=flax.core.freeze(all_params),
         tx=tx,
     )
 
-    # Count parameters
+    print(f"encoder_lr_scale: {args.encoder_lr_scale}")
+    print(f"weight_decay: {args.weight_decay}")
+
     param_count = sum(x.size for x in jax.tree_util.tree_leaves(agent_state.params))
     print(f"Total parameters: {param_count:,}")
+
+    # Keep non-JIT versions for debug logging (return_activations needs concrete bool)
+    actor_apply_debug = actor.apply
+    critic_apply_debug = critic.apply
 
     network.apply = jax.jit(partial(network.apply, deterministic=True))
     actor.apply = jax.jit(actor.apply)
@@ -812,19 +854,14 @@ if __name__ == "__main__":
         next_obs: np.ndarray,
         key: jax.random.PRNGKey,
     ):
-        """next_obs: (B, temporal_stack, H, W, C_stacked)"""
         hidden = network.apply(agent_state.params['network'], next_obs)
         actor_mean, actor_logstd = actor.apply(agent_state.params['actor'], hidden)
-
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
-
         key, subkey = jax.random.split(key)
         action = pi.sample(seed=subkey)
         logprob = pi.log_prob(action)
         value = critic.apply(agent_state.params['critic'], hidden)
-
         action = jnp.clip(action, -args.max_action, args.max_action)
-
         return action, logprob, value.squeeze(-1), key
 
     @jax.jit
@@ -833,23 +870,18 @@ if __name__ == "__main__":
         x: np.ndarray,
         action: np.ndarray,
     ):
-        """x: (B, temporal_stack, H, W, C_stacked)"""
         hidden = network.apply(params['network'], x)
         actor_mean, actor_logstd = actor.apply(params['actor'], hidden)
-
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
-
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
         value = critic.apply(params['critic'], hidden).squeeze(-1)
-
         return logprob, entropy, value
 
     def compute_gae_once(carry, inp, gamma, gae_lambda):
         advantages = carry
         nextdone, nextvalues, curvalues, reward = inp
         nextnonterminal = 1.0 - nextdone
-
         delta = reward + gamma * nextvalues * nextnonterminal - curvalues
         advantages = delta + gamma * gae_lambda * nextnonterminal * advantages
         return advantages, advantages
@@ -867,7 +899,6 @@ if __name__ == "__main__":
             agent_state.params['critic'],
             network.apply(agent_state.params['network'], next_obs)
         ).squeeze(-1)
-
         advantages = jnp.zeros((args.n_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
@@ -880,10 +911,7 @@ if __name__ == "__main__":
         )
         return storage
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values, aug_key):
-        if args.use_augmentation:
-            x = random_shift(aug_key, x, pad=args.augment_pad)
-
+    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values):
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
@@ -898,9 +926,7 @@ if __name__ == "__main__":
 
         if args.clip_vloss:
             v_loss_unclipped = (newvalue - mb_returns) ** 2
-            v_clipped = mb_values + jnp.clip(
-                newvalue - mb_values, -args.clip_eps, args.clip_eps
-            )
+            v_clipped = mb_values + jnp.clip(newvalue - mb_values, -args.clip_eps, args.clip_eps)
             v_loss_clipped = (v_clipped - mb_returns) ** 2
             v_loss = 0.5 * jnp.maximum(v_loss_unclipped, v_loss_clipped).mean()
         else:
@@ -920,7 +946,7 @@ if __name__ == "__main__":
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
-            key, subkey, aug_key = jax.random.split(key, 3)
+            key, subkey = jax.random.split(key)
 
             def flatten(x):
                 return x.reshape((-1,) + x.shape[2:])
@@ -933,11 +959,8 @@ if __name__ == "__main__":
             flatten_storage = jax.tree_map(flatten, storage)
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
 
-            aug_keys = jax.random.split(aug_key, args.num_minibatches)
-
-            def update_minibatch(carry, inputs):
+            def update_minibatch(carry, minibatch):
                 agent_state = carry
-                minibatch, mb_aug_key = inputs
                 (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
@@ -946,20 +969,18 @@ if __name__ == "__main__":
                     minibatch.advantages,
                     minibatch.returns,
                     minibatch.values,
-                    mb_aug_key,
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
                 return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
             agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-                update_minibatch, agent_state, (shuffled_storage, aug_keys)
+                update_minibatch, agent_state, shuffled_storage
             )
             return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
         (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
             update_epoch, (agent_state, key), (), length=args.update_epochs
         )
-        # Return final gradients for analysis (last epoch, last minibatch)
         final_grads = jax.tree_map(lambda x: x[-1, -1], grads)
         return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key
 
@@ -971,12 +992,11 @@ if __name__ == "__main__":
     reset_rngs = jax.random.split(reset_key, args.n_envs)
     env_state = envs.reset(reset_rngs)
 
-    # Initialize hierarchical frame stack (returns (B, T, H, W, C_stacked))
     frame_stack = HierarchicalFrameStack.create(
         args.n_envs, args.temporal_stack, args.channel_stack, raw_obs_shape
     )
     frame_stack = frame_stack.reset(env_state.pixels)
-    next_obs = frame_stack.get_stacked()  # (B, temporal_stack, H, W, C * channel_stack)
+    next_obs = frame_stack.get_stacked()
     next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
 
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
@@ -986,14 +1006,13 @@ if __name__ == "__main__":
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
         env_state = envs.step(env_state, action)
-        raw_obs = env_state.pixels  # (B, H, W, C)
+        raw_obs = env_state.pixels
         raw_reward = env_state.reward
         next_done = env_state.done.astype(jnp.bool_)
 
-        # Update frame stack
         fs = fs.push(raw_obs)
         fs = fs.reset(raw_obs, next_done)
-        next_obs = fs.get_stacked()  # (B, temporal_stack, H, W, C * channel_stack)
+        next_obs = fs.get_stacked()
 
         reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
         reward = reward_norm.normalize(raw_reward)
@@ -1063,9 +1082,10 @@ if __name__ == "__main__":
             )
 
             if args.track:
-                lr = agent_state.opt_state[1].hyperparams["learning_rate"].item()
+                opt_step = iteration * args.update_epochs * args.num_minibatches
+                lr = float(lr_schedule(opt_step))
+                encoder_lr = lr * args.encoder_lr_scale
 
-                # Get log_std values from actor params
                 log_std = jax.device_get(agent_state.params['actor']['params']['log_std'])
                 log_std_mean = float(np.mean(log_std))
                 log_std_min = float(np.min(log_std))
@@ -1078,6 +1098,7 @@ if __name__ == "__main__":
                     "charts/cumulative_episodic_return": cumulative_episodic_return,
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
                     "charts/learning_rate": lr,
+                    "charts/encoder_learning_rate": encoder_lr,
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),
@@ -1091,17 +1112,29 @@ if __name__ == "__main__":
                     "policy/std_mean": std_mean,
                 }
 
-                # Add debug representation metrics if enabled
                 if args.debug_repr:
-                    # Compute representation health on current observations
                     hidden = network.apply(agent_state.params['network'], next_obs)
                     health_metrics = repr_health(hidden)
                     for k, v in health_metrics.items():
                         log_dict[k] = float(jax.device_get(v))
 
-                    # Compute gradient norms
                     grad_metrics = compute_grad_norms(final_grads)
                     for k, v in grad_metrics.items():
+                        log_dict[k] = float(jax.device_get(v))
+
+                    # Swish activation metrics for actor and critic (use non-JIT versions)
+                    _, _, actor_activations = actor_apply_debug(
+                        agent_state.params['actor'], hidden, return_activations=True
+                    )
+                    actor_metrics = swish_activation_metrics(actor_activations, "actor_swish")
+                    for k, v in actor_metrics.items():
+                        log_dict[k] = float(jax.device_get(v))
+
+                    _, critic_activations = critic_apply_debug(
+                        agent_state.params['critic'], hidden, return_activations=True
+                    )
+                    critic_metrics = swish_activation_metrics(critic_activations, "critic_swish")
+                    for k, v in critic_metrics.items():
                         log_dict[k] = float(jax.device_get(v))
 
                 wandb.log(log_dict, step=global_step)

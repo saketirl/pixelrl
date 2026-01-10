@@ -3,7 +3,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 mkdir -p pixelenvs/pixelrl
 
 cd pixelenvs/pixelrl
-git clone https://github.com/saketirl/pixelrl.git
+git clone https://github.com/saketirl/pixelrl.git .
 git submodule update --init --recursive
 
 curl https://pyenv.run | bash
