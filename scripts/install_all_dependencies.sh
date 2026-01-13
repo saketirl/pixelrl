@@ -2,26 +2,9 @@
 curl -LsSf https://astral.sh/uv/install.sh | sh
 mkdir -p pixelenvs/pixelrl
 
-cd pixelenvs/pixelrl
+cd /home/ubuntu/pixelenvs/pixelrl
 git clone https://github.com/saketirl/pixelrl.git .
 git submodule update --init --recursive
-
-curl https://pyenv.run | bash
-
-cat <<'EOF' >> ~/.bashrc
-
-# >>> pyenv setup >>>
-export PATH="$HOME/.pyenv/bin:$PATH"
-eval "$(pyenv init -)"
-eval "$(pyenv virtualenv-init -)"
-# <<< pyenv setup <<<
-EOF
-
-source ~/.bashrc
-
-pyenv --version
-
-pyenv install 3.9.19
 
 sudo add-apt-repository ppa:deadsnakes/ppa
 sudo apt update

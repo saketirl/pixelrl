@@ -177,6 +177,8 @@ clean_rl_reference/
 *.out
 slurm_logs/
 
+run_data/*
+
 #wandb
 wandb/
 *.json

@@ -4,16 +4,15 @@ PPO for PixelBrax environments using Factorized CRATE with Swish activations
 and Manifold MUON optimizer.
 
 Key differences from swish version:
-- Uses Manifold MUON optimizer for all matrix parameters (ndim >= 2)
-- Uses Adam for all vector/scalar parameters (ndim < 2)
-- MUON keeps weight matrices on the Stiefel manifold (orthonormal structure)
+- Uses Manifold MUON for all matrices (2D+ parameters) - keeps weights on Stiefel manifold
+- Uses Adam for vectors and scalars (1D and 0D parameters) - biases, layer norms, log_std, etc.
 """
 import os
 import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Sequence, Any, Tuple
+from typing import Sequence
 
 import flax
 import flax.linen as nn
@@ -21,11 +20,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import wandb
 import tyro
 import distrax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-from optax._src import base
 
 import sys
 sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/brax")
@@ -33,11 +32,14 @@ import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
-from manifold_muon_optax import manifold_muon, msign_simple
+from manifold_muon_optax import manifold_muon
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+os.environ["WANDB_DISABLE_CODE"] = "true"
+os.environ["WANDB_DISABLE_GIT"] = "true"
+os.environ["WANDB_DISABLE_PACKAGE_CHECK"] = "true"
 
 
 @dataclass
@@ -56,8 +58,11 @@ class Args:
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
-    learning_rate: float = 3e-4
-    encoder_lr_scale: float = 1.0
+    # Learning rates for each component/param-type combination
+    encoder_muon_lr: float = 3e-4
+    encoder_adam_lr: float = 3e-4
+    heads_muon_lr: float = 3e-4
+    heads_adam_lr: float = 3e-4
     weight_decay: float = 0.0
     num_steps: int = 256
     anneal_lr: bool = False
@@ -209,16 +214,16 @@ class CRATEBlock(nn.Module):
     ista_lambda: float = 0.1
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
+    def __call__(self, x, deterministic: bool = True, return_intermediates: bool = False):
         # Attention with residual
         y = nn.LayerNorm()(x)
-        y = CRATEAttention(
+        attn_out = CRATEAttention(
             dim=self.dim,
             heads=self.heads,
             dim_head=self.dim_head,
             dropout=self.dropout,
         )(y, deterministic=deterministic)
-        grad_x = y + x
+        grad_x = attn_out + x
 
         # ISTA with Swish (ISTASwish already applies swish internally)
         y = nn.LayerNorm()(grad_x)
@@ -231,6 +236,8 @@ class CRATEBlock(nn.Module):
         # Residual connection
         x = x + z
 
+        if return_intermediates:
+            return x, attn_out
         return x
 
 
@@ -279,7 +286,7 @@ class SpatialCRATE(nn.Module):
     ista_lambda: float = 0.1
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
+    def __call__(self, x, deterministic: bool = True, return_intermediates: bool = False):
         B, H, W, C = x.shape
         dim_head = self.embed_dim // self.num_heads
         num_patches = (H // self.patch_size) * (W // self.patch_size)
@@ -303,17 +310,33 @@ class SpatialCRATE(nn.Module):
 
         x = nn.Dropout(self.emb_dropout, deterministic=deterministic)(x)
 
+        attn_outputs = []
         for _ in range(self.depth):
-            x = CRATEBlock(
-                dim=self.embed_dim,
-                heads=self.num_heads,
-                dim_head=dim_head,
-                dropout=self.attn_dropout,
-                ista_step_size=self.ista_step_size,
-                ista_lambda=self.ista_lambda,
-            )(x, deterministic=deterministic)
+            if return_intermediates:
+                x, attn_out = CRATEBlock(
+                    dim=self.embed_dim,
+                    heads=self.num_heads,
+                    dim_head=dim_head,
+                    dropout=self.attn_dropout,
+                    ista_step_size=self.ista_step_size,
+                    ista_lambda=self.ista_lambda,
+                )(x, deterministic=deterministic, return_intermediates=True)
+                attn_outputs.append(attn_out)
+            else:
+                x = CRATEBlock(
+                    dim=self.embed_dim,
+                    heads=self.num_heads,
+                    dim_head=dim_head,
+                    dropout=self.attn_dropout,
+                    ista_step_size=self.ista_step_size,
+                    ista_lambda=self.ista_lambda,
+                )(x, deterministic=deterministic)
 
         x = nn.LayerNorm()(x)
+
+        if return_intermediates:
+            # Return: CLS output, full sequence (all tokens), attention outputs per layer
+            return x[:, 0], x, attn_outputs
         return x[:, 0]
 
 
@@ -328,7 +351,7 @@ class TemporalCRATE(nn.Module):
     ista_lambda: float = 0.1
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
+    def __call__(self, x, deterministic: bool = True, return_intermediates: bool = False):
         B, T, _ = x.shape
         dim_head = self.embed_dim // self.num_heads
 
@@ -349,17 +372,33 @@ class TemporalCRATE(nn.Module):
 
         x = nn.Dropout(self.emb_dropout, deterministic=deterministic)(x)
 
+        attn_outputs = []
         for _ in range(self.depth):
-            x = CRATEBlock(
-                dim=self.embed_dim,
-                heads=self.num_heads,
-                dim_head=dim_head,
-                dropout=self.attn_dropout,
-                ista_step_size=self.ista_step_size,
-                ista_lambda=self.ista_lambda,
-            )(x, deterministic=deterministic)
+            if return_intermediates:
+                x, attn_out = CRATEBlock(
+                    dim=self.embed_dim,
+                    heads=self.num_heads,
+                    dim_head=dim_head,
+                    dropout=self.attn_dropout,
+                    ista_step_size=self.ista_step_size,
+                    ista_lambda=self.ista_lambda,
+                )(x, deterministic=deterministic, return_intermediates=True)
+                attn_outputs.append(attn_out)
+            else:
+                x = CRATEBlock(
+                    dim=self.embed_dim,
+                    heads=self.num_heads,
+                    dim_head=dim_head,
+                    dropout=self.attn_dropout,
+                    ista_step_size=self.ista_step_size,
+                    ista_lambda=self.ista_lambda,
+                )(x, deterministic=deterministic)
 
         x = nn.LayerNorm()(x)
+
+        if return_intermediates:
+            # Return: CLS output, full sequence (all tokens), attention outputs per layer
+            return x[:, 0], x, attn_outputs
         return x[:, 0]
 
 
@@ -378,7 +417,7 @@ class FactorizedCRATEEncoder(nn.Module):
     ista_lambda: float = 0.1
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
+    def __call__(self, x, deterministic: bool = True, return_intermediates: bool = False):
         B, T, H, W, C_stacked = x.shape
 
         x = x.astype(jnp.float32) / 255.0
@@ -394,9 +433,15 @@ class FactorizedCRATEEncoder(nn.Module):
             ista_step_size=self.ista_step_size,
             ista_lambda=self.ista_lambda,
         )
-        x = spatial_encoder(x, deterministic=deterministic)
 
-        x = x.reshape(B, T, self.embed_dim)
+        if return_intermediates:
+            spatial_cls, spatial_seq, spatial_attn = spatial_encoder(
+                x, deterministic=deterministic, return_intermediates=True
+            )
+        else:
+            spatial_cls = spatial_encoder(x, deterministic=deterministic)
+
+        x = spatial_cls.reshape(B, T, self.embed_dim)
 
         temporal_encoder = TemporalCRATE(
             embed_dim=self.embed_dim,
@@ -407,8 +452,22 @@ class FactorizedCRATEEncoder(nn.Module):
             ista_step_size=self.ista_step_size,
             ista_lambda=self.ista_lambda,
         )
-        x = temporal_encoder(x, deterministic=deterministic)
 
+        if return_intermediates:
+            temporal_cls, temporal_seq, temporal_attn = temporal_encoder(
+                x, deterministic=deterministic, return_intermediates=True
+            )
+            intermediates = {
+                'spatial_cls': spatial_cls,  # (B*T, embed_dim)
+                'spatial_seq': spatial_seq,  # (B*T, num_patches+1, embed_dim)
+                'spatial_attn': spatial_attn,  # list of (B*T, num_patches+1, embed_dim)
+                'temporal_cls': temporal_cls,  # (B, embed_dim)
+                'temporal_seq': temporal_seq,  # (B, T+1, embed_dim)
+                'temporal_attn': temporal_attn,  # list of (B, T+1, embed_dim)
+            }
+            return temporal_cls, intermediates
+
+        x = temporal_encoder(x, deterministic=deterministic)
         return x
 
 
@@ -639,6 +698,93 @@ def swish_activation_metrics(activations: tuple, name: str) -> dict:
     return metrics
 
 
+def attention_vs_cls_metrics(intermediates: dict) -> dict:
+    """
+    Compute metrics comparing attention outputs vs CLS token outputs.
+
+    Tracks:
+    - Norms and statistics of attention outputs at each layer
+    - Norms and statistics of CLS tokens
+    - Ratio of attention to CLS norms (information flow)
+    - Cosine similarity between CLS and mean of patch tokens
+    """
+    metrics = {}
+
+    def compute_stats(x, prefix):
+        """Compute standard statistics for a tensor."""
+        norms = jnp.linalg.norm(x, axis=-1)
+        return {
+            f"{prefix}/mean": jnp.mean(x),
+            f"{prefix}/std": jnp.std(x),
+            f"{prefix}/norm_mean": jnp.mean(norms),
+            f"{prefix}/norm_std": jnp.std(norms),
+            f"{prefix}/norm_min": jnp.min(norms),
+            f"{prefix}/norm_max": jnp.max(norms),
+        }
+
+    # Spatial CLS output stats
+    spatial_cls = intermediates['spatial_cls']
+    metrics.update(compute_stats(spatial_cls, "spatial_cls"))
+
+    # Temporal CLS output stats (final encoder output)
+    temporal_cls = intermediates['temporal_cls']
+    metrics.update(compute_stats(temporal_cls, "temporal_cls"))
+
+    # Spatial attention outputs per layer
+    for i, attn_out in enumerate(intermediates['spatial_attn']):
+        # attn_out shape: (B*T, num_patches+1, embed_dim)
+        # CLS attention (first token)
+        cls_attn = attn_out[:, 0, :]
+        # Patch attention (rest of tokens)
+        patch_attn = attn_out[:, 1:, :]
+
+        metrics.update(compute_stats(cls_attn, f"spatial_attn_L{i}/cls"))
+        metrics.update(compute_stats(patch_attn, f"spatial_attn_L{i}/patches"))
+
+        # Ratio of CLS to patch attention norms
+        cls_norm = jnp.linalg.norm(cls_attn, axis=-1)
+        patch_norm = jnp.mean(jnp.linalg.norm(patch_attn, axis=-1), axis=-1)
+        metrics[f"spatial_attn_L{i}/cls_to_patch_ratio"] = jnp.mean(cls_norm / (patch_norm + 1e-8))
+
+    # Temporal attention outputs per layer
+    for i, attn_out in enumerate(intermediates['temporal_attn']):
+        # attn_out shape: (B, T+1, embed_dim)
+        cls_attn = attn_out[:, 0, :]
+        frame_attn = attn_out[:, 1:, :]
+
+        metrics.update(compute_stats(cls_attn, f"temporal_attn_L{i}/cls"))
+        metrics.update(compute_stats(frame_attn, f"temporal_attn_L{i}/frames"))
+
+        # Ratio of CLS to frame attention norms
+        cls_norm = jnp.linalg.norm(cls_attn, axis=-1)
+        frame_norm = jnp.mean(jnp.linalg.norm(frame_attn, axis=-1), axis=-1)
+        metrics[f"temporal_attn_L{i}/cls_to_frame_ratio"] = jnp.mean(cls_norm / (frame_norm + 1e-8))
+
+    # Full sequence comparisons
+    # Spatial: compare CLS to mean of patches
+    spatial_seq = intermediates['spatial_seq']  # (B*T, num_patches+1, embed_dim)
+    spatial_cls_final = spatial_seq[:, 0, :]
+    spatial_patches_mean = jnp.mean(spatial_seq[:, 1:, :], axis=1)
+
+    # Cosine similarity between CLS and mean patch
+    cos_sim = jnp.sum(spatial_cls_final * spatial_patches_mean, axis=-1) / (
+        jnp.linalg.norm(spatial_cls_final, axis=-1) * jnp.linalg.norm(spatial_patches_mean, axis=-1) + 1e-8
+    )
+    metrics["spatial/cls_patch_cosine_sim"] = jnp.mean(cos_sim)
+
+    # Temporal: compare CLS to mean of frames
+    temporal_seq = intermediates['temporal_seq']  # (B, T+1, embed_dim)
+    temporal_cls_final = temporal_seq[:, 0, :]
+    temporal_frames_mean = jnp.mean(temporal_seq[:, 1:, :], axis=1)
+
+    cos_sim = jnp.sum(temporal_cls_final * temporal_frames_mean, axis=-1) / (
+        jnp.linalg.norm(temporal_cls_final, axis=-1) * jnp.linalg.norm(temporal_frames_mean, axis=-1) + 1e-8
+    )
+    metrics["temporal/cls_frame_cosine_sim"] = jnp.mean(cos_sim)
+
+    return metrics
+
+
 def orthogonality_metrics(params: dict) -> dict:
     """
     Compute orthogonality metrics for weight matrices.
@@ -647,7 +793,8 @@ def orthogonality_metrics(params: dict) -> dict:
     metrics = {}
 
     def check_orthogonality(path, param):
-        if param.ndim >= 2:
+        # Only check 2D matrices with min dimension > 1 (same as MUON condition)
+        if param.ndim == 2 and min(param.shape) > 1:
             # For a matrix W, orthogonality means W^T @ W ≈ I (or W @ W^T ≈ I)
             if param.shape[0] <= param.shape[1]:
                 # More columns than rows: check W @ W^T
@@ -676,208 +823,80 @@ def orthogonality_metrics(params: dict) -> dict:
 
 
 # --------------------------------------------------------
-#  Hybrid Optimizer: MUON for matrices, Adam for vectors
+#  Optimizer: Manifold MUON for matrices, Adam for vectors/scalars
+#  with separate learning rates for encoder vs actor/critic heads
 # --------------------------------------------------------
 
-from typing import NamedTuple
-
-class HybridMuonAdamState(NamedTuple):
-    """State for hybrid MUON-Adam optimizer."""
-    muon_lambda: Any  # Dual variables for MUON (same structure as params)
-    adam_mu: Any      # Adam first moment (same structure as params)
-    adam_nu: Any      # Adam second moment (same structure as params)
-    step: jnp.ndarray
-
-
-def create_hybrid_muon_adam_optimizer(
-    learning_rate: float,
+def create_muon_matrices_adam_rest_optimizer(
+    encoder_muon_lr: float,
+    encoder_adam_lr: float,
+    heads_muon_lr: float,
+    heads_adam_lr: float,
     muon_dual_lr: float = 0.01,
     muon_dual_steps: int = 5,
     muon_msign_steps: int = 5,
     adam_eps: float = 1e-5,
-    adam_b1: float = 0.9,
-    adam_b2: float = 0.999,
     weight_decay: float = 0.0,
     max_grad_norm: float = 0.5,
 ):
     """
-    Create a hybrid optimizer that uses:
-    - Manifold MUON for all matrix parameters (ndim >= 2)
-    - Adam for all vector/scalar parameters (ndim < 2)
+    Create optimizer that uses:
+    - Manifold MUON for all matrices (2D+ parameters with min dimension > 1)
+    - Adam for vectors and scalars (1D and 0D parameters, or matrices with min dim <= 1)
+
+    With 4 separate learning rates:
+    - encoder_muon_lr: encoder matrices (MUON)
+    - encoder_adam_lr: encoder vectors/scalars (Adam)
+    - heads_muon_lr: actor/critic matrices (MUON)
+    - heads_adam_lr: actor/critic vectors/scalars (Adam)
     """
 
-    def init_fn(params):
-        # Initialize MUON lambda (for matrices) - zeros for vectors
-        def init_muon_lambda(p):
-            if p.ndim >= 2 and min(p.shape) > 1:
-                min_dim = min(p.shape[0], p.shape[1])
-                return jnp.zeros((min_dim, min_dim), dtype=p.dtype)
-            else:
-                return jnp.zeros((1,), dtype=p.dtype)  # Placeholder
+    # Create transforms for each combination of component and param type
+    def make_adam(lr):
+        if weight_decay > 0:
+            return optax.adamw(learning_rate=lr, eps=adam_eps, weight_decay=weight_decay)
+        return optax.adam(learning_rate=lr, eps=adam_eps)
 
-        # Initialize Adam moments (for vectors) - zeros for matrices
-        def init_adam(p):
-            return jnp.zeros_like(p)
-
-        muon_lambda = jax.tree_util.tree_map(init_muon_lambda, params)
-        adam_mu = jax.tree_util.tree_map(init_adam, params)
-        adam_nu = jax.tree_util.tree_map(init_adam, params)
-
-        return HybridMuonAdamState(
-            muon_lambda=muon_lambda,
-            adam_mu=adam_mu,
-            adam_nu=adam_nu,
-            step=jnp.array(0),
+    def make_muon(lr):
+        return manifold_muon(
+            learning_rate=lr,
+            dual_lr=muon_dual_lr,
+            dual_steps=muon_dual_steps,
+            msign_steps=muon_msign_steps,
+            min_ndim=2,
         )
 
-    def update_fn(updates, state, params=None):
-        if params is None:
-            raise ValueError("Hybrid MUON-Adam requires params")
+    # 4 transforms: encoder/heads x muon/adam
+    transforms = {
+        'encoder_muon': make_muon(encoder_muon_lr),
+        'encoder_adam': make_adam(encoder_adam_lr),
+        'heads_muon': make_muon(heads_muon_lr),
+        'heads_adam': make_adam(heads_adam_lr),
+    }
 
-        step = state.step
-        lr = learning_rate
+    # Label function: combines component (encoder/heads) and param type (muon/adam)
+    def label_fn(params):
+        def _label(path, param):
+            # Determine component: 'network' -> encoder, 'actor'/'critic' -> heads
+            is_encoder = path[0] == 'network'
+            component = 'encoder' if is_encoder else 'heads'
 
-        def compute_muon_update(g, p, lam):
-            """Compute MUON update for matrices, return update only."""
-            if p.ndim < 2 or min(p.shape) <= 1:
-                return jnp.zeros_like(p)
+            # Determine param type: matrices -> muon, vectors/scalars -> adam
+            is_matrix = param.ndim >= 2 and min(param.shape) > 1
+            param_type = 'muon' if is_matrix else 'adam'
 
-            should_transpose = p.shape[0] < p.shape[1]
-            W = p.T if should_transpose else p
-            G = g.T if should_transpose else g
+            return f'{component}_{param_type}'
 
-            # Ensure Lambda has correct shape
-            min_dim = min(W.shape[0], W.shape[1])
-            lam = jnp.where(
-                lam.shape[0] != min_dim,
-                jnp.zeros((min_dim, min_dim), dtype=W.dtype),
-                lam
-            )
+        flat = flax.traverse_util.flatten_dict(params)
+        labeled = {k: _label(k, v) for k, v in flat.items()}
+        return flax.core.freeze(flax.traverse_util.unflatten_dict(labeled))
 
-            # Initialize Lambda if zero
-            lam = jnp.where(
-                jnp.sum(jnp.abs(lam)) < 1e-10,
-                -0.25 * (W.T @ G + G.T @ W),
-                lam
-            )
-
-            # Dual optimization steps
-            def dual_step(lam, _):
-                A = msign_simple(G + 2 * W @ lam, steps=muon_msign_steps)
-                H = W.T @ A + A.T @ W
-                return lam - muon_dual_lr * H, None
-
-            lam, _ = jax.lax.scan(dual_step, lam, None, length=muon_dual_steps)
-
-            # Compute update direction
-            A = msign_simple(G + 2 * W @ lam, steps=muon_msign_steps)
-            new_W = W - lr * A
-            new_W = msign_simple(new_W, steps=muon_msign_steps)
-
-            if should_transpose:
-                return new_W.T - p
-            else:
-                return new_W - p
-
-        def compute_muon_lambda(g, p, lam):
-            """Compute new MUON lambda state."""
-            if p.ndim < 2 or min(p.shape) <= 1:
-                return lam
-
-            should_transpose = p.shape[0] < p.shape[1]
-            W = p.T if should_transpose else p
-            G = g.T if should_transpose else g
-
-            min_dim = min(W.shape[0], W.shape[1])
-            lam = jnp.where(
-                lam.shape[0] != min_dim,
-                jnp.zeros((min_dim, min_dim), dtype=W.dtype),
-                lam
-            )
-
-            lam = jnp.where(
-                jnp.sum(jnp.abs(lam)) < 1e-10,
-                -0.25 * (W.T @ G + G.T @ W),
-                lam
-            )
-
-            def dual_step(lam, _):
-                A = msign_simple(G + 2 * W @ lam, steps=muon_msign_steps)
-                H = W.T @ A + A.T @ W
-                return lam - muon_dual_lr * H, None
-
-            lam, _ = jax.lax.scan(dual_step, lam, None, length=muon_dual_steps)
-            return lam
-
-        def compute_adam_update(g, p, mu, nu):
-            """Compute Adam update for vectors/scalars."""
-            if p.ndim >= 2 and min(p.shape) > 1:
-                return jnp.zeros_like(p)
-
-            new_mu = adam_b1 * mu + (1 - adam_b1) * g
-            new_nu = adam_b2 * nu + (1 - adam_b2) * (g ** 2)
-
-            mu_hat = new_mu / (1 - adam_b1 ** (step + 1))
-            nu_hat = new_nu / (1 - adam_b2 ** (step + 1))
-
-            update = -lr * mu_hat / (jnp.sqrt(nu_hat) + adam_eps)
-
-            if weight_decay > 0:
-                update = update - lr * weight_decay * p
-
-            return update
-
-        def compute_adam_mu(g, p, mu):
-            """Compute new Adam mu state."""
-            if p.ndim >= 2 and min(p.shape) > 1:
-                return mu
-            return adam_b1 * mu + (1 - adam_b1) * g
-
-        def compute_adam_nu(g, p, nu):
-            """Compute new Adam nu state."""
-            if p.ndim >= 2 and min(p.shape) > 1:
-                return nu
-            return adam_b2 * nu + (1 - adam_b2) * (g ** 2)
-
-        # Compute updates separately
-        muon_updates = jax.tree_util.tree_map(
-            compute_muon_update, updates, params, state.muon_lambda
-        )
-        adam_updates = jax.tree_util.tree_map(
-            compute_adam_update, updates, params, state.adam_mu, state.adam_nu
-        )
-
-        # Compute new states separately
-        new_muon_lambda = jax.tree_util.tree_map(
-            compute_muon_lambda, updates, params, state.muon_lambda
-        )
-        new_adam_mu = jax.tree_util.tree_map(
-            compute_adam_mu, updates, params, state.adam_mu
-        )
-        new_adam_nu = jax.tree_util.tree_map(
-            compute_adam_nu, updates, params, state.adam_nu
-        )
-
-        # Combine updates (one will be zero, the other non-zero)
-        final_updates = jax.tree_util.tree_map(
-            lambda m, a: m + a,
-            muon_updates,
-            adam_updates,
-        )
-
-        new_state = HybridMuonAdamState(
-            muon_lambda=new_muon_lambda,
-            adam_mu=new_adam_mu,
-            adam_nu=new_adam_nu,
-            step=step + 1,
-        )
-
-        return final_updates, new_state
-
-    # Chain with gradient clipping
     return optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
-        base.GradientTransformation(init_fn, update_fn),
+        optax.multi_transform(
+            transforms=transforms,
+            param_labels=label_fn,
+        ),
     )
 
 
@@ -917,7 +936,7 @@ if __name__ == "__main__":
     run_name = f"{args.env_name}__crate_muon__{args.seed}__{int(time.time())}"
 
     if args.track:
-        import wandb
+
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -940,7 +959,6 @@ if __name__ == "__main__":
     print(f"total timesteps: {args.total_timesteps}")
     print(f"num steps per rollout: {args.num_steps}")
     print(f"num envs: {args.n_envs}")
-    print(f"learning rate: {args.learning_rate}")
     print(f"warmup_steps: {args.warmup_steps}")
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
@@ -961,12 +979,16 @@ if __name__ == "__main__":
     print(f"  ista_step_size: {args.ista_step_size}")
     print(f"  ista_lambda: {args.ista_lambda}")
     print(f"  activation: Swish (all ISTA layers)")
-    print(f"\nManifold MUON config:")
+    print(f"\nOptimizer config:")
+    print(f"  Matrices (2D+ params): Manifold MUON")
+    print(f"  Vectors/Scalars (1D/0D params): Adam")
+    print(f"  encoder_muon_lr: {args.encoder_muon_lr}")
+    print(f"  encoder_adam_lr: {args.encoder_adam_lr}")
+    print(f"  heads_muon_lr: {args.heads_muon_lr}")
+    print(f"  heads_adam_lr: {args.heads_adam_lr}")
     print(f"  muon_dual_lr: {args.muon_dual_lr}")
     print(f"  muon_dual_steps: {args.muon_dual_steps}")
     print(f"  muon_msign_steps: {args.muon_msign_steps}")
-    print(f"  Matrices (ndim>=2): MUON optimizer")
-    print(f"  Vectors/Scalars (ndim<2): Adam optimizer")
     print("=" * 60)
 
     envs, action_dim = make_pixelbrax_envs(args)
@@ -991,6 +1013,7 @@ if __name__ == "__main__":
     )
 
     def lr_schedule(count):
+        """Compute learning rate schedule (for logging only, uses heads_adam_lr as reference)."""
         update_step = count // (args.num_minibatches * args.update_epochs)
         if args.warmup_steps > 0:
             warmup_ratio = jnp.minimum(count / args.warmup_steps, 1.0)
@@ -1000,7 +1023,8 @@ if __name__ == "__main__":
             anneal_ratio = 1.0 - update_step / args.num_updates
         else:
             anneal_ratio = 1.0
-        return args.learning_rate * warmup_ratio * anneal_ratio
+        # Use heads_adam_lr as reference for logging
+        return args.heads_adam_lr * warmup_ratio * anneal_ratio
 
     # Initialize network
     network = FactorizedCRATEEncoder(
@@ -1045,23 +1069,41 @@ if __name__ == "__main__":
         'critic': critic_params,
     }
 
-    # Count matrix vs vector params
-    def count_params_by_type(params):
-        flat = flax.traverse_util.flatten_dict(params)
-        matrix_count = sum(p.size for p in flat.values() if p.ndim >= 2)
-        vector_count = sum(p.size for p in flat.values() if p.ndim < 2)
-        return matrix_count, vector_count
+    # Count params by component
+    def count_component_params(params, key):
+        if key in params:
+            return sum(p.size for p in jax.tree_util.tree_leaves(params[key]))
+        return 0
 
-    matrix_params, vector_params = count_params_by_type(all_params)
-    total_params = matrix_params + vector_params
-    print(f"\nParameter breakdown:")
-    print(f"  Matrix params (MUON): {matrix_params:,} ({100*matrix_params/total_params:.1f}%)")
-    print(f"  Vector params (Adam): {vector_params:,} ({100*vector_params/total_params:.1f}%)")
+    encoder_params = count_component_params(all_params, 'network')
+    actor_params = count_component_params(all_params, 'actor')
+    critic_params = count_component_params(all_params, 'critic')
+    total_params = encoder_params + actor_params + critic_params
+
+    print(f"\nParameter count by component:")
+    print(f"  Encoder params: {encoder_params:,} ({100*encoder_params/total_params:.1f}%)")
+    print(f"  Actor params: {actor_params:,} ({100*actor_params/total_params:.1f}%)")
+    print(f"  Critic params: {critic_params:,} ({100*critic_params/total_params:.1f}%)")
     print(f"  Total params: {total_params:,}")
 
-    # Create hybrid optimizer
-    tx = create_hybrid_muon_adam_optimizer(
-        learning_rate=args.learning_rate,
+    # Count params by shape (matrices vs vectors/scalars)
+    def count_by_shape(params):
+        flat = flax.traverse_util.flatten_dict(params)
+        muon_count = sum(p.size for p in flat.values() if p.ndim >= 2 and min(p.shape) > 1)
+        adam_count = sum(p.size for p in flat.values() if p.ndim < 2 or min(p.shape) <= 1)
+        return muon_count, adam_count
+
+    muon_params, adam_params = count_by_shape(all_params)
+    print(f"\nParameter breakdown by optimizer:")
+    print(f"  Matrix params (MUON): {muon_params:,} ({100*muon_params/total_params:.1f}%)")
+    print(f"  Vector/Scalar params (Adam): {adam_params:,} ({100*adam_params/total_params:.1f}%)")
+
+    # Create optimizer: MUON for matrices, Adam for vectors/scalars
+    tx = create_muon_matrices_adam_rest_optimizer(
+        encoder_muon_lr=args.encoder_muon_lr,
+        encoder_adam_lr=args.encoder_adam_lr,
+        heads_muon_lr=args.heads_muon_lr,
+        heads_adam_lr=args.heads_adam_lr,
         muon_dual_lr=args.muon_dual_lr,
         muon_dual_steps=args.muon_dual_steps,
         muon_msign_steps=args.muon_msign_steps,
@@ -1078,7 +1120,8 @@ if __name__ == "__main__":
 
     print(f"\nweight_decay: {args.weight_decay}")
 
-    # Keep non-JIT versions for debug logging (return_activations needs concrete bool)
+    # Keep non-JIT versions for debug logging (return_activations/return_intermediates needs concrete bool)
+    network_apply_debug = network.apply
     actor_apply_debug = actor.apply
     critic_apply_debug = critic.apply
 
@@ -1349,9 +1392,18 @@ if __name__ == "__main__":
                 }
 
                 if args.debug_repr:
-                    hidden = network.apply(agent_state.params['network'], next_obs)
+                    # Get encoder output with intermediates for attention vs CLS tracking
+                    hidden, intermediates = network_apply_debug(
+                        agent_state.params['network'], next_obs,
+                        deterministic=True, return_intermediates=True
+                    )
                     health_metrics = repr_health(hidden)
                     for k, v in health_metrics.items():
+                        log_dict[k] =float(jax.device_get(v))
+
+                    # Attention vs CLS metrics
+                    attn_cls_metrics = attention_vs_cls_metrics(intermediates)
+                    for k, v in attn_cls_metrics.items():
                         log_dict[k] = float(jax.device_get(v))
 
                     grad_metrics = compute_grad_norms(final_grads)

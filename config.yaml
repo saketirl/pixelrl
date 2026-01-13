@@ -1,0 +1,145 @@
+wandb_version: 1
+
+exp_name:
+  desc: null
+  value: ppo_pixelbrax_jax2_muon
+seed:
+  desc: null
+  value: 1
+track:
+  desc: null
+  value: true
+wandb_project_name:
+  desc: null
+  value: benchmark
+wandb_entity:
+  desc: null
+  value: null
+env_name:
+  desc: null
+  value: halfcheetah
+backend:
+  desc: null
+  value: spring
+n_envs:
+  desc: null
+  value: 128
+hw:
+  desc: null
+  value: 84
+total_timesteps:
+  desc: null
+  value: 10000000
+encoder_lr:
+  desc: null
+  value: 0.0003
+heads_muon_lr:
+  desc: null
+  value: 0.01
+heads_adam_lr:
+  desc: null
+  value: 0.0003
+num_steps:
+  desc: null
+  value: 10
+anneal_lr:
+  desc: null
+  value: true
+gamma:
+  desc: null
+  value: 0.99
+gae_lambda:
+  desc: null
+  value: 0.95
+num_minibatches:
+  desc: null
+  value: 32
+update_epochs:
+  desc: null
+  value: 4
+norm_adv:
+  desc: null
+  value: true
+clip_eps:
+  desc: null
+  value: 0.1
+clip_vloss:
+  desc: null
+  value: true
+ent_coef:
+  desc: null
+  value: 0.0
+vf_coef:
+  desc: null
+  value: 0.5
+max_grad_norm:
+  desc: null
+  value: 0.05
+max_action:
+  desc: null
+  value: 1.0
+log_interval:
+  desc: null
+  value: 1
+muon_dual_lr:
+  desc: null
+  value: 0.01
+muon_dual_steps:
+  desc: null
+  value: 5
+muon_msign_steps:
+  desc: null
+  value: 5
+use_augmentation:
+  desc: null
+  value: false
+augment_pad:
+  desc: null
+  value: 4
+frame_stack:
+  desc: null
+  value: 4
+action_repeat:
+  desc: null
+  value: 4
+debug_repr:
+  desc: null
+  value: true
+batch_size:
+  desc: null
+  value: 1280
+minibatch_size:
+  desc: null
+  value: 40
+num_updates:
+  desc: null
+  value: 7812
+_wandb:
+  desc: null
+  value:
+    code_path: code/ppo_pixelbrax_jax2_muon.py
+    python_version: 3.9.25
+    cli_version: 0.17.2
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1768192376
+    t:
+      1:
+      - 12
+      - 45
+      - 55
+      2:
+      - 12
+      - 45
+      - 55
+      3:
+      - 2
+      - 13
+      - 16
+      - 23
+      - 61
+      4: 3.9.25
+      5: 0.17.2
+      8:
+      - 5
+      13: linux-x86_64
