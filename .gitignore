@@ -178,7 +178,7 @@ clean_rl_reference/
 slurm_logs/
 
 run_data/*
-
+.DS_Store
 #wandb
 wandb/
 *.json
