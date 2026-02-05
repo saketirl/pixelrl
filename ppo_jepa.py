@@ -108,8 +108,8 @@ class Args:
     """Number of times to repeat each action (frame skip)"""
 
     # JEPA auxiliary objective
-    use_jepa: bool = True
-    """Toggle JEPA auxiliary objective"""
+    jepa_mode: str = "jepa"
+    """JEPA mode: 'none', 'jepa' (original), 'td_jepa' (successor features)"""
     jepa_lambda: float = 0.05
     """coefficient for JEPA loss"""
     jepa_ema_tau: float = 0.99
@@ -120,6 +120,22 @@ class Args:
     """updates before JEPA loss is active"""
     jepa_rampup_updates: int = 10
     """updates to linearly ramp JEPA lambda to target"""
+
+    # TD-JEPA (successor features) hyperparameters
+    sf_dim: int = 256
+    """dimensionality of successor/reward features"""
+    beta_sf: float = 0.1
+    """coefficient for SF TD loss"""
+    beta_r: float = 1.0
+    """coefficient for reward regression loss"""
+    sf_ema_tau: float = 0.995
+    """EMA coefficient for TD-JEPA target networks"""
+    sf_warmup_updates: int = 2
+    """updates before SF losses activate"""
+    sf_rampup_updates: int = 10
+    """updates to linearly ramp SF loss coefficients"""
+    refit_w_only: bool = False
+    """freeze all params except w for reward-change adaptation"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -228,6 +244,30 @@ class JEPAPredictor(nn.Module):
         return x
 
 
+class PsiHead(nn.Module):
+    """Reward features: hidden -> psi (sf_dim)."""
+    sf_dim: int = 256
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.LayerNorm()(x)
+        x = nn.tanh(x)
+        x = nn.Dense(self.sf_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        return x
+
+
+class MHead(nn.Module):
+    """Successor features: hidden -> m (sf_dim)."""
+    sf_dim: int = 256
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.LayerNorm()(x)
+        x = nn.tanh(x)
+        x = nn.Dense(self.sf_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        return x
+
+
 # JEPA Helper Functions
 
 def ema_update(target_params, online_params, tau):
@@ -296,13 +336,16 @@ def get_jepa_lambda_py(update_step, target_lambda, warmup_updates, rampup_update
 @flax.struct.dataclass
 class Storage:
     obs: jnp.array
+    next_obs: jnp.array
     actions: jnp.array
     logprobs: jnp.array
     dones: jnp.array
+    next_dones: jnp.array
     values: jnp.array
     advantages: jnp.array
     returns: jnp.array
     rewards: jnp.array
+    raw_rewards: jnp.array
 
 
 @flax.struct.dataclass
@@ -503,6 +546,8 @@ def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.n
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    args.use_jepa = (args.jepa_mode == "jepa")
+    args.use_td_jepa = (args.jepa_mode == "td_jepa")
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
@@ -535,12 +580,21 @@ if __name__ == "__main__":
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
-    print(f"use_jepa: {args.use_jepa}")
+    print(f"jepa_mode: {args.jepa_mode}")
     if args.use_jepa:
         print(f"jepa_lambda: {args.jepa_lambda}")
         print(f"jepa_ema_tau: {args.jepa_ema_tau}")
         print(f"jepa_warmup_updates: {args.jepa_warmup_updates}")
         print(f"jepa_rampup_updates: {args.jepa_rampup_updates}")
+    if args.use_td_jepa:
+        print(f"sf_dim: {args.sf_dim}")
+        print(f"beta_sf: {args.beta_sf}")
+        print(f"beta_r: {args.beta_r}")
+        print(f"sf_ema_tau: {args.sf_ema_tau}")
+        print(f"sf_warmup_updates: {args.sf_warmup_updates}")
+        print(f"sf_rampup_updates: {args.sf_rampup_updates}")
+    if args.refit_w_only:
+        print("REFIT-W-ONLY MODE: all params frozen except w")
 
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
@@ -580,14 +634,32 @@ if __name__ == "__main__":
     # Initialize predictor with dummy hidden state
     predictor_params = predictor.init(predictor_key, dummy_hidden)
 
+    params_dict = {
+        'network': network_params,
+        'actor': actor.init(actor_key, dummy_hidden),
+        'critic': critic.init(critic_key, dummy_hidden),
+        'predictor': predictor_params,
+    }
+
+    # TD-JEPA: initialize PsiHead, MHead, and w
+    if args.use_td_jepa:
+        psi_head = PsiHead(sf_dim=args.sf_dim)
+        m_head = MHead(sf_dim=args.sf_dim)
+        key, psi_key, m_key, w_key = jax.random.split(key, 4)
+        psi_params = psi_head.init(psi_key, dummy_hidden)
+        m_params = m_head.init(m_key, dummy_hidden)
+        w_init = jax.random.normal(w_key, (args.sf_dim,)) * 0.01
+        params_dict['psi_head'] = psi_params
+        params_dict['m_head'] = m_params
+        params_dict['w'] = {'w': w_init}
+    else:
+        # Create module references for consistent code paths (unused but needed for closures)
+        psi_head = PsiHead(sf_dim=args.sf_dim)
+        m_head = MHead(sf_dim=args.sf_dim)
+
     agent_state = TrainState.create(
         apply_fn=None,
-        params=flax.core.freeze({
-            'network': network_params,
-            'actor': actor.init(actor_key, dummy_hidden),
-            'critic': critic.init(critic_key, dummy_hidden),
-            'predictor': predictor_params,
-        }),
+        params=flax.core.freeze(params_dict),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
@@ -597,14 +669,24 @@ if __name__ == "__main__":
         ),
     )
 
-    # Target network params - separate from TrainState (no optimizer)
-    # Initialize with online network params
-    target_network_params = agent_state.params['network']
+    # Target params - separate from TrainState (no optimizer)
+    # Initialize with online params
+    if args.use_td_jepa:
+        target_params = flax.core.freeze({
+            'network': agent_state.params['network'],
+            'psi_head': agent_state.params['psi_head'],
+            'm_head': agent_state.params['m_head'],
+        })
+    else:
+        target_params = agent_state.params['network']
 
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
     predictor.apply = jax.jit(predictor.apply)
+    if args.use_td_jepa:
+        psi_head.apply = jax.jit(psi_head.apply)
+        m_head.apply = jax.jit(m_head.apply)
 
     @jax.jit
     def get_action_and_value(
@@ -622,12 +704,13 @@ if __name__ == "__main__":
         key, subkey = jax.random.split(key)
         action = pi.sample(seed=subkey)
         logprob = pi.log_prob(action)
-        value = critic.apply(agent_state.params['critic'], hidden)
+
+        value = critic.apply(agent_state.params['critic'], hidden).squeeze(-1)
 
         # Clip action
         action = jnp.clip(action, -args.max_action, args.max_action)
 
-        return action, logprob, value.squeeze(-1), key
+        return action, logprob, value, key
 
     @jax.jit
     def get_action_and_value2(
@@ -644,6 +727,7 @@ if __name__ == "__main__":
 
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
+
         value = critic.apply(params['critic'], hidden).squeeze(-1)
 
         return logprob, entropy, value
@@ -666,9 +750,9 @@ if __name__ == "__main__":
         next_done: np.ndarray,
         storage: Storage,
     ):
+        hidden = network.apply(agent_state.params['network'], next_obs)
         next_value = critic.apply(
-            agent_state.params['critic'],
-            network.apply(agent_state.params['network'], next_obs)
+            agent_state.params['critic'], hidden
         ).squeeze(-1)
 
         advantages = jnp.zeros((args.n_envs,))
@@ -743,12 +827,55 @@ if __name__ == "__main__":
 
         return jepa_loss
 
-    def ppo_jepa_loss(params, target_network_params, x, a, logp, mb_advantages,
-                      mb_returns, mb_values, aug_key, jepa_key, jepa_lambda_current):
-        """Combined PPO + JEPA loss function."""
+    def compute_sf_losses(params, target_params, obs, next_obs, rewards, next_dones, aug_key):
+        """Compute successor feature TD loss and reward regression loss."""
+        # Augment next_obs independently if augmentation enabled
+        if args.use_augmentation:
+            next_obs = random_shift(aug_key, next_obs, pad=args.augment_pad)
+
+        # Encode
+        hidden = network.apply(params['network'], obs)
+        hidden_next_tgt = network.apply(target_params['network'], next_obs)
+
+        # Online heads
+        psi = psi_head.apply(params['psi_head'], hidden)      # (B, sf_dim)
+        m = m_head.apply(params['m_head'], hidden)             # (B, sf_dim)
+        w = params['w']['w']                                    # (sf_dim,)
+
+        # Target m on next obs
+        m_tgt_next = m_head.apply(target_params['m_head'], hidden_next_tgt)
+
+        # SF TD target: psi(o_t) + gamma * (1 - d_t) * sg[m_tgt(o_{t+1})]
+        nonterminal = (1.0 - next_dones.astype(jnp.float32))[:, None]
+        sf_target = psi + args.gamma * nonterminal * jax.lax.stop_gradient(m_tgt_next)
+
+        # SF TD loss: ||m(o_t) - sf_target||^2  (psi gets grads, m_tgt_next is already stopped)
+        sf_td_loss = jnp.mean(jnp.sum((m - sf_target) ** 2, axis=-1))
+
+        # Reward regression loss: (w . psi(o_t) - r_t)^2
+        pred_reward = jnp.dot(psi, w)
+        reward_loss = jnp.mean((pred_reward - rewards) ** 2)
+
+        # Diagnostics
+        reward_r2 = 1.0 - jnp.sum((pred_reward - rewards)**2) / (jnp.sum((rewards - rewards.mean())**2) + 1e-8)
+        sf_td_error = jnp.mean(jnp.sqrt(jnp.sum((m - sf_target)**2, axis=-1)))
+        w_norm = jnp.linalg.norm(w)
+        psi_norm = jnp.mean(jnp.linalg.norm(psi, axis=-1))
+        m_norm = jnp.mean(jnp.linalg.norm(m, axis=-1))
+
+        return sf_td_loss, reward_loss, (reward_r2, sf_td_error, w_norm, psi_norm, m_norm)
+
+    def ppo_jepa_loss(params, target_params, x, a, logp, mb_advantages,
+                      mb_returns, mb_values, aug_key, jepa_key,
+                      jepa_lambda_current, next_x, mb_rewards, mb_raw_rewards,
+                      mb_next_dones, sf_lambda_current):
+        """Combined PPO + JEPA + TD-JEPA loss function."""
+        # Split aug_key for obs vs next_obs augmentation
+        aug_key_obs, aug_key_next = jax.random.split(aug_key)
+
         # Apply random shift augmentation if enabled
         if args.use_augmentation:
-            x = random_shift(aug_key, x, pad=args.augment_pad)
+            x = random_shift(aug_key_obs, x, pad=args.augment_pad)
 
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
         logratio = newlogprob - logp
@@ -778,34 +905,55 @@ if __name__ == "__main__":
         ppo_loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
         # JEPA loss (conditional on lambda > 0 and use_jepa flag)
-        def compute_jepa():
-            return compute_jepa_loss(params, target_network_params, x, jepa_key)
+        if args.use_jepa:
+            def compute_jepa():
+                return compute_jepa_loss(params, target_params, x, jepa_key)
+            def skip_jepa():
+                return 0.0
+            j_loss = jax.lax.cond(
+                jepa_lambda_current > 0,
+                compute_jepa,
+                skip_jepa,
+            )
+        else:
+            j_loss = 0.0
 
-        def skip_jepa():
-            return 0.0
+        # SF losses: reward regression always on, SF TD gated by sf_lambda_current
+        sf_zero_diag = (0.0, 0.0, 0.0, 0.0, 0.0)
+        if args.use_td_jepa:
+            # Always compute SF losses (reward regression needs to train from the start)
+            sf_td_loss, reward_loss, sf_diag = compute_sf_losses(
+                params, target_params, x, next_x, mb_raw_rewards, mb_next_dones, aug_key_next
+            )
+        else:
+            sf_td_loss, reward_loss, sf_diag = 0.0, 0.0, sf_zero_diag
 
-        j_loss = jax.lax.cond(
-            (jepa_lambda_current > 0) & args.use_jepa,
-            compute_jepa,
-            skip_jepa,
-        )
+        # Total loss
+        total_loss = ppo_loss
+        if args.use_jepa:
+            total_loss = total_loss + jepa_lambda_current * j_loss
+        if args.use_td_jepa:
+            # Reward regression always active; SF TD warmed up via sf_lambda_current
+            total_loss = total_loss + args.beta_r * reward_loss + sf_lambda_current * args.beta_sf * sf_td_loss
 
-        total_loss = ppo_loss + jepa_lambda_current * j_loss
-        return total_loss, (pg_loss, v_loss, entropy_loss, j_loss, jax.lax.stop_gradient(approx_kl))
+        return total_loss, (pg_loss, v_loss, entropy_loss, j_loss,
+                           jax.lax.stop_gradient(approx_kl),
+                           sf_td_loss, reward_loss, sf_diag)
 
     ppo_jepa_loss_grad_fn = jax.value_and_grad(ppo_jepa_loss, has_aux=True)
 
     @jax.jit
     def update_ppo_jepa(
         agent_state: TrainState,
-        target_network_params,
+        target_params,
         storage: Storage,
         key: jax.random.PRNGKey,
         jepa_lambda_current: float,
+        sf_lambda_current: float,
     ):
-        """PPO update with JEPA auxiliary objective."""
+        """PPO update with JEPA / TD-JEPA auxiliary objective."""
         def update_epoch(carry, unused_inp):
-            agent_state, target_network_params, key = carry
+            agent_state, target_params, key = carry
             key, subkey, aug_key, jepa_key = jax.random.split(key, 4)
 
             def flatten(x):
@@ -824,12 +972,13 @@ if __name__ == "__main__":
             jepa_keys = jax.random.split(jepa_key, args.num_minibatches)
 
             def update_minibatch(carry, inputs):
-                agent_state, target_network_params = carry
+                agent_state, target_params = carry
                 minibatch, mb_aug_key, mb_jepa_key = inputs
 
-                (loss, (pg_loss, v_loss, entropy_loss, j_loss, approx_kl)), grads = ppo_jepa_loss_grad_fn(
+                (loss, (pg_loss, v_loss, entropy_loss, j_loss, approx_kl,
+                        sf_td_loss, reward_loss, sf_diag)), grads = ppo_jepa_loss_grad_fn(
                     agent_state.params,
-                    jax.lax.stop_gradient(target_network_params),
+                    jax.lax.stop_gradient(target_params),
                     minibatch.obs,
                     minibatch.actions,
                     minibatch.logprobs,
@@ -839,27 +988,60 @@ if __name__ == "__main__":
                     mb_aug_key,
                     mb_jepa_key,
                     jepa_lambda_current,
+                    minibatch.next_obs,
+                    minibatch.rewards,
+                    minibatch.raw_rewards,
+                    minibatch.next_dones,
+                    sf_lambda_current,
                 )
+                if args.refit_w_only:
+                    # Zero all gradients except w — only reward regression trains w
+                    def _mask_grad(path, g):
+                        # path is a tuple of DictKey/etc; keep only leaves under 'w'
+                        if path and str(path[0].key) == 'w':
+                            return g
+                        return jnp.zeros_like(g)
+                    grads = jax.tree_util.tree_map_with_path(_mask_grad, grads)
+
+                grad_norm = optax.global_norm(grads)
                 agent_state = agent_state.apply_gradients(grads=grads)
 
-                # EMA update target network only when JEPA is actually active (not during warmup)
-                target_network_params = jax.lax.cond(
-                    args.use_jepa & (jepa_lambda_current > 0),
-                    lambda: ema_update(target_network_params, agent_state.params['network'], args.jepa_ema_tau),
-                    lambda: target_network_params,
-                )
+                # EMA update target networks
+                if args.use_td_jepa and not args.refit_w_only:
+                    # TD-JEPA: EMA update encoder + psi_head + m_head
+                    target_params = jax.lax.cond(
+                        sf_lambda_current > 0,
+                        lambda: flax.core.freeze({
+                            'network': ema_update(target_params['network'], agent_state.params['network'], args.sf_ema_tau),
+                            'psi_head': ema_update(target_params['psi_head'], agent_state.params['psi_head'], args.sf_ema_tau),
+                            'm_head': ema_update(target_params['m_head'], agent_state.params['m_head'], args.sf_ema_tau),
+                        }),
+                        lambda: target_params,
+                    )
+                elif args.use_jepa:
+                    # JEPA: EMA update encoder only
+                    target_params = jax.lax.cond(
+                        jepa_lambda_current > 0,
+                        lambda: ema_update(target_params, agent_state.params['network'], args.jepa_ema_tau),
+                        lambda: target_params,
+                    )
 
-                return (agent_state, target_network_params), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl, grads)
+                return (agent_state, target_params), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl,
+                                                       sf_td_loss, reward_loss, sf_diag, grad_norm)
 
-            (agent_state, target_network_params), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl, grads) = jax.lax.scan(
-                update_minibatch, (agent_state, target_network_params), (shuffled_storage, aug_keys, jepa_keys)
+            (agent_state, target_params), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl,
+                                            sf_td_loss, reward_loss, sf_diag, grad_norm) = jax.lax.scan(
+                update_minibatch, (agent_state, target_params), (shuffled_storage, aug_keys, jepa_keys)
             )
-            return (agent_state, target_network_params, key), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl, grads)
+            return (agent_state, target_params, key), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl,
+                                                        sf_td_loss, reward_loss, sf_diag, grad_norm)
 
-        (agent_state, target_network_params, key), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl, grads) = jax.lax.scan(
-            update_epoch, (agent_state, target_network_params, key), (), length=args.update_epochs
+        (agent_state, target_params, key), (loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl,
+                                             sf_td_loss, reward_loss, sf_diag, grad_norm) = jax.lax.scan(
+            update_epoch, (agent_state, target_params, key), (), length=args.update_epochs
         )
-        return agent_state, target_network_params, loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl, key
+        return (agent_state, target_params, loss, pg_loss, v_loss, entropy_loss, j_loss, approx_kl,
+                sf_td_loss, reward_loss, sf_diag, grad_norm, key)
 
     # Start the game
     global_step = 0
@@ -915,11 +1097,14 @@ if __name__ == "__main__":
 
         storage = Storage(
             obs=obs,
+            next_obs=next_obs,
             actions=action,
             logprobs=logprob,
             dones=done,
+            next_dones=next_done,
             values=value,
-            rewards=reward,  # Use normalized reward for training
+            rewards=reward,  # Normalized reward for PPO training
+            raw_rewards=raw_reward,  # Raw reward for SF reward regression
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
@@ -944,19 +1129,27 @@ if __name__ == "__main__":
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
 
-        # Compute JEPA lambda OUTSIDE jit to avoid recompilation
+        # Compute loss schedule lambdas OUTSIDE jit to avoid recompilation
         jepa_lambda_current = get_jepa_lambda_py(
             iteration, args.jepa_lambda,
             args.jepa_warmup_updates, args.jepa_rampup_updates
-        )
+        ) if args.use_jepa else 0.0
 
-        # PPO + JEPA update
-        agent_state, target_network_params, loss, pg_loss, v_loss, entropy_loss, jepa_loss_val, approx_kl, key = update_ppo_jepa(
+        sf_lambda_current = get_jepa_lambda_py(
+            iteration, 1.0,
+            args.sf_warmup_updates, args.sf_rampup_updates
+        ) if args.use_td_jepa else 0.0
+
+        # PPO + JEPA / TD-JEPA update
+        (agent_state, target_params, loss, pg_loss, v_loss, entropy_loss,
+         jepa_loss_val, approx_kl, sf_td_loss_val, reward_loss_val,
+         sf_diag_val, grad_norm_val, key) = update_ppo_jepa(
             agent_state,
-            target_network_params,
+            target_params,
             storage,
             key,
             jepa_lambda_current,
+            sf_lambda_current,
         )
 
         if iteration % args.log_interval == 0:
@@ -966,7 +1159,21 @@ if __name__ == "__main__":
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
 
-            if args.use_jepa:
+            if args.use_td_jepa:
+                print(
+                    f"update={iteration} step={global_step} "
+                    f"ep_return={avg_episodic_return:.1f} "
+                    f"ep_len={avg_episodic_length * args.action_repeat:.0f} "
+                    f"loss={loss[-1, -1].item():.4f} "
+                    f"sf_td={sf_td_loss_val[-1, -1].item():.4f} "
+                    f"r_loss={reward_loss_val[-1, -1].item():.4f} "
+                    f"r2={sf_diag_val[0][-1, -1].item():.3f} "
+                    f"w_norm={sf_diag_val[2][-1, -1].item():.3f} "
+                    f"grad_norm={grad_norm_val[-1, -1].item():.3f} "
+                    f"sf_lam={sf_lambda_current:.4f} "
+                    f"SPS={sps}"
+                )
+            elif args.use_jepa:
                 print(
                     f"update={iteration} step={global_step} "
                     f"ep_return={avg_episodic_return:.1f} "
@@ -1000,11 +1207,22 @@ if __name__ == "__main__":
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
+                    "losses/grad_norm": grad_norm_val[-1, -1].item(),
                 }
 
                 if args.use_jepa:
                     log_dict["jepa/loss"] = jepa_loss_val[-1, -1].item()
                     log_dict["jepa/lambda"] = jepa_lambda_current
+
+                if args.use_td_jepa:
+                    log_dict["td_jepa/sf_td_loss"] = sf_td_loss_val[-1, -1].item()
+                    log_dict["td_jepa/reward_loss"] = reward_loss_val[-1, -1].item()
+                    log_dict["td_jepa/reward_r2"] = sf_diag_val[0][-1, -1].item()
+                    log_dict["td_jepa/sf_td_error_mean"] = sf_diag_val[1][-1, -1].item()
+                    log_dict["td_jepa/w_norm"] = sf_diag_val[2][-1, -1].item()
+                    log_dict["td_jepa/psi_norm_mean"] = sf_diag_val[3][-1, -1].item()
+                    log_dict["td_jepa/m_norm_mean"] = sf_diag_val[4][-1, -1].item()
+                    log_dict["td_jepa/sf_lambda"] = sf_lambda_current
 
                 wandb.log(log_dict, step=global_step)
 
