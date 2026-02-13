@@ -32,6 +32,7 @@ from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
 from manifold_muon_optax import manifold_muon
+from encoders import build_encoder
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -137,6 +138,8 @@ class Args:
     """Toggle debug logging for encoder representations"""
 
     # Encoder architecture
+    encoder_type: str = "cnn"
+    """encoder architecture to use: 'cnn' or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
 
@@ -147,56 +150,6 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_updates: int = 0
     """the number of updates (computed in runtime)"""
-
-
-class Network(nn.Module):
-    """CNN encoder for pixel observations with LayerNorm for stability."""
-    tanh_scale: float = 0.5
-
-    @nn.compact
-    def __call__(self, x):
-        # x: (B, H, W, C) - already in NHWC format from PixelBrax
-        x = x.astype(jnp.float32) / 255.0
-
-        # Conv layers with LayerNorm for stable training
-        x = nn.Conv(
-            32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(
-            64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(
-            64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.LayerNorm()(x)
-        x = nn.tanh(self.tanh_scale * x)  # tanh for bounded features, helps with stability
-        return x
 
 
 class Critic(nn.Module):
@@ -645,6 +598,8 @@ if __name__ == "__main__":
     print(f"  max_grad_norm ({adam_type}): {args.max_grad_norm}")
     print(f"  actor_muon_max_grad_norm: {args.actor_muon_max_grad_norm}")
     print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
+    print(f"  encoder_type: {args.encoder_type}")
+    print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
@@ -669,7 +624,7 @@ if __name__ == "__main__":
     )
 
     # Initialize networks
-    network = Network(tanh_scale=args.encoder_tanh_scale)
+    network = build_encoder(args.encoder_type, args.encoder_tanh_scale)
     actor = Actor(action_dim=action_dim)
     critic = Critic()
 
@@ -869,7 +824,7 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         def update_epoch(carry, unused_inp):
-            agent_state, key = carry
+            agent_state, key, last_grads = carry
             key, subkey, aug_key = jax.random.split(key, 3)
 
             def flatten(x):
@@ -886,7 +841,7 @@ if __name__ == "__main__":
             aug_keys = jax.random.split(aug_key, args.num_minibatches)
 
             def update_minibatch(carry, inputs):
-                agent_state = carry
+                agent_state, _ = carry
                 minibatch, mb_aug_key = inputs
                 (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
                     agent_state.params,
@@ -899,18 +854,17 @@ if __name__ == "__main__":
                     mb_aug_key,
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
-                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
+                return (agent_state, grads), (loss, pg_loss, v_loss, entropy_loss, approx_kl)
 
-            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-                update_minibatch, agent_state, (shuffled_storage, aug_keys)
+            (agent_state, last_grads), (loss, pg_loss, v_loss, entropy_loss, approx_kl) = jax.lax.scan(
+                update_minibatch, (agent_state, last_grads), (shuffled_storage, aug_keys)
             )
-            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
+            return (agent_state, key, last_grads), (loss, pg_loss, v_loss, entropy_loss, approx_kl)
 
-        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-            update_epoch, (agent_state, key), (), length=args.update_epochs
+        init_grads = jax.tree_util.tree_map(jnp.zeros_like, agent_state.params)
+        (agent_state, key, final_grads), (loss, pg_loss, v_loss, entropy_loss, approx_kl) = jax.lax.scan(
+            update_epoch, (agent_state, key, init_grads), (), length=args.update_epochs
         )
-        # Get final gradients from last minibatch of last epoch
-        final_grads = jax.tree_util.tree_map(lambda x: x[-1, -1], grads)
         return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key
 
     # Start the game
