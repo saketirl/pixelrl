@@ -655,7 +655,12 @@ if __name__ == "__main__":
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    # Mark Slurm array runs explicitly so W&B names show sweep context.
+    slurm_array_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
+    if slurm_array_task_id is not None:
+        run_name = f"{args.env_name}__{args.exp_name}__sweep__a{slurm_array_task_id}__{args.seed}__{int(time.time())}"
+    else:
+        run_name = f"{args.env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
     if args.track:
         import wandb

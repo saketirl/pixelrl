@@ -66,7 +66,10 @@ COMMON_ARGS=(
   --num-steps 10
   --num-minibatches 32
   --update-epochs 4
-  --learning-rate 3e-4
+  --encoder-lr 3e-4
+  --heads-muon-lr 0.001
+  --heads-adam-lr 3e-4
+  --jepa-heads-lr 3e-4
   --gamma 0.99
   --gae-lambda 0.95
   --clip-eps 0.1
@@ -86,7 +89,7 @@ if [[ -n "${WANDB_ENTITY}" ]]; then
 fi
 
 if [[ "${JEPA_MODE}" == "le_jepa" ]]; then
-  uv run ppo_jepa.py \
+  uv run ppo_pixelbrax_jax2_muon.py \
     "${COMMON_ARGS[@]}" \
     --jepa-lambda 1e-4 \
     --jepa-warmup-updates 50 \
@@ -96,5 +99,5 @@ if [[ "${JEPA_MODE}" == "le_jepa" ]]; then
     --sigreg-num-slices 64 \
     --proj-dim 128
 else
-  uv run ppo_jepa.py "${COMMON_ARGS[@]}"
+  uv run ppo_pixelbrax_jax2_muon.py "${COMMON_ARGS[@]}"
 fi

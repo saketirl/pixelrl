@@ -47,7 +47,7 @@ JEPA_EMA_TAU=${EMA_TAUS[$TAU_IDX]}
 echo "Running TASK_ID=${TASK_ID}/${NUM_CONFIGS} on ${ENV_NAME}"
 echo "seed=${SEED}, jepa_lambda=${JEPA_LAMBDA}, jepa_ema_tau=${JEPA_EMA_TAU}, warmup=${JEPA_WARMUP_UPDATES}, rampup=${JEPA_RAMPUP_UPDATES}"
 
-uv run ppo_jepa.py \
+uv run ppo_pixelbrax_jax2_muon.py \
   --env-name "${ENV_NAME}" \
   --backend spring \
   --n-envs 128 \
@@ -57,7 +57,10 @@ uv run ppo_jepa.py \
   --num-steps 10 \
   --num-minibatches 32 \
   --update-epochs 4 \
-  --learning-rate 3e-4 \
+  --encoder-lr 3e-4 \
+  --heads-muon-lr 0.001 \
+  --heads-adam-lr 3e-4 \
+  --jepa-heads-lr 3e-4 \
   --gamma 0.99 \
   --gae-lambda 0.95 \
   --clip-eps 0.1 \
