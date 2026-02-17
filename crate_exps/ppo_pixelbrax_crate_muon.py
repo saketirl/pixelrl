@@ -1392,9 +1392,11 @@ if __name__ == "__main__":
                 }
 
                 if args.debug_repr:
+                    # Compute representation health averaged over rollout batch
+                    batch_obs = storage.obs.reshape((-1,) + storage.obs.shape[2:])
                     # Get encoder output with intermediates for attention vs CLS tracking
                     hidden, intermediates = network_apply_debug(
-                        agent_state.params['network'], next_obs,
+                        agent_state.params['network'], batch_obs,
                         deterministic=True, return_intermediates=True
                     )
                     health_metrics = repr_health(hidden)

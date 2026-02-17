@@ -1220,7 +1220,9 @@ if __name__ == "__main__":
                 }
 
                 if args.debug_repr:
-                    hidden = network.apply(agent_state.params['network'], next_obs)
+                    # Compute representation health averaged over rollout batch
+                    batch_obs = storage.obs.reshape((-1,) + storage.obs.shape[2:])
+                    hidden = network.apply(agent_state.params['network'], batch_obs)
                     health_metrics = repr_health(hidden)
                     for k, v in health_metrics.items():
                         log_dict[k] = float(jax.device_get(v))
