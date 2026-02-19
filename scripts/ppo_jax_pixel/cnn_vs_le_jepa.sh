@@ -12,7 +12,10 @@
 set -euo pipefail
 
 export PYTHONPATH="/home/guests/arjun/pixelrl/pixelbrax/brax:${PYTHONPATH:-}"
-export WANDB_API_KEY=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
+WANDB_KEY_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../secrets/wandb_api_key.txt"
+if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
+  export WANDB_API_KEY="$(cat "${WANDB_KEY_FILE}")"
+fi
 
 # Usage:
 #   sbatch scripts/ppo_jax_pixel/cnn_vs_le_jepa.sh [env_name] [wandb_project] [wandb_entity]

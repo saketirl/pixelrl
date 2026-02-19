@@ -53,6 +53,7 @@ def manifold_muon_update(
     eta: float = 0.02,
     alpha: float = 0.01,
     steps: int = 5,
+    msign_steps: int = 5,
 ) -> jnp.ndarray:
     """
     Single manifold MUON update step.
@@ -79,7 +80,7 @@ def manifold_muon_update(
 
     # Dual optimization
     def dual_step(Lambda, step_idx):
-        A = msign(G + 2 * W @ Lambda, steps=5)
+        A = msign(G + 2 * W @ Lambda, steps=msign_steps)
         H = W.T @ A + A.T @ W
         # Decaying step size
         step_size = alpha * (1.0 - step_idx / steps)
@@ -89,9 +90,9 @@ def manifold_muon_update(
     Lambda, _ = jax.lax.scan(dual_step, Lambda, jnp.arange(steps))
 
     # Final update
-    A = msign(G + 2 * W @ Lambda, steps=5)
+    A = msign(G + 2 * W @ Lambda, steps=msign_steps)
     new_W = W - eta * A
-    new_W = msign(new_W, steps=5)
+    new_W = msign(new_W, steps=msign_steps)
 
     if should_transpose:
         new_W = new_W.T
@@ -102,6 +103,40 @@ def manifold_muon_update(
 class ManifoldMuonState(NamedTuple):
     """State for Manifold MUON optimizer (just step counter)."""
     step: jnp.ndarray
+
+
+def manifold_muon_update_per_head(
+    W: jnp.ndarray,
+    G: jnp.ndarray,
+    eta: float = 0.02,
+    alpha: float = 0.01,
+    dual_steps: int = 5,
+    msign_steps: int = 5,
+) -> jnp.ndarray:
+    """
+    Manifold MUON update applied independently per attention head.
+
+    Expected shape for W/G is (in_dim, num_heads, head_dim). This enforces
+    within-head orthogonality by updating each (in_dim, head_dim) slice.
+    """
+    if W.ndim != 3:
+        raise ValueError(f"Expected rank-3 tensor for per-head update, got {W.shape}")
+
+    w_heads = jnp.swapaxes(W, 0, 1)
+    g_heads = jnp.swapaxes(G, 0, 1)
+
+    def update_one_head(w_h, g_h):
+        return manifold_muon_update(
+            W=w_h,
+            G=g_h,
+            eta=eta,
+            alpha=alpha,
+            steps=dual_steps,
+            msign_steps=msign_steps,
+        )
+
+    updated_heads = jax.vmap(update_one_head)(w_heads, g_heads)
+    return jnp.swapaxes(updated_heads, 0, 1)
 
 
 def manifold_muon(
@@ -158,6 +193,7 @@ def manifold_muon(
                     eta=learning_rate,
                     alpha=dual_lr,
                     steps=dual_steps,
+                    msign_steps=msign_steps,
                 )
                 # Return the update (difference from current)
                 return new_W - p
@@ -168,6 +204,62 @@ def manifold_muon(
         new_updates = jax.tree_util.tree_map(update_param, updates, params)
         new_state = ManifoldMuonState(step=state.step + 1)
 
+        return new_updates, new_state
+
+    return base.GradientTransformation(init_fn, update_fn)
+
+
+def manifold_muon_per_head(
+    learning_rate: float = 0.02,
+    dual_lr: float = 0.01,
+    dual_steps: int = 5,
+    msign_steps: int = 5,
+    min_ndim: int = 2,
+) -> base.GradientTransformation:
+    """
+    Manifold MUON optimizer with special handling for rank-3 attention kernels.
+
+    - Rank-3 tensors are updated head-wise (within-head orthogonality).
+    - Rank-2+ matrices use standard manifold MUON fallback.
+    - Lower-rank tensors use simple SGD updates.
+    """
+
+    def init_fn(params: base.Params) -> ManifoldMuonState:
+        return ManifoldMuonState(step=jnp.array(0))
+
+    def update_fn(
+        updates: base.Updates,
+        state: ManifoldMuonState,
+        params: Optional[base.Params] = None,
+    ) -> Tuple[base.Updates, ManifoldMuonState]:
+        if params is None:
+            raise ValueError("Manifold MUON requires params to be passed to update()")
+
+        def update_param(g, p):
+            if p.ndim == 3 and p.shape[1] > 1 and min(p.shape[0], p.shape[-1]) > 1:
+                new_W = manifold_muon_update_per_head(
+                    W=p,
+                    G=g,
+                    eta=learning_rate,
+                    alpha=dual_lr,
+                    dual_steps=dual_steps,
+                    msign_steps=msign_steps,
+                )
+                return new_W - p
+            if p.ndim >= min_ndim and min(p.shape) > 1:
+                new_W = manifold_muon_update(
+                    W=p,
+                    G=g,
+                    eta=learning_rate,
+                    alpha=dual_lr,
+                    steps=dual_steps,
+                    msign_steps=msign_steps,
+                )
+                return new_W - p
+            return -learning_rate * g
+
+        new_updates = jax.tree_util.tree_map(update_param, updates, params)
+        new_state = ManifoldMuonState(step=state.step + 1)
         return new_updates, new_state
 
     return base.GradientTransformation(init_fn, update_fn)

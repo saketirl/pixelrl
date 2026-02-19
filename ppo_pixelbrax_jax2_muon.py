@@ -32,8 +32,8 @@ import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
-from manifold_muon_optax import manifold_muon
-from encoders import build_encoder
+from manifold_muon_optax import manifold_muon, manifold_muon_per_head
+from encoders import ViTConfig, build_encoder
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -144,9 +144,47 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn' or 'mlp'"""
+    """encoder architecture to use: 'cnn', 'mlp', or 'vit'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
+    encoder_warmup_updates: int = 0
+    """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
+    vit_patch_size: int = 14
+    """ViT patch size (pixels) for both height and width."""
+    vit_hidden_size: int = 192
+    """ViT token/embedding hidden dimension."""
+    vit_mlp_dim: int = 768
+    """ViT MLP expansion dimension in transformer blocks."""
+    vit_num_heads: int = 3
+    """ViT number of self-attention heads."""
+    vit_num_layers: int = 4
+    """ViT number of transformer encoder blocks."""
+    vit_dropout_rate: float = 0.0
+    """ViT dropout rate (kept deterministic unless encoder path is extended)."""
+    vit_attention_dropout_rate: float = 0.0
+    """ViT attention dropout rate (kept deterministic unless encoder path is extended)."""
+    vit_use_cls_token: bool = False
+    """If true, use CLS-token readout; otherwise mean-pool patch tokens."""
+    vit_use_conv_stem: bool = True
+    """If true, apply a lightweight CNN stem before ViT patch embedding."""
+    vit_conv_stem_channels: int = 64
+    """Channel width for the optional ViT CNN stem."""
+    vit_conv_stem_kernel: int = 3
+    """Kernel size for the optional ViT CNN stem convolutions."""
+    vit_apply_output_tanh: bool = False
+    """If true, apply tanh bottleneck on ViT 512-dim output."""
+    vit_qk_stiefel: bool = False
+    """If true, apply Stiefel-constrained updates to ViT attention Q/K kernels."""
+    vit_qk_stiefel_lr: float = 1e-4
+    """Learning rate for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_dual_lr: float = 0.01
+    """Dual-variable learning rate for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_dual_steps: int = 5
+    """Number of dual optimization steps for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_msign_steps: int = 5
+    """Number of matrix-sign iterations for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_max_grad_norm: float = 0.5
+    """Max grad norm clip for ViT Q/K Stiefel parameter group."""
 
     # JEPA auxiliary objective
     jepa_mode: str = "none"
@@ -502,10 +540,17 @@ def create_encoder_adam_heads_muon_optimizer(
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
+    vit_qk_stiefel: bool = False,
+    vit_qk_stiefel_lr: float = 1e-4,
+    vit_qk_stiefel_dual_lr: float = 0.01,
+    vit_qk_stiefel_dual_steps: int = 5,
+    vit_qk_stiefel_msign_steps: int = 5,
+    vit_qk_stiefel_max_grad_norm: float = 0.5,
 ):
     """
     Create optimizer that uses:
     - Adam/AdamW for encoder (all params) - supports lr schedule, with grad clipping
+    - Optional per-head manifold MUON for ViT encoder attention Q/K kernels
     - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
@@ -528,6 +573,18 @@ def create_encoder_adam_heads_muon_optimizer(
     encoder_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
         adam_opt(encoder_lr),
+    )
+
+    # Optional Stiefel-constrained updates for ViT Q/K kernels (per-head)
+    encoder_qk_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(vit_qk_stiefel_max_grad_norm),
+        manifold_muon_per_head(
+            learning_rate=vit_qk_stiefel_lr,
+            dual_lr=vit_qk_stiefel_dual_lr,
+            dual_steps=vit_qk_stiefel_dual_steps,
+            msign_steps=vit_qk_stiefel_msign_steps,
+            min_ndim=2,
+        ),
     )
 
     # Adam/AdamW for head vectors/scalars (with schedule support and grad clipping)
@@ -566,10 +623,12 @@ def create_encoder_adam_heads_muon_optimizer(
         ),
     )
 
-    # 5 transforms: encoder, actor_muon (matrices), critic_muon (matrices),
-    # heads_adam (actor/critic vectors/scalars), jepa_heads_adam (predictor/projector)
+    # 6 transforms: encoder, encoder_qk_stiefel, actor_muon (matrices), critic_muon
+    # (matrices), heads_adam (actor/critic vectors/scalars), jepa_heads_adam
+    # (predictor/projector)
     transforms = {
         'encoder': encoder_tx,
+        'encoder_qk_stiefel': encoder_qk_stiefel_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
@@ -581,6 +640,16 @@ def create_encoder_adam_heads_muon_optimizer(
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
+                is_vit_qk_kernel = (
+                    len(path) >= 7
+                    and path[1] == 'params'
+                    and 'Transformer' in path
+                    and 'SelfAttention_0' in path
+                    and path[-1] == 'kernel'
+                    and path[-2] in ('query', 'key')
+                )
+                if vit_qk_stiefel and is_vit_qk_kernel:
+                    return 'encoder_qk_stiefel'
                 return 'encoder'
             if path[0] in ('predictor', 'projector'):
                 return 'jepa_heads_adam'
@@ -815,6 +884,26 @@ if __name__ == "__main__":
     print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
+    print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
+    if args.encoder_type.lower() == "vit":
+        print(f"  vit_patch_size: {args.vit_patch_size}")
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  vit_dropout_rate: {args.vit_dropout_rate}")
+        print(f"  vit_attention_dropout_rate: {args.vit_attention_dropout_rate}")
+        print(f"  vit_use_cls_token: {args.vit_use_cls_token}")
+        print(f"  vit_use_conv_stem: {args.vit_use_conv_stem}")
+        print(f"  vit_conv_stem_channels: {args.vit_conv_stem_channels}")
+        print(f"  vit_conv_stem_kernel: {args.vit_conv_stem_kernel}")
+        print(f"  vit_apply_output_tanh: {args.vit_apply_output_tanh}")
+        print(f"  vit_qk_stiefel: {args.vit_qk_stiefel}")
+        print(f"  vit_qk_stiefel_lr: {args.vit_qk_stiefel_lr}")
+        print(f"  vit_qk_stiefel_dual_lr: {args.vit_qk_stiefel_dual_lr}")
+        print(f"  vit_qk_stiefel_dual_steps: {args.vit_qk_stiefel_dual_steps}")
+        print(f"  vit_qk_stiefel_msign_steps: {args.vit_qk_stiefel_msign_steps}")
+        print(f"  vit_qk_stiefel_max_grad_norm: {args.vit_qk_stiefel_max_grad_norm}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print(f"  jepa_mode: {args.jepa_mode}")
     if args.use_jepa or args.use_le_jepa:
@@ -853,7 +942,25 @@ if __name__ == "__main__":
     )
 
     # Initialize networks
-    network = build_encoder(args.encoder_type, args.encoder_tanh_scale)
+    vit_config = ViTConfig(
+        patch_size=args.vit_patch_size,
+        hidden_size=args.vit_hidden_size,
+        mlp_dim=args.vit_mlp_dim,
+        num_heads=args.vit_num_heads,
+        num_layers=args.vit_num_layers,
+        dropout_rate=args.vit_dropout_rate,
+        attention_dropout_rate=args.vit_attention_dropout_rate,
+        use_cls_token=args.vit_use_cls_token,
+        use_conv_stem=args.vit_use_conv_stem,
+        conv_stem_channels=args.vit_conv_stem_channels,
+        conv_stem_kernel=args.vit_conv_stem_kernel,
+        apply_output_tanh=args.vit_apply_output_tanh,
+    )
+    network = build_encoder(
+        args.encoder_type,
+        args.encoder_tanh_scale,
+        vit_config=vit_config,
+    )
     actor = Actor(action_dim=action_dim)
     critic = Critic()
     projector = Projector(proj_dim=args.proj_dim)
@@ -923,18 +1030,42 @@ if __name__ == "__main__":
     print(f"  Total: {total_params:,}")
 
     # Create learning rate schedules for Adam optimizers
-    def make_linear_schedule(base_lr):
-        """Linear annealing schedule for Adam optimizers."""
+    steps_per_update = args.num_minibatches * args.update_epochs
+
+    def lr_from_update(base_lr: float, update_idx: int, warmup_updates: int = 0):
+        """Warmup + linear decay learning-rate helper."""
+        update_idx = jnp.asarray(update_idx, dtype=jnp.float32)
+        warmup = float(max(0, warmup_updates))
+        decay_updates = float(max(1, args.num_updates - warmup_updates))
+
+        warm_lr = base_lr * ((update_idx + 1.0) / jnp.maximum(1.0, warmup))
+        decay_idx = jnp.maximum(0.0, update_idx - warmup)
+        frac = 1.0 - jnp.minimum(1.0, decay_idx / decay_updates)
+        decay_lr = base_lr * frac
+
+        if warmup_updates <= 0:
+            return decay_lr
+        return jnp.where(update_idx < warmup, warm_lr, decay_lr)
+
+    def make_linear_schedule(base_lr, warmup_updates: int = 0):
+        """Schedule for Adam optimizers; optional warmup before linear decay."""
         def schedule(count):
-            frac = 1.0 - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
-            return base_lr * frac
+            update_idx = count // steps_per_update
+            return lr_from_update(base_lr, update_idx, warmup_updates)
+
         return schedule
 
     if args.anneal_lr:
-        encoder_lr = make_linear_schedule(args.encoder_lr)
-        heads_adam_lr = make_linear_schedule(args.heads_adam_lr)
-        jepa_heads_lr = make_linear_schedule(args.jepa_heads_lr)
-        print("\nLearning rate annealing: ENABLED (linear decay for Adam)")
+        encoder_lr = make_linear_schedule(args.encoder_lr, args.encoder_warmup_updates)
+        heads_adam_lr = make_linear_schedule(args.heads_adam_lr, warmup_updates=0)
+        jepa_heads_lr = make_linear_schedule(args.jepa_heads_lr, warmup_updates=0)
+        if args.encoder_warmup_updates > 0:
+            print(
+                f"\nLearning rate annealing: ENABLED "
+                f"(encoder warmup={args.encoder_warmup_updates} updates + linear decay)"
+            )
+        else:
+            print("\nLearning rate annealing: ENABLED (linear decay for Adam)")
     else:
         encoder_lr = args.encoder_lr
         heads_adam_lr = args.heads_adam_lr
@@ -956,6 +1087,12 @@ if __name__ == "__main__":
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
         weight_decay=args.weight_decay,
+        vit_qk_stiefel=args.vit_qk_stiefel,
+        vit_qk_stiefel_lr=args.vit_qk_stiefel_lr,
+        vit_qk_stiefel_dual_lr=args.vit_qk_stiefel_dual_lr,
+        vit_qk_stiefel_dual_steps=args.vit_qk_stiefel_dual_steps,
+        vit_qk_stiefel_msign_steps=args.vit_qk_stiefel_msign_steps,
+        vit_qk_stiefel_max_grad_norm=args.vit_qk_stiefel_max_grad_norm,
     )
 
     agent_state = TrainState.create(
@@ -1580,10 +1717,22 @@ if __name__ == "__main__":
             if args.track:
                 opt_step = iteration * args.update_epochs * args.num_minibatches
                 if args.anneal_lr:
-                    frac = 1.0 - (opt_step // (args.num_minibatches * args.update_epochs)) / args.num_updates
-                    encoder_lr_current = args.encoder_lr * frac
-                    heads_adam_lr_current = args.heads_adam_lr * frac
-                    jepa_heads_lr_current = args.jepa_heads_lr * frac
+                    update_idx = opt_step // steps_per_update
+                    encoder_lr_current = lr_from_update(
+                        args.encoder_lr,
+                        update_idx,
+                        args.encoder_warmup_updates,
+                    )
+                    heads_adam_lr_current = lr_from_update(
+                        args.heads_adam_lr,
+                        update_idx,
+                        warmup_updates=0,
+                    )
+                    jepa_heads_lr_current = lr_from_update(
+                        args.jepa_heads_lr,
+                        update_idx,
+                        warmup_updates=0,
+                    )
                 else:
                     encoder_lr_current = args.encoder_lr
                     heads_adam_lr_current = args.heads_adam_lr
@@ -1594,10 +1743,13 @@ if __name__ == "__main__":
                     "charts/avg_episodic_return": avg_episodic_return,
                     "charts/cumulative_episodic_return": cumulative_episodic_return,
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
-                    "charts/encoder_lr": encoder_lr_current,
-                    "charts/heads_adam_lr": heads_adam_lr_current,
+                    "charts/encoder_lr": float(encoder_lr_current),
+                    "charts/heads_adam_lr": float(heads_adam_lr_current),
                     "charts/heads_muon_lr": args.heads_muon_lr,
-                    "charts/jepa_heads_lr": jepa_heads_lr_current,
+                    "charts/jepa_heads_lr": float(jepa_heads_lr_current),
+                    "charts/vit_qk_stiefel_lr": (
+                        args.vit_qk_stiefel_lr if args.vit_qk_stiefel else 0.0
+                    ),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),

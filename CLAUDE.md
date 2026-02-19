@@ -90,3 +90,18 @@ Both algorithms follow:
 
 - **Main branch**: `continual`
 - **Remote**: https://github.com/saketirl/pixelrl.git
+
+## Worktree SLURM Submissions
+
+**Always `sbatch` from inside the worktree directory.** Scripts use `SLURM_SUBMIT_DIR` to resolve `REPO_ROOT`, so submitting from the wrong directory will silently run the main repo's script instead.
+
+```bash
+# Correct - submit from inside the worktree
+cd /home/guests/arjun/pixelrl/.worktrees/vit-muon
+sbatch scripts/ppo_jax_pixel/my_sweep.sh halfcheetah benchmark
+
+# Wrong - SLURM_SUBMIT_DIR will point to main repo
+sbatch /home/guests/arjun/pixelrl/.worktrees/vit-muon/scripts/ppo_jax_pixel/my_sweep.sh
+```
+
+Slurm logs land in `slurm_logs/` relative to the submit directory, so they will also end up in the wrong place if submitted from elsewhere.
