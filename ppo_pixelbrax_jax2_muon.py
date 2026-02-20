@@ -117,6 +117,8 @@ class Args:
     """logging interval (in updates)"""
 
     # Manifold MUON optimizer arguments
+    use_heads_muon: bool = True
+    """if True, use manifold MUON for actor/critic weight matrices; if False, use Adam for all head params"""
     muon_dual_lr: float = 0.01
     """dual learning rate for MUON"""
     muon_dual_steps: int = 5
@@ -546,6 +548,7 @@ def create_encoder_adam_heads_muon_optimizer(
     vit_qk_stiefel_dual_steps: int = 5,
     vit_qk_stiefel_msign_steps: int = 5,
     vit_qk_stiefel_max_grad_norm: float = 0.5,
+    use_heads_muon: bool = True,
 ):
     """
     Create optimizer that uses:
@@ -657,9 +660,9 @@ def create_encoder_adam_heads_muon_optimizer(
             # For actor/critic heads, check if matrix or vector/scalar
             is_matrix = param.ndim >= 2 and min(param.shape) > 1
             if path[0] == 'actor':
-                return 'actor_muon' if is_matrix else 'heads_adam'
+                return 'actor_muon' if (is_matrix and use_heads_muon) else 'heads_adam'
             if path[0] == 'critic':
-                return 'critic_muon' if is_matrix else 'heads_adam'
+                return 'critic_muon' if (is_matrix and use_heads_muon) else 'heads_adam'
 
             # Fallback for any extra top-level params.
             return 'heads_adam'
@@ -1093,6 +1096,7 @@ if __name__ == "__main__":
         vit_qk_stiefel_dual_steps=args.vit_qk_stiefel_dual_steps,
         vit_qk_stiefel_msign_steps=args.vit_qk_stiefel_msign_steps,
         vit_qk_stiefel_max_grad_norm=args.vit_qk_stiefel_max_grad_norm,
+        use_heads_muon=args.use_heads_muon,
     )
 
     agent_state = TrainState.create(
