@@ -12,7 +12,7 @@ uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
   --temporal-stack 8 \
   --channel-stack 4 \
   --patch-size 14 \
-  --embed-dim 256 \
+  --embed-dim 512 \
   --depth 2 \
   --num-heads 4 \
   --learning-rate 3e-4 \
@@ -34,4 +34,5 @@ uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
   --ent-coef 0.001 \
   --weight-decay 0.01 \
   --encoder-lr-scale 0.10 \
-  --temporal-decay 0.25  &> tmp_crate_2.out
+  --temporal-decay 1.0 \
+  --vf-clip-eps 2.0 &> tmp_crate_3.out

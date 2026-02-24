@@ -104,6 +104,10 @@ class Args:
     action_repeat: int = 1
     """Number of times to repeat each action (frame skip)"""
 
+    # Debug/analysis flags
+    debug_repr: bool = False
+    """Enable representation health and gradient norm logging"""
+
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -353,6 +357,40 @@ class RewardNormalizer:
         """Normalize rewards by std of discounted returns and clip."""
         normalized = rewards / jnp.sqrt(self.return_rms_var + epsilon)
         return jnp.clip(normalized, -clip, clip)
+
+
+# --------------------------------------------------------
+#  Debug Metrics
+# --------------------------------------------------------
+
+def repr_health(hidden: jnp.ndarray) -> dict:
+    """Compute lightweight representation health metrics."""
+    dim_std = jnp.std(hidden, axis=0)
+    norms = jnp.linalg.norm(hidden, axis=-1)
+    return {
+        "repr/mean": jnp.mean(hidden),
+        "repr/std": jnp.std(hidden),
+        "repr/norm_mean": jnp.mean(norms),
+        "repr/norm_std": jnp.std(norms),
+        "repr/dead_dims": jnp.mean(dim_std < 0.01),
+        "repr/dim_std_min": jnp.min(dim_std),
+        "repr/dim_std_max": jnp.max(dim_std),
+        "repr/sparsity": jnp.mean(jnp.abs(hidden) < 0.01),
+        # Saturation metrics for tanh encoder output
+        "repr/saturated_frac": jnp.mean(jnp.abs(hidden) > 0.95),
+    }
+
+
+def compute_grad_norms(grads: dict) -> dict:
+    """Compute gradient norms for encoder, actor, and critic."""
+    def tree_norm(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves))
+    return {
+        "grads/encoder_norm": tree_norm(grads['network']),
+        "grads/actor_norm": tree_norm(grads['actor']),
+        "grads/critic_norm": tree_norm(grads['critic']),
+    }
 
 
 def make_pixelbrax_envs(args):
@@ -656,7 +694,8 @@ if __name__ == "__main__":
         (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
             update_epoch, (agent_state, key), (), length=args.update_epochs
         )
-        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key
+        final_grads = jax.tree_map(lambda x: x[-1, -1], grads)
+        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key
 
     # Start the game
     global_step = 0
@@ -740,7 +779,7 @@ if __name__ == "__main__":
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
+        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key = update_ppo(
             agent_state,
             storage,
             key,
@@ -763,7 +802,7 @@ if __name__ == "__main__":
             
             if args.track:
                 lr = agent_state.opt_state[1].hyperparams["learning_rate"].item()
-                wandb.log({
+                log_dict = {
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,
                     "charts/cumulative_episodic_return": cumulative_episodic_return,
@@ -776,7 +815,22 @@ if __name__ == "__main__":
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
-                }, step=global_step)
+                }
+
+                if args.debug_repr:
+                    # Compute representation health averaged over rollout batch
+                    batch_obs = storage.obs.reshape((-1,) + storage.obs.shape[2:])
+                    hidden = network.apply(agent_state.params['network'], batch_obs)
+                    health_metrics = repr_health(hidden)
+                    for k, v in health_metrics.items():
+                        log_dict[k] = float(jax.device_get(v))
+
+                    # Gradient norms
+                    grad_metrics = compute_grad_norms(final_grads)
+                    for k, v in grad_metrics.items():
+                        log_dict[k] = float(jax.device_get(v))
+
+                wandb.log(log_dict, step=global_step)
 
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed:.1f}s")

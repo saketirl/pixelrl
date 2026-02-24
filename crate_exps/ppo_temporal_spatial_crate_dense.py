@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-PPO for PixelBrax environments using Interleaved Temporal-Spatial CRATE.
+PPO for PixelBrax environments using Interleaved Temporal-Spatial CRATE with Dense output layer.
 
 This implementation uses interleaved spatial and temporal attention blocks:
 Instead of: Spatial1 → Spatial2 → Temporal1 → Temporal2
@@ -16,6 +16,8 @@ Architecture:
     Interleaved blocks: [Spatial_i → Temporal_i] × depth
            ↓
     Global pooling → (B, embed_dim)
+           ↓
+    Dense → LayerNorm → tanh (like CNN encoder in muon file)
            ↓
     Actor/Critic heads
 
@@ -148,10 +150,6 @@ class Args:
     action_repeat: int = 4
     """Number of times to repeat each action (frame skip)"""
 
-    # Frame stacking (at environment level)
-    frame_stack: int = 3
-    """Number of frames to stack in the environment (raw obs has C * frame_stack channels)"""
-
     # Actor/Critic heads
     head_activation: str = "tanh"
     """Activation function for actor/critic heads: 'tanh' or 'relu'"""
@@ -177,10 +175,12 @@ class Args:
     """dropout after embedding"""
     attn_dropout: float = 0.0
     """dropout in attention"""
-    parseval_coef: float = 0.0
-    """Parseval regularization coefficient for attention projection weights (0=disabled). Encourages orthogonality of W matrices."""
-    freeze_encoder_updates: int = 0
-    """Number of updates to freeze encoder (only train actor/critic heads). 0 = no freezing."""
+
+    # Dense output layer (after CRATE blocks)
+    encoder_hidden_dim: int = 512
+    """Hidden dimension for the dense output layer after CRATE blocks"""
+    encoder_tanh_scale: float = 0.5
+    """Multiplier for encoder output before tanh (controls saturation)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -395,12 +395,12 @@ class PatchEmbed(nn.Module):
 
 
 # --------------------------------------------------------
-#  Interleaved CRATE Encoder
+#  Interleaved CRATE Encoder with Dense Output Layer
 # --------------------------------------------------------
 
 class InterleavedCRATEEncoder(nn.Module):
     """
-    Interleaved Spatial-Temporal CRATE encoder.
+    Interleaved Spatial-Temporal CRATE encoder with dense output layer.
 
     Instead of stacking all spatial blocks then all temporal blocks,
     this encoder interleaves them: S1 → T1 → S2 → T2 → ...
@@ -410,6 +410,7 @@ class InterleavedCRATEEncoder(nn.Module):
     - Each spatial block attends over patches within each frame
     - Each temporal block attends over time for each patch position
     - Final pooling aggregates over both dimensions
+    - Dense output layer with LayerNorm and tanh (like CNN encoder)
 
     This allows richer interaction between spatial and temporal information
     at each layer of the network.
@@ -425,6 +426,9 @@ class InterleavedCRATEEncoder(nn.Module):
     ista_step_size: float = 0.1
     ista_lambda: float = 0.1
     temporal_decay: float = 0.0  # Decay for temporal attention (0=none)
+    # Dense output layer params
+    hidden_dim: int = 512
+    tanh_scale: float = 0.5
 
     @nn.compact
     def __call__(self, x, deterministic: bool = True):
@@ -435,7 +439,7 @@ class InterleavedCRATEEncoder(nn.Module):
                C_stacked = C * channel_stack (channel-stacked frames per token)
 
         Returns:
-            (B, embed_dim) - encoded representation
+            (B, hidden_dim) - encoded representation
         """
         B, T, H, W, C_stacked = x.shape
         dim_head = self.embed_dim // self.num_heads
@@ -513,6 +517,15 @@ class InterleavedCRATEEncoder(nn.Module):
         # Global average pooling over both time and patches
         # (B, T, P, D) → (B, D)
         x = jnp.mean(x, axis=(1, 2))
+
+        # Dense output layer (like CNN encoder in muon file)
+        x = nn.Dense(
+            self.hidden_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.tanh(self.tanh_scale * x)  # tanh for bounded features, helps with stability
 
         return x
 
@@ -634,7 +647,7 @@ class Actor(nn.Module):
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         h1 = act_fn(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(h1)
-        h2 = act_fn(x)
+        h2 = act_fn(x) + h1  # Residual connection to prevent saturation
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
@@ -909,55 +922,6 @@ def temporal_attention_metrics(temporal_attentions: list, T: int) -> dict:
 
 
 # --------------------------------------------------------
-#  Parseval Regularization
-# --------------------------------------------------------
-
-def compute_parseval_loss(params: flax.core.FrozenDict) -> jnp.ndarray:
-    """
-    Compute Parseval regularization loss for attention projection weights.
-
-    Parseval regularization encourages orthogonality of weight matrices by
-    penalizing the deviation of W^T W from the identity matrix:
-
-        L_parseval = ||W^T W - I||_F^2
-
-    This helps maintain trainability and prevents loss of plasticity.
-
-    Reference: "Parseval Regularization for Continual Reinforcement Learning"
-    https://arxiv.org/abs/2412.07224
-
-    Args:
-        params: Network parameters (FrozenDict)
-
-    Returns:
-        Scalar Parseval regularization loss
-    """
-    total_loss = 0.0
-    count = 0
-
-    # Flatten params to find all attention projection kernels
-    flat_params = flax.traverse_util.flatten_dict(params)
-
-    for key, value in flat_params.items():
-        # Look for Dense kernels in CRATEAttention layers (spatial and temporal blocks)
-        # The qkv projection is Dense_0 in CRATEAttention
-        key_str = '/'.join(str(k) for k in key)
-        if 'CRATEAttention_0' in key_str and 'Dense_0' in key_str and 'kernel' in key_str:
-            W = value  # Shape: (input_dim, output_dim)
-            # Compute W^T W
-            WtW = W.T @ W
-            # Create identity matrix of appropriate size
-            I = jnp.eye(WtW.shape[0])
-            # Frobenius norm squared of (W^T W - I)
-            parseval_loss = jnp.sum((WtW - I) ** 2)
-            total_loss = total_loss + parseval_loss
-            count = count + 1
-
-    # Return average loss across all attention projections
-    return total_loss / jnp.maximum(count, 1)
-
-
-# --------------------------------------------------------
 #  Environment
 # --------------------------------------------------------
 
@@ -974,7 +938,6 @@ def make_pixelbrax_envs(args):
         video_set="train",
         return_float32=False,
         action_repeat=args.action_repeat,
-        frame_stack=args.frame_stack,
     )
     try:
         action_dim = envs.action_size
@@ -994,7 +957,7 @@ if __name__ == "__main__":
     args.num_updates = args.total_timesteps // args.batch_size
     if args.vf_clip_eps is None:
         args.vf_clip_eps = args.clip_eps  # Default to same as policy clipping
-    run_name = f"{args.env_name}__interleaved_crate__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_name}__interleaved_crate_dense__{args.seed}__{int(time.time())}"
 
     if args.track:
         import wandb
@@ -1015,7 +978,7 @@ if __name__ == "__main__":
 
     # Environment setup
     print("=" * 60)
-    print("Interleaved CRATE PPO")
+    print("Interleaved CRATE PPO with Dense Output Layer")
     print("=" * 60)
     print(f"JAX devices: {jax.devices()}")
     print(f"env name: {args.env_name}")
@@ -1044,6 +1007,9 @@ if __name__ == "__main__":
     print(f"  embed_dim: {args.embed_dim}")
     print(f"  depth (interleaved pairs): {args.depth}")
     print(f"  num_heads: {args.num_heads}")
+    print(f"\nDense output layer:")
+    print(f"  encoder_hidden_dim: {args.encoder_hidden_dim}")
+    print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
     print(f"\nAttention pattern: S1 → T1 → S2 → T2 → ... → S{args.depth} → T{args.depth}")
     print(f"Total blocks: {args.depth * 2} ({args.depth} spatial + {args.depth} temporal)")
     print("=" * 60)
@@ -1061,7 +1027,6 @@ if __name__ == "__main__":
     obs_shape = (args.temporal_stack, H, W, C_stacked)
 
     print(f"raw_obs_shape: {raw_obs_shape}")
-    print(f"frame_stack: {args.frame_stack}")
     print(f"obs_shape (T, H, W, C_stacked): {obs_shape}")
 
     episode_stats = EpisodeStatistics(
@@ -1085,7 +1050,7 @@ if __name__ == "__main__":
             anneal_ratio = 1.0
         return args.learning_rate * warmup_ratio * anneal_ratio
 
-    # Initialize Interleaved CRATE network
+    # Initialize Interleaved CRATE network with dense output layer
     network = InterleavedCRATEEncoder(
         temporal_stack=args.temporal_stack,
         channel_stack=args.channel_stack,
@@ -1098,6 +1063,8 @@ if __name__ == "__main__":
         ista_step_size=args.ista_step_size,
         ista_lambda=args.ista_lambda,
         temporal_decay=args.temporal_decay,
+        hidden_dim=args.encoder_hidden_dim,
+        tanh_scale=args.encoder_tanh_scale,
     )
     actor = Actor(action_dim=action_dim, activation=args.head_activation, log_std_min=args.log_std_min)
     critic = Critic(activation=args.head_activation)
@@ -1176,10 +1143,6 @@ if __name__ == "__main__":
         print(f"vf_clip_eps: {args.vf_clip_eps} (policy clip_eps: {args.clip_eps})")
     if args.temporal_decay > 0:
         print(f"temporal_decay: {args.temporal_decay} (penalizing distant temporal attention)")
-    if args.parseval_coef > 0:
-        print(f"parseval_coef: {args.parseval_coef} (Parseval regularization on attention W matrices)")
-    if args.freeze_encoder_updates > 0:
-        print(f"freeze_encoder_updates: {args.freeze_encoder_updates} (encoder frozen, only training actor/critic)")
     if args.debug_temporal_attn:
         print(f"debug_temporal_attn: enabled (logging temporal attention patterns)")
 
@@ -1277,31 +1240,15 @@ if __name__ == "__main__":
 
         entropy_loss = entropy.mean()
         loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-        # Parseval regularization for attention projection weights
-        parseval_loss = jnp.float32(0.0)
-        if args.parseval_coef > 0:
-            parseval_loss = compute_parseval_loss(params['network'])
-            loss = loss + args.parseval_coef * parseval_loss
-
-        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl), parseval_loss)
+        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
-    def _zero_encoder_grads(grads):
-        """Zero out encoder gradients, keeping actor/critic gradients intact."""
-        return {
-            'network': jax.tree_map(jnp.zeros_like, grads['network']),
-            'actor': grads['actor'],
-            'critic': grads['critic'],
-        }
-
-    @partial(jax.jit, static_argnames=['freeze_encoder'])
+    @jax.jit
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
-        freeze_encoder: bool = False,
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -1320,7 +1267,7 @@ if __name__ == "__main__":
 
             def update_minibatch(carry, minibatch):
                 agent_state = carry
-                (loss, (pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss)), grads = ppo_loss_grad_fn(
+                (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
                     minibatch.actions,
@@ -1329,22 +1276,19 @@ if __name__ == "__main__":
                     minibatch.returns,
                     minibatch.values,
                 )
-                # Zero out encoder gradients if frozen
-                if freeze_encoder:
-                    grads = _zero_encoder_grads(grads)
                 agent_state = agent_state.apply_gradients(grads=grads)
-                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads)
+                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
-            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads) = jax.lax.scan(
+            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
                 update_minibatch, agent_state, shuffled_storage
             )
-            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads)
+            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
-        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads) = jax.lax.scan(
+        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
             update_epoch, (agent_state, key), (), length=args.update_epochs
         )
         final_grads = jax.tree_map(lambda x: x[-1, -1], grads)
-        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, final_grads, key
+        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key
 
     # Start training
     global_step = 0
@@ -1422,17 +1366,11 @@ if __name__ == "__main__":
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
-        freeze_encoder = iteration <= args.freeze_encoder_updates
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, final_grads, key = update_ppo(
+        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key = update_ppo(
             agent_state,
             storage,
             key,
-            freeze_encoder=freeze_encoder,
         )
-
-        # Print when encoder becomes unfrozen
-        if args.freeze_encoder_updates > 0 and iteration == args.freeze_encoder_updates + 1:
-            print(f"update={iteration}: Encoder unfrozen, now training full network")
 
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
@@ -1474,9 +1412,7 @@ if __name__ == "__main__":
                     "losses/policy_loss": pg_loss[-1, -1].item(),
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
-                    "losses/parseval": parseval_loss[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
-                    "training/encoder_frozen": int(freeze_encoder),
                     "policy/log_std_mean": log_std_mean,
                     "policy/log_std_min": log_std_min,
                     "policy/log_std_max": log_std_max,

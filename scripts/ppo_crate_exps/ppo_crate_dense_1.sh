@@ -5,15 +5,14 @@ cd /home/guests/saket/pixelenvs/pixelrl
 export PYTHONPATH="/home/guests/saket/pixelenvs/pixelrl/pixelbrax/brax:${PYTHONPATH}"
 uv run python -m wandb login 9fb4ba17a708de72496774b2e25d219f07de038d
 
-uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
+uv run crate_exps/ppo_temporal_spatial_crate_dense.py --env-name halfcheetah \
   --n-envs 128 \
   --total-timesteps 10000000 \
   --num-steps 10 \
-  --temporal-stack 8 \
+  --temporal-stack 4 \
   --channel-stack 4 \
   --patch-size 14 \
   --embed-dim 256 \
-  --depth 2 \
   --num-heads 4 \
   --learning-rate 3e-4 \
   --warmup-steps 50000 \
@@ -30,8 +29,13 @@ uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
   --seed 0 \
   --gpu 0 \
   --frame-skip 1 \
-  --emb-dropout 0.1 \
+  --emb-dropout 0.0 \
   --ent-coef 0.001 \
-  --weight-decay 0.01 \
+  --weight-decay 0.0 \
   --encoder-lr-scale 0.10 \
-  --temporal-decay 0.25  &> tmp_crate_2.out
+  --temporal-decay 1.0 \
+  --vf-clip-eps 2.0 \
+  --depth 2 \
+  --encoder-hidden-dim 256 \
+  --encoder-tanh-scale 0.5 &> tmp_crate_8.out
+

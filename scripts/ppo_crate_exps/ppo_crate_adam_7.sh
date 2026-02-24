@@ -34,4 +34,7 @@ uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
   --ent-coef 0.001 \
   --weight-decay 0.01 \
   --encoder-lr-scale 0.10 \
-  --temporal-decay 0.25  &> tmp_crate_2.out
+  --temporal-decay 0.5 \
+  --parseval-coef 0.001 \
+  --frame-stack 1 &> tmp_crate_3.out
+

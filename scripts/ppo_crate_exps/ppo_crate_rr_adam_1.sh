@@ -5,7 +5,8 @@ cd /home/guests/saket/pixelenvs/pixelrl
 export PYTHONPATH="/home/guests/saket/pixelenvs/pixelrl/pixelbrax/brax:${PYTHONPATH}"
 uv run python -m wandb login 9fb4ba17a708de72496774b2e25d219f07de038d
 
-uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
+uv run crate_exps/ppo_temporal_spatial_crate_rr.py \
+  --env-name halfcheetah \
   --n-envs 128 \
   --total-timesteps 10000000 \
   --num-steps 10 \
@@ -32,12 +33,19 @@ uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
   --frame-skip 1 \
   --emb-dropout 0.1 \
   --ent-coef 0.001 \
-  --weight-decay 0.01 \
-  --encoder-lr-scale 0.25 \
+  --weight-decay 0.001 \
+  --encoder-lr-scale 0.10 \
   --temporal-decay 0.5 \
-  --vf-clip-eps 1.0 &> tmp_crate_8.out
+  --rep-loss-coef 1e-3 \
+  --rr-beta 1.0 \
+  --rr-alpha 1.0 \
+  --rr-global-lambda 1.0 \
+  --rr-weight-type softmax \
+  --clip-eps 0.1 \
+  --rr-max-deviation 1.5 &> tmp_crate_rr_1.out
 
-uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
+uv run crate_exps/ppo_temporal_spatial_crate_rr.py \
+  --env-name halfcheetah \
   --n-envs 128 \
   --total-timesteps 10000000 \
   --num-steps 10 \
@@ -64,8 +72,14 @@ uv run crate_exps/ppo_temporal_spatial_crate.py --env-name halfcheetah \
   --frame-skip 1 \
   --emb-dropout 0.1 \
   --ent-coef 0.001 \
-  --weight-decay 0.01 \
-  --encoder-lr-scale 0.25 \
-  --temporal-decay 1.0 \
-  --vf-clip-eps 2.0 &> tmp_crate_8.out
-
+  --weight-decay 0.001 \
+  --encoder-lr-scale 0.10 \
+  --temporal-decay 0.5 \
+  --rep-loss-coef 1e-2 \
+  --rr-beta 1.0 \
+  --rr-alpha 1.0 \
+  --rr-global-lambda 1.0 \
+  --rr-weight-type softmax \
+  --clip-eps 0.1 \
+  --rr-max-deviation 1.1 \
+  --encoder-grad-scale 0.0 &> tmp_crate_rr_1.out

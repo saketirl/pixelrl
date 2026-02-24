@@ -1,26 +1,21 @@
 #!/usr/bin/env python
 """
-PPO for PixelBrax environments using Interleaved Temporal-Spatial CRATE.
+PPO for PixelBrax environments using Interleaved Temporal-Spatial CRATE
+with Return-Weighted Rate-Reduction Auxiliary Loss.
 
-This implementation uses interleaved spatial and temporal attention blocks:
-Instead of: Spatial1 → Spatial2 → Temporal1 → Temporal2
-We use:     Spatial1 → Temporal1 → Spatial2 → Temporal2
+This implementation extends ppo_temporal_spatial_crate.py with:
+- Per-time embeddings from encoder (h_bt)
+- Return-weighted rate-reduction loss using empirical returns-to-go from GAE
+- Efficient T×T logdet computation via Cholesky decomposition
+- Global anti-collapse regularization
 
-Architecture:
-    Input: (B, T, H, W, C_stacked)
-           ↓
-    Patchify all frames: (B, T, num_patches, embed_dim)
-           ↓
-    Add spatial + temporal positional embeddings
-           ↓
-    Interleaved blocks: [Spatial_i → Temporal_i] × depth
-           ↓
-    Global pooling → (B, embed_dim)
-           ↓
-    Actor/Critic heads
+Rate-Reduction Loss:
+    good_rate = mean over trajectories of weighted logdet rate
+    global_rate = logdet of global covariance (anti-collapse)
+    rep_loss = good_rate - global_lambda * global_rate
+    total_loss = ppo_loss + rep_loss_coef * rep_loss
 
-Uses CRATE architecture (ISTA feedforward, simplified Q=K=V attention)
-Based on: https://github.com/Ma-Lab-Berkeley/CRATE
+Reference: "White-Box Transformers via Sparse Rate Reduction" (CRATE paper)
 """
 import os
 import argparse
@@ -37,7 +32,7 @@ import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Sequence
+from typing import Sequence, Tuple, Optional
 
 import flax
 import flax.linen as nn
@@ -177,10 +172,46 @@ class Args:
     """dropout after embedding"""
     attn_dropout: float = 0.0
     """dropout in attention"""
-    parseval_coef: float = 0.0
-    """Parseval regularization coefficient for attention projection weights (0=disabled). Encourages orthogonality of W matrices."""
     freeze_encoder_updates: int = 0
     """Number of updates to freeze encoder (only train actor/critic heads). 0 = no freezing."""
+    encoder_grad_scale: float = 1.0
+    """Scale factor for gradients flowing from actor/critic back to encoder. 1.0 = full gradient, 0.0 = no gradient."""
+
+    # ==========================================================================
+    # Return-Weighted Rate-Reduction Loss Hyperparameters
+    # ==========================================================================
+    rep_loss_coef: float = 1e-3
+    """Coefficient for rate-reduction representation loss"""
+    rr_beta: float = 1.0
+    """Weight sharpness for softmax over returns (higher = sharper focus on high-return timesteps)"""
+    rr_alpha: float = 1.0
+    """Scale for good-rate (per-trajectory weighted logdet)"""
+    rr_alpha_g: float = None
+    """Scale for global-rate (anti-collapse). Defaults to rr_alpha if None."""
+    rr_global_lambda: float = 1.0
+    """Coefficient for global anti-collapse term in rep_loss"""
+    rr_eps: float = 1e-6
+    """Cholesky jitter for numerical stability"""
+    rr_weight_type: str = "softmax"
+    """Weight type: 'softmax', 'relu', or 'topk'"""
+    rr_topk: int = 4
+    """Number of top timesteps to keep if rr_weight_type='topk'"""
+    rep_loss_encoder_only: bool = True
+    """Apply rep_loss gradients only to encoder (not actor/critic)"""
+
+    # Rate clipping parameters
+    rr_clip_rates: bool = True
+    """Enable EMA-based clipping of rate values"""
+    rr_max_deviation: float = 2.0
+    """Max ratio deviation from EMA (e.g., 2.0 = [ema/2, ema*2])"""
+    rr_min_rate: float = 0.1
+    """Absolute minimum for rates"""
+    rr_max_rate: float = 50.0
+    """Absolute maximum for rates"""
+    rr_ema_decay: float = 0.99
+    """EMA decay for rate tracking"""
+    rr_warmup_updates: int = 10
+    """Number of updates before applying rate clipping"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -354,9 +385,9 @@ class CRATEBlock(nn.Module):
 class PatchEmbed(nn.Module):
     """
     CRATE-style patch embedding.
-    Converts (H, W, C) → (num_patches, embed_dim)
+    Converts (H, W, C) -> (num_patches, embed_dim)
 
-    Uses: Rearrange → LayerNorm → Linear → LayerNorm
+    Uses: Rearrange -> LayerNorm -> Linear -> LayerNorm
     """
     patch_size: int = 14
     embed_dim: int = 256
@@ -376,13 +407,13 @@ class PatchEmbed(nn.Module):
         num_patches = num_patches_h * num_patches_w
         patch_dim = p * p * C
 
-        # Rearrange into patches: (B, H, W, C) → (B, num_patches, patch_dim)
+        # Rearrange into patches: (B, H, W, C) -> (B, num_patches, patch_dim)
         # Equivalent to einops: 'b (h p1) (w p2) c -> b (h w) (p1 p2 c)'
         x = x.reshape(B, num_patches_h, p, num_patches_w, p, C)
         x = jnp.transpose(x, (0, 1, 3, 2, 4, 5))  # (B, nh, nw, p, p, C)
         x = x.reshape(B, num_patches, patch_dim)
 
-        # LayerNorm → Linear → LayerNorm (CRATE style)
+        # LayerNorm -> Linear -> LayerNorm (CRATE style)
         x = nn.LayerNorm()(x)
         x = nn.Dense(
             self.embed_dim,
@@ -395,15 +426,15 @@ class PatchEmbed(nn.Module):
 
 
 # --------------------------------------------------------
-#  Interleaved CRATE Encoder
+#  Interleaved CRATE Encoder with Per-Time Embeddings
 # --------------------------------------------------------
 
 class InterleavedCRATEEncoder(nn.Module):
     """
-    Interleaved Spatial-Temporal CRATE encoder.
+    Interleaved Spatial-Temporal CRATE encoder with optional per-time embeddings.
 
     Instead of stacking all spatial blocks then all temporal blocks,
-    this encoder interleaves them: S1 → T1 → S2 → T2 → ...
+    this encoder interleaves them: S1 -> T1 -> S2 -> T2 -> ...
 
     The key difference from FactorizedCRATEEncoder:
     - Maintains full (B, T, num_patches, embed_dim) tensor throughout
@@ -411,8 +442,7 @@ class InterleavedCRATEEncoder(nn.Module):
     - Each temporal block attends over time for each patch position
     - Final pooling aggregates over both dimensions
 
-    This allows richer interaction between spatial and temporal information
-    at each layer of the network.
+    When return_seq=True, also returns per-time embeddings h_bt for rate-reduction loss.
     """
     temporal_stack: int = 8
     channel_stack: int = 4
@@ -427,15 +457,17 @@ class InterleavedCRATEEncoder(nn.Module):
     temporal_decay: float = 0.0  # Decay for temporal attention (0=none)
 
     @nn.compact
-    def __call__(self, x, deterministic: bool = True):
+    def __call__(self, x, deterministic: bool = True, return_seq: bool = False):
         """
         Args:
             x: (B, T, H, W, C_stacked) - batch of frame sequences
                T = temporal_stack (number of temporal tokens)
                C_stacked = C * channel_stack (channel-stacked frames per token)
+            return_seq: If True, also return per-time embeddings h_bt
 
         Returns:
-            (B, embed_dim) - encoded representation
+            h_b: (B, embed_dim) - pooled representation
+            h_bt: (B, T, embed_dim) - per-time embeddings (only if return_seq=True)
         """
         B, T, H, W, C_stacked = x.shape
         dim_head = self.embed_dim // self.num_heads
@@ -446,7 +478,7 @@ class InterleavedCRATEEncoder(nn.Module):
         # Normalize pixel values
         x = x.astype(jnp.float32) / 255.0
 
-        # Patchify all frames: (B, T, H, W, C) → (B, T, num_patches, embed_dim)
+        # Patchify all frames: (B, T, H, W, C) -> (B, T, num_patches, embed_dim)
         # Reshape for patchification
         x = x.reshape(B * T, H, W, C_stacked)
         x = PatchEmbed(patch_size=self.patch_size, embed_dim=self.embed_dim)(x)
@@ -475,7 +507,7 @@ class InterleavedCRATEEncoder(nn.Module):
         # Interleaved spatial and temporal blocks
         for i in range(self.depth):
             # Spatial attention: attend over patches within each frame
-            # Reshape: (B, T, P, D) → (B*T, P, D)
+            # Reshape: (B, T, P, D) -> (B*T, P, D)
             x = x.reshape(B * T, num_patches, self.embed_dim)
             x = CRATEBlock(
                 dim=self.embed_dim,
@@ -486,11 +518,11 @@ class InterleavedCRATEEncoder(nn.Module):
                 ista_lambda=self.ista_lambda,
                 name=f"spatial_block_{i}",
             )(x, deterministic=deterministic)
-            # Reshape back: (B*T, P, D) → (B, T, P, D)
+            # Reshape back: (B*T, P, D) -> (B, T, P, D)
             x = x.reshape(B, T, num_patches, self.embed_dim)
 
             # Temporal attention: attend over time for each patch position
-            # Reshape: (B, T, P, D) → (B*P, T, D)
+            # Reshape: (B, T, P, D) -> (B*P, T, D)
             x = jnp.transpose(x, (0, 2, 1, 3))  # (B, P, T, D)
             x = x.reshape(B * num_patches, T, self.embed_dim)
             x = CRATEBlock(
@@ -503,101 +535,373 @@ class InterleavedCRATEEncoder(nn.Module):
                 temporal_decay=self.temporal_decay,  # Apply decay only to temporal attention
                 name=f"temporal_block_{i}",
             )(x, deterministic=deterministic)
-            # Reshape back: (B*P, T, D) → (B, T, P, D)
+            # Reshape back: (B*P, T, D) -> (B, T, P, D)
             x = x.reshape(B, num_patches, T, self.embed_dim)
             x = jnp.transpose(x, (0, 2, 1, 3))  # (B, T, P, D)
 
         # Final layer norm
         x = nn.LayerNorm()(x)
 
-        # Global average pooling over both time and patches
-        # (B, T, P, D) → (B, D)
-        x = jnp.mean(x, axis=(1, 2))
+        # x shape: (B, T, P, D)
+        # Compute per-time embeddings by pooling patches
+        h_bt = jnp.mean(x, axis=2)  # (B, T, D) - pool patches, keep time
 
-        return x
+        # Global average pooling over time
+        h_b = jnp.mean(h_bt, axis=1)  # (B, D)
+
+        if return_seq:
+            return h_b, h_bt
+        return h_b
 
 
-def extract_temporal_attention(network: InterleavedCRATEEncoder, params, x):
+# --------------------------------------------------------
+#  Return-Weighted Rate-Reduction Loss
+# --------------------------------------------------------
+
+def compute_weights_softmax(G: jnp.ndarray, beta: float, eps: float = 1e-8) -> jnp.ndarray:
     """
-    Extract temporal attention weights from all layers.
-
-    This is a standalone function because Flax only allows one @nn.compact method per class.
+    Compute softmax weights from returns.
 
     Args:
-        network: The InterleavedCRATEEncoder instance
-        params: The network parameters (FrozenDict with 'params' key)
-        x: (B, T, H, W, C_stacked) - batch of frame sequences
+        G: (B, T) normalized returns-to-go
+        beta: temperature/sharpness parameter
+        eps: numerical stability
 
     Returns:
-        List of attention weights, one per temporal block.
-        Each has shape (B, num_patches, num_heads, T, T)
-        where attn[b, p, h, i, j] = how much time step i attends to time step j
+        w: (B, T) weights summing to 1 per trajectory
     """
-    B, T, H, W, C_stacked = x.shape
-    embed_dim = network.embed_dim
-    num_heads = network.num_heads
-    patch_size = network.patch_size
-    depth = network.depth
-    dim_head = embed_dim // num_heads
-    num_patches_h = H // patch_size
-    num_patches_w = W // patch_size
-    num_patches = num_patches_h * num_patches_w
+    return jax.nn.softmax(beta * G, axis=1)
 
-    # Access the nested params dict
-    p = params['params']
 
-    # Normalize pixel values
-    x = x.astype(jnp.float32) / 255.0
+def compute_weights_relu(G: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+    """
+    Compute ReLU-positive weights from returns.
 
-    # Patchify all frames using the PatchEmbed from params
-    patch_embed = PatchEmbed(patch_size=patch_size, embed_dim=embed_dim)
-    x = x.reshape(B * T, H, W, C_stacked)
-    x = patch_embed.apply({'params': p['PatchEmbed_0']}, x)
-    x = x.reshape(B, T, num_patches, embed_dim)
+    Args:
+        G: (B, T) normalized returns-to-go
+        eps: numerical stability
 
-    # Add positional embeddings from params
-    x = x + p['spatial_pos_embed']
-    x = x + p['temporal_pos_embed']
+    Returns:
+        w: (B, T) positive weights normalized per trajectory
+    """
+    u = jax.nn.relu(G)
+    return u / (jnp.sum(u, axis=1, keepdims=True) + eps)
 
-    temporal_attentions = []
 
-    for i in range(depth):
-        # Spatial attention (don't need weights)
-        spatial_block = CRATEBlock(
-            dim=embed_dim,
-            heads=num_heads,
-            dim_head=dim_head,
-            dropout=0.0,
-            ista_step_size=network.ista_step_size,
-            ista_lambda=network.ista_lambda,
+def compute_weights_topk(G: jnp.ndarray, k: int, eps: float = 1e-8) -> jnp.ndarray:
+    """
+    Compute top-k hard focus weights from returns.
+
+    Args:
+        G: (B, T) normalized returns-to-go
+        k: number of top timesteps to keep
+        eps: numerical stability
+
+    Returns:
+        w: (B, T) weights with only top-k non-zero per trajectory
+    """
+    B, T = G.shape
+    # Get indices of top-k values per trajectory
+    topk_vals, _ = jax.lax.top_k(G, k)
+    threshold = topk_vals[:, -1:]  # (B, 1) - k-th largest value
+
+    # Create mask for top-k
+    mask = (G >= threshold).astype(jnp.float32)
+
+    # Renormalize
+    w = mask / (jnp.sum(mask, axis=1, keepdims=True) + eps)
+    return w
+
+
+def normalize_returns(G: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+    """
+    Normalize returns per-trajectory.
+
+    Args:
+        G: (B, T) raw returns-to-go
+        eps: numerical stability
+
+    Returns:
+        G_norm: (B, T) normalized returns (zero mean, unit std per trajectory)
+    """
+    mean = jnp.mean(G, axis=1, keepdims=True)
+    std = jnp.std(G, axis=1, keepdims=True)
+    return (G - mean) / (std + eps)
+
+
+def compute_trajectory_rate(H: jnp.ndarray, w: jnp.ndarray, alpha: float, eps: float) -> jnp.ndarray:
+    """
+    Compute weighted logdet rate for a single trajectory using T×T trick.
+
+    Args:
+        H: (T, D) embeddings for one trajectory
+        w: (T,) weights for each timestep
+        alpha: scale parameter
+        eps: Cholesky jitter
+
+    Returns:
+        rate: scalar logdet rate for this trajectory
+    """
+    T, D = H.shape
+
+    # Weighted mean
+    mu = jnp.sum(w[:, None] * H, axis=0)  # (D,)
+
+    # Center
+    H0 = H - mu  # (T, D)
+
+    # Apply weights (sqrt for covariance)
+    A = jnp.sqrt(w)[:, None] * H0  # (T, D)
+
+    # Matrix determinant lemma: use T×T matrix instead of D×D
+    # logdet(I_D + alpha * A^T A) = logdet(I_T + alpha * A A^T)
+    # This is efficient when T << D
+    M = jnp.eye(T) + alpha * (A @ A.T) + eps * jnp.eye(T)  # (T, T)
+
+    # Cholesky decomposition for stable logdet
+    L = jnp.linalg.cholesky(M)
+    logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
+
+    rate = 0.5 * logdet
+    return rate
+
+
+def compute_good_rate(h_bt: jnp.ndarray, w_bt: jnp.ndarray, alpha: float, eps: float) -> jnp.ndarray:
+    """
+    Compute mean weighted logdet rate across all trajectories.
+
+    Args:
+        h_bt: (B, T, D) per-time embeddings
+        w_bt: (B, T) weights per timestep
+        alpha: scale parameter
+        eps: Cholesky jitter
+
+    Returns:
+        good_rate: scalar mean rate across trajectories
+    """
+    # vmap over batch dimension
+    rates = jax.vmap(compute_trajectory_rate, in_axes=(0, 0, None, None))(
+        h_bt, w_bt, alpha, eps
+    )  # (B,)
+    return jnp.mean(rates)
+
+
+def compute_global_rate(h_bt: jnp.ndarray, alpha_g: float, eps: float) -> jnp.ndarray:
+    """
+    Compute global anti-collapse rate using D×D covariance.
+
+    Args:
+        h_bt: (B, T, D) per-time embeddings
+        alpha_g: scale parameter for global rate
+        eps: Cholesky jitter
+
+    Returns:
+        global_rate: scalar logdet of global covariance
+    """
+    B, T, D = h_bt.shape
+
+    # Flatten all embeddings
+    H_all = h_bt.reshape(B * T, D)  # (B*T, D)
+
+    # Center globally
+    mu = jnp.mean(H_all, axis=0)  # (D,)
+    Hc = H_all - mu  # (B*T, D)
+
+    # Compute covariance
+    N = B * T
+    cov = (Hc.T @ Hc) / N  # (D, D)
+
+    # Compute logdet
+    M = jnp.eye(D) + alpha_g * cov + eps * jnp.eye(D)
+    L = jnp.linalg.cholesky(M)
+    logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
+
+    global_rate = 0.5 * logdet
+    return global_rate
+
+
+# --------------------------------------------------------
+#  Rate Statistics for EMA-based Clipping
+# --------------------------------------------------------
+
+@flax.struct.dataclass
+class RateStats:
+    """Track EMA of rate-reduction values for clipping."""
+    good_rate_ema: jnp.ndarray  # scalar
+    global_rate_ema: jnp.ndarray  # scalar
+    count: jnp.ndarray  # for warm-up
+
+    @classmethod
+    def create(cls):
+        return cls(
+            good_rate_ema=jnp.array(0.0),
+            global_rate_ema=jnp.array(0.0),
+            count=jnp.array(0.0),
         )
-        x = x.reshape(B * T, num_patches, embed_dim)
-        x = spatial_block.apply({'params': p[f'spatial_block_{i}']}, x, deterministic=True, return_attn=False)
-        x = x.reshape(B, T, num_patches, embed_dim)
 
-        # Temporal attention (extract weights)
-        temporal_block = CRATEBlock(
-            dim=embed_dim,
-            heads=num_heads,
-            dim_head=dim_head,
-            dropout=0.0,
-            ista_step_size=network.ista_step_size,
-            ista_lambda=network.ista_lambda,
-            temporal_decay=network.temporal_decay,
+    def update(self, good_rate: jnp.ndarray, global_rate: jnp.ndarray,
+               ema_decay: float = 0.99):
+        """Update EMAs with new rate values."""
+        # Warm-up: use simple average for first ~100 updates
+        warmup_weight = jnp.minimum(self.count / 100.0, 1.0)
+        effective_decay = ema_decay * warmup_weight
+
+        new_good_ema = effective_decay * self.good_rate_ema + (1 - effective_decay) * good_rate
+        new_global_ema = effective_decay * self.global_rate_ema + (1 - effective_decay) * global_rate
+
+        return self.replace(
+            good_rate_ema=new_good_ema,
+            global_rate_ema=new_global_ema,
+            count=self.count + 1,
         )
-        x = jnp.transpose(x, (0, 2, 1, 3))  # (B, P, T, D)
-        x = x.reshape(B * num_patches, T, embed_dim)
-        x, attn_weights = temporal_block.apply(
-            {'params': p[f'temporal_block_{i}']}, x, deterministic=True, return_attn=True
+
+
+def clip_rate_to_ema(
+    rate: jnp.ndarray,
+    ema: jnp.ndarray,
+    max_deviation: float = 2.0,
+    min_rate: float = 0.1,
+    max_rate: float = 50.0,
+) -> jnp.ndarray:
+    """
+    Clip rate based on deviation from EMA.
+
+    Args:
+        rate: current rate value
+        ema: exponential moving average of rate
+        max_deviation: max ratio (rate/ema) allowed, e.g., 2.0 means [ema/2, ema*2]
+        min_rate: absolute minimum (for early training when ema is small)
+        max_rate: absolute maximum (safety ceiling)
+
+    Returns:
+        clipped rate
+    """
+    # Compute dynamic bounds based on EMA
+    # Avoid division issues when ema is near zero
+    safe_ema = jnp.maximum(jnp.abs(ema), 0.1)
+
+    dynamic_min = safe_ema / max_deviation
+    dynamic_max = safe_ema * max_deviation
+
+    # Combine with absolute bounds
+    lower = jnp.maximum(dynamic_min, min_rate)
+    upper = jnp.minimum(dynamic_max, max_rate)
+
+    return jnp.clip(rate, lower, upper)
+
+
+def compute_rate_reduction_loss(
+    h_bt: jnp.ndarray,
+    returns: jnp.ndarray,
+    beta: float,
+    alpha: float,
+    alpha_g: float,
+    global_lambda: float,
+    eps: float,
+    weight_type: str = "softmax",
+    topk: int = 4,
+    # Clipping parameters
+    rate_stats: RateStats = None,
+    clip_rates: bool = False,
+    max_deviation: float = 2.0,
+    min_rate: float = 0.1,
+    max_rate: float = 50.0,
+    ema_decay: float = 0.99,
+    warmup_updates: int = 10,
+) -> Tuple[jnp.ndarray, dict, RateStats]:
+    """
+    Compute return-weighted rate-reduction loss with optional EMA-based clipping.
+
+    Args:
+        h_bt: (B, T, D) per-time embeddings from encoder
+        returns: (B, T) returns-to-go from GAE (already computed as advantages + values)
+        beta: weight sharpness for softmax
+        alpha: scale for good-rate
+        alpha_g: scale for global-rate
+        global_lambda: coefficient for global anti-collapse term
+        eps: numerical stability
+        weight_type: 'softmax', 'relu', or 'topk'
+        topk: k for topk weighting
+        rate_stats: RateStats object for EMA tracking (None to create new)
+        clip_rates: whether to apply EMA-based clipping
+        max_deviation: max ratio deviation from EMA
+        min_rate: absolute minimum for rates
+        max_rate: absolute maximum for rates
+        ema_decay: EMA decay factor
+        warmup_updates: number of updates before applying clipping
+
+    Returns:
+        rep_loss: scalar representation loss
+        metrics: dict of intermediate values for logging
+        rate_stats: updated RateStats object
+    """
+    # Initialize rate_stats if not provided
+    if rate_stats is None:
+        rate_stats = RateStats.create()
+
+    # Stop gradient on returns (weights should not affect PPO gradients)
+    G = jax.lax.stop_gradient(returns)  # (B, T)
+
+    # Normalize per-trajectory
+    G_norm = normalize_returns(G, eps)
+
+    # Compute weights
+    if weight_type == "softmax":
+        w_bt = compute_weights_softmax(G_norm, beta, eps)
+    elif weight_type == "relu":
+        w_bt = compute_weights_relu(G_norm, eps)
+    elif weight_type == "topk":
+        w_bt = compute_weights_topk(G_norm, topk, eps)
+    else:
+        raise ValueError(f"Unknown weight_type: {weight_type}")
+
+    # Compute raw rates (always needed for EMA update)
+    good_rate_raw = compute_good_rate(h_bt, w_bt, alpha, eps)
+    global_rate_raw = compute_global_rate(h_bt, alpha_g, eps)
+
+    # Apply clipping if enabled and past warmup
+    if clip_rates:
+        # Only clip after warmup period
+        should_clip = rate_stats.count >= warmup_updates
+        good_rate = jnp.where(
+            should_clip,
+            clip_rate_to_ema(good_rate_raw, rate_stats.good_rate_ema,
+                            max_deviation, min_rate, max_rate),
+            good_rate_raw
         )
-        # attn_weights: (B*P, heads, T, T)
-        attn_weights = attn_weights.reshape(B, num_patches, num_heads, T, T)
-        temporal_attentions.append(attn_weights)
+        global_rate = jnp.where(
+            should_clip,
+            clip_rate_to_ema(global_rate_raw, rate_stats.global_rate_ema,
+                            max_deviation, min_rate, max_rate),
+            global_rate_raw
+        )
+    else:
+        good_rate = good_rate_raw
+        global_rate = global_rate_raw
 
-        x = x.reshape(B, num_patches, T, embed_dim)
-        x = jnp.transpose(x, (0, 2, 1, 3))  # (B, T, P, D)
+    # Update EMA with raw (unclipped) values for tracking
+    rate_stats = rate_stats.update(good_rate_raw, global_rate_raw, ema_decay)
 
-    return temporal_attentions
+    # Final loss: maximize good_rate, maximize global_rate
+    # Since we minimize loss: good_rate - global_lambda * global_rate
+    # We want high good_rate (low loss contribution) and high global_rate (negative contribution)
+    rep_loss = good_rate - global_lambda * global_rate
+
+    metrics = {
+        "rr/good_rate": good_rate,
+        "rr/good_rate_raw": good_rate_raw,
+        "rr/global_rate": global_rate,
+        "rr/global_rate_raw": global_rate_raw,
+        "rr/good_rate_ema": rate_stats.good_rate_ema,
+        "rr/global_rate_ema": rate_stats.global_rate_ema,
+        "rr/rep_loss": rep_loss,
+        "rr/weight_max": jnp.max(w_bt),
+        "rr/weight_min": jnp.min(w_bt),
+        "rr/weight_entropy": -jnp.mean(jnp.sum(w_bt * jnp.log(w_bt + eps), axis=1)),
+        "rr/rate_stats_count": rate_stats.count,
+    }
+
+    return rep_loss, metrics, rate_stats
 
 
 # --------------------------------------------------------
@@ -813,6 +1117,27 @@ class RewardNormalizer:
 
 
 # --------------------------------------------------------
+#  Gradient Scaling for Encoder
+# --------------------------------------------------------
+
+def scale_encoder_gradient(hidden: jnp.ndarray, scale: float) -> jnp.ndarray:
+    """
+    Scale gradients flowing back through the encoder from actor/critic.
+
+    Args:
+        hidden: Encoder output (B, D) or (B, T, D)
+        scale: Gradient scale factor. 1.0 = full gradient, 0.0 = no gradient (stop_gradient)
+
+    Returns:
+        hidden with scaled gradient flow
+    """
+    # Blend between full gradient and stopped gradient
+    # When scale=1.0: returns hidden (full gradient)
+    # When scale=0.0: returns stop_gradient(hidden) (no gradient)
+    return scale * hidden + (1.0 - scale) * jax.lax.stop_gradient(hidden)
+
+
+# --------------------------------------------------------
 #  Debug Metrics
 # --------------------------------------------------------
 
@@ -842,119 +1167,6 @@ def compute_grad_norms(grads: dict) -> dict:
         "grads/actor_norm": tree_norm(grads['actor']),
         "grads/critic_norm": tree_norm(grads['critic']),
     }
-
-
-def temporal_attention_metrics(temporal_attentions: list, T: int) -> dict:
-    """
-    Compute metrics about temporal attention patterns.
-
-    Args:
-        temporal_attentions: List of attention weights per layer.
-            Each has shape (B, num_patches, num_heads, T, T)
-            where attn[..., i, j] = how much time step i attends to time step j
-        T: number of temporal tokens
-
-    Returns:
-        Dictionary of metrics describing how attention is distributed over time.
-    """
-    metrics = {}
-
-    for layer_idx, attn in enumerate(temporal_attentions):
-        # attn: (B, P, H, T, T) - average over batch, patches, heads
-        # Result: (T, T) attention matrix
-        avg_attn = jnp.mean(attn, axis=(0, 1, 2))  # (T, T)
-
-        layer_name = f"temporal_attn/layer{layer_idx}"
-
-        # Self-attention: diagonal elements (how much each t attends to itself)
-        self_attn = jnp.diag(avg_attn)
-        metrics[f"{layer_name}/self_attn_mean"] = jnp.mean(self_attn)
-
-        # Past attention: for each t, how much does it attend to t-1, t-2, ...
-        # Build a mask for past attention (lower triangular, excluding diagonal)
-        past_mask = jnp.tril(jnp.ones((T, T)), k=-1)
-        past_attn = avg_attn * past_mask
-        past_attn_sum = jnp.sum(past_attn, axis=-1)  # Sum of attention to past for each t
-        # Average over t (excluding t=0 which has no past)
-        metrics[f"{layer_name}/past_attn_mean"] = jnp.mean(past_attn_sum[1:])
-
-        # Future attention: for each t, how much does it attend to t+1, t+2, ...
-        future_mask = jnp.triu(jnp.ones((T, T)), k=1)
-        future_attn = avg_attn * future_mask
-        future_attn_sum = jnp.sum(future_attn, axis=-1)
-        metrics[f"{layer_name}/future_attn_mean"] = jnp.mean(future_attn_sum[:-1])
-
-        # Attention decay: average attention as a function of temporal distance
-        # For distance d, average attention from t to t-d (for all valid t)
-        for d in range(1, min(T, 4)):  # Track up to distance 3
-            # Attention from t to t-d: diagonal at offset -d
-            if d < T:
-                diag_d = jnp.diag(avg_attn, k=-d)  # Shape: (T-d,)
-                metrics[f"{layer_name}/attn_dist_{d}"] = jnp.mean(diag_d)
-
-        # Attention entropy per query position (higher = more distributed attention)
-        # Entropy = -sum(p * log(p))
-        attn_flat = jnp.mean(attn, axis=(0, 1, 2))  # (T, T)
-        entropy = -jnp.sum(attn_flat * jnp.log(attn_flat + 1e-10), axis=-1)
-        metrics[f"{layer_name}/entropy_mean"] = jnp.mean(entropy)
-        metrics[f"{layer_name}/entropy_min"] = jnp.min(entropy)
-        metrics[f"{layer_name}/entropy_max"] = jnp.max(entropy)
-
-        # Attention to most recent frame (t-1) vs oldest frame (t=0)
-        # For the last time step T-1
-        metrics[f"{layer_name}/last_to_prev"] = avg_attn[T-1, T-2] if T > 1 else 0.0
-        metrics[f"{layer_name}/last_to_first"] = avg_attn[T-1, 0]
-
-    return metrics
-
-
-# --------------------------------------------------------
-#  Parseval Regularization
-# --------------------------------------------------------
-
-def compute_parseval_loss(params: flax.core.FrozenDict) -> jnp.ndarray:
-    """
-    Compute Parseval regularization loss for attention projection weights.
-
-    Parseval regularization encourages orthogonality of weight matrices by
-    penalizing the deviation of W^T W from the identity matrix:
-
-        L_parseval = ||W^T W - I||_F^2
-
-    This helps maintain trainability and prevents loss of plasticity.
-
-    Reference: "Parseval Regularization for Continual Reinforcement Learning"
-    https://arxiv.org/abs/2412.07224
-
-    Args:
-        params: Network parameters (FrozenDict)
-
-    Returns:
-        Scalar Parseval regularization loss
-    """
-    total_loss = 0.0
-    count = 0
-
-    # Flatten params to find all attention projection kernels
-    flat_params = flax.traverse_util.flatten_dict(params)
-
-    for key, value in flat_params.items():
-        # Look for Dense kernels in CRATEAttention layers (spatial and temporal blocks)
-        # The qkv projection is Dense_0 in CRATEAttention
-        key_str = '/'.join(str(k) for k in key)
-        if 'CRATEAttention_0' in key_str and 'Dense_0' in key_str and 'kernel' in key_str:
-            W = value  # Shape: (input_dim, output_dim)
-            # Compute W^T W
-            WtW = W.T @ W
-            # Create identity matrix of appropriate size
-            I = jnp.eye(WtW.shape[0])
-            # Frobenius norm squared of (W^T W - I)
-            parseval_loss = jnp.sum((WtW - I) ** 2)
-            total_loss = total_loss + parseval_loss
-            count = count + 1
-
-    # Return average loss across all attention projections
-    return total_loss / jnp.maximum(count, 1)
 
 
 # --------------------------------------------------------
@@ -994,7 +1206,9 @@ if __name__ == "__main__":
     args.num_updates = args.total_timesteps // args.batch_size
     if args.vf_clip_eps is None:
         args.vf_clip_eps = args.clip_eps  # Default to same as policy clipping
-    run_name = f"{args.env_name}__interleaved_crate__{args.seed}__{int(time.time())}"
+    if args.rr_alpha_g is None:
+        args.rr_alpha_g = args.rr_alpha  # Default to same as good-rate alpha
+    run_name = f"{args.env_name}__crate_rr__{args.seed}__{int(time.time())}"
 
     if args.track:
         import wandb
@@ -1015,7 +1229,7 @@ if __name__ == "__main__":
 
     # Environment setup
     print("=" * 60)
-    print("Interleaved CRATE PPO")
+    print("Interleaved CRATE PPO with Rate-Reduction Loss")
     print("=" * 60)
     print(f"JAX devices: {jax.devices()}")
     print(f"env name: {args.env_name}")
@@ -1044,8 +1258,27 @@ if __name__ == "__main__":
     print(f"  embed_dim: {args.embed_dim}")
     print(f"  depth (interleaved pairs): {args.depth}")
     print(f"  num_heads: {args.num_heads}")
-    print(f"\nAttention pattern: S1 → T1 → S2 → T2 → ... → S{args.depth} → T{args.depth}")
+    print(f"\nAttention pattern: S1 -> T1 -> S2 -> T2 -> ... -> S{args.depth} -> T{args.depth}")
     print(f"Total blocks: {args.depth * 2} ({args.depth} spatial + {args.depth} temporal)")
+
+    print(f"\nRate-Reduction config:")
+    print(f"  rep_loss_coef: {args.rep_loss_coef}")
+    print(f"  rr_beta (weight sharpness): {args.rr_beta}")
+    print(f"  rr_alpha (good-rate scale): {args.rr_alpha}")
+    print(f"  rr_alpha_g (global-rate scale): {args.rr_alpha_g}")
+    print(f"  rr_global_lambda: {args.rr_global_lambda}")
+    print(f"  rr_weight_type: {args.rr_weight_type}")
+    if args.rr_weight_type == "topk":
+        print(f"  rr_topk: {args.rr_topk}")
+    print(f"  rep_loss_encoder_only: {args.rep_loss_encoder_only}")
+    print(f"\nRate Clipping config:")
+    print(f"  rr_clip_rates: {args.rr_clip_rates}")
+    if args.rr_clip_rates:
+        print(f"  rr_max_deviation: {args.rr_max_deviation}")
+        print(f"  rr_min_rate: {args.rr_min_rate}")
+        print(f"  rr_max_rate: {args.rr_max_rate}")
+        print(f"  rr_ema_decay: {args.rr_ema_decay}")
+        print(f"  rr_warmup_updates: {args.rr_warmup_updates}")
     print("=" * 60)
 
     envs, action_dim = make_pixelbrax_envs(args)
@@ -1106,9 +1339,13 @@ if __name__ == "__main__":
     dummy_obs = jnp.zeros((1,) + obs_shape)
     print(f"dummy_obs shape: {dummy_obs.shape}")
 
-    network_params = network.init(network_key, dummy_obs, deterministic=True)
-    dummy_hidden = network.apply(network_params, dummy_obs, deterministic=True)
+    network_params = network.init(network_key, dummy_obs, deterministic=True, return_seq=False)
+    dummy_hidden = network.apply(network_params, dummy_obs, deterministic=True, return_seq=False)
     print(f"encoder output shape: {dummy_hidden.shape}")
+
+    # Test return_seq mode
+    dummy_hidden_seq, dummy_h_bt = network.apply(network_params, dummy_obs, deterministic=True, return_seq=True)
+    print(f"encoder h_bt shape (per-time): {dummy_h_bt.shape}")
 
     # Initialize all params first
     actor_params = actor.init(actor_key, dummy_hidden)
@@ -1170,24 +1407,31 @@ if __name__ == "__main__":
     )
 
     print(f"encoder_lr_scale: {args.encoder_lr_scale}")
+    print(f"encoder_grad_scale: {args.encoder_grad_scale}")
     print(f"weight_decay: {args.weight_decay}")
     print(f"head_activation: {args.head_activation}")
     if args.vf_clip_eps != args.clip_eps:
         print(f"vf_clip_eps: {args.vf_clip_eps} (policy clip_eps: {args.clip_eps})")
     if args.temporal_decay > 0:
         print(f"temporal_decay: {args.temporal_decay} (penalizing distant temporal attention)")
-    if args.parseval_coef > 0:
-        print(f"parseval_coef: {args.parseval_coef} (Parseval regularization on attention W matrices)")
     if args.freeze_encoder_updates > 0:
         print(f"freeze_encoder_updates: {args.freeze_encoder_updates} (encoder frozen, only training actor/critic)")
-    if args.debug_temporal_attn:
-        print(f"debug_temporal_attn: enabled (logging temporal attention patterns)")
 
     # Count parameters
     param_count = sum(x.size for x in jax.tree_util.tree_leaves(agent_state.params))
     print(f"Total parameters: {param_count:,}")
 
-    network.apply = jax.jit(partial(network.apply, deterministic=True))
+    # JIT compile network applications
+    # For inference (no return_seq needed)
+    @jax.jit
+    def network_apply_inference(params, x):
+        return network.apply(params, x, deterministic=True, return_seq=False)
+
+    # For training (with return_seq for rate-reduction loss)
+    @jax.jit
+    def network_apply_train(params, x):
+        return network.apply(params, x, deterministic=True, return_seq=True)
+
     actor.apply = jax.jit(actor.apply, static_argnames=['return_activations'])
     critic.apply = jax.jit(critic.apply, static_argnames=['return_activations'])
 
@@ -1197,7 +1441,7 @@ if __name__ == "__main__":
         next_obs: np.ndarray,
         key: jax.random.PRNGKey,
     ):
-        hidden = network.apply(agent_state.params['network'], next_obs)
+        hidden = network_apply_inference(agent_state.params['network'], next_obs)
         actor_mean, actor_logstd = actor.apply(agent_state.params['actor'], hidden)
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
         key, subkey = jax.random.split(key)
@@ -1207,18 +1451,20 @@ if __name__ == "__main__":
         action = jnp.clip(action, -args.max_action, args.max_action)
         return action, logprob, value.squeeze(-1), key
 
-    @jax.jit
     def get_action_and_value2(
         params: flax.core.FrozenDict,
         x: np.ndarray,
         action: np.ndarray,
     ):
-        hidden = network.apply(params['network'], x)
-        actor_mean, actor_logstd = actor.apply(params['actor'], hidden)
+        """Get logprob, entropy, value for PPO loss (no return_seq needed)."""
+        hidden = network.apply(params['network'], x, deterministic=True, return_seq=False)
+        # Scale gradients flowing back to encoder from actor/critic
+        hidden_scaled = scale_encoder_gradient(hidden, args.encoder_grad_scale)
+        actor_mean, actor_logstd = actor.apply(params['actor'], hidden_scaled)
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
-        value = critic.apply(params['critic'], hidden).squeeze(-1)
+        value = critic.apply(params['critic'], hidden_scaled).squeeze(-1)
         return logprob, entropy, value
 
     def compute_gae_once(carry, inp, gamma, gae_lambda):
@@ -1238,9 +1484,12 @@ if __name__ == "__main__":
         next_done: np.ndarray,
         storage: Storage,
     ):
+        hidden = network_apply_inference(agent_state.params['network'], next_obs)
+        # Scale gradients flowing back to encoder from critic
+        hidden_scaled = scale_encoder_gradient(hidden, args.encoder_grad_scale)
         next_value = critic.apply(
             agent_state.params['critic'],
-            network.apply(agent_state.params['network'], next_obs)
+            hidden_scaled
         ).squeeze(-1)
         advantages = jnp.zeros((args.n_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
@@ -1255,6 +1504,7 @@ if __name__ == "__main__":
         return storage
 
     def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values):
+        """Standard PPO loss without rate-reduction (for minibatch updates)."""
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
@@ -1278,31 +1528,138 @@ if __name__ == "__main__":
         entropy_loss = entropy.mean()
         loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-        # Parseval regularization for attention projection weights
-        parseval_loss = jnp.float32(0.0)
-        if args.parseval_coef > 0:
-            parseval_loss = compute_parseval_loss(params['network'])
-            loss = loss + args.parseval_coef * parseval_loss
-
-        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl), parseval_loss)
+        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
+    def rep_loss_fn(network_params, obs, returns, rate_stats):
+        """
+        Compute rate-reduction loss on full trajectories with EMA-based clipping.
+
+        Args:
+            network_params: encoder parameters
+            obs: (T, B, obs_shape...) observations from rollout
+            returns: (T, B) returns from GAE
+            rate_stats: RateStats object for EMA tracking
+
+        Returns:
+            rep_loss: scalar
+            (metrics, rate_stats_updated): auxiliary outputs
+        """
+        # Transpose to (B, T, ...)
+        # obs: (T, B, temporal_stack, H, W, C_stacked) -> need to handle carefully
+        # The obs here is flattened across T steps, but each obs already has temporal_stack
+        # We need to sample one observation per env to get (B, T_rr, D) where T_rr = temporal_stack
+
+        # Actually, returns is (num_steps, n_envs) from rollout
+        # We need to reshape to (B, T) where B = n_envs and T = num_steps
+        # But the encoder expects temporal_stack frames, which is different from num_steps
+
+        # For rate-reduction, we sample observations and use their per-time embeddings
+        # obs shape: (num_steps, n_envs, temporal_stack, H, W, C_stacked)
+        # returns shape: (num_steps, n_envs)
+
+        num_steps = obs.shape[0]
+        n_envs = obs.shape[1]
+
+        # Sample one observation per env (e.g., last one or random)
+        # For simplicity, use the last observation which has the most recent temporal stack
+        # This gives us T = temporal_stack for rate-reduction
+        sampled_obs = obs[-1]  # (n_envs, temporal_stack, H, W, C_stacked)
+
+        # Get per-time embeddings
+        h_b, h_bt = network.apply(network_params, sampled_obs, deterministic=True, return_seq=True)
+        # h_bt: (n_envs, temporal_stack, embed_dim)
+
+        # For returns, we need to match the temporal structure
+        # Since each timestep's observation contains temporal_stack frames,
+        # we can use the returns from the last temporal_stack timesteps
+        # This aligns returns with the per-time embeddings
+        T = args.temporal_stack
+        if num_steps >= T:
+            # Use last T returns for each env
+            sampled_returns = returns[-T:, :]  # (T, n_envs)
+            sampled_returns = sampled_returns.T  # (n_envs, T) = (B, T)
+        else:
+            # Pad with zeros if not enough steps
+            pad_size = T - num_steps
+            sampled_returns = jnp.pad(returns, ((pad_size, 0), (0, 0)), mode='edge')
+            sampled_returns = sampled_returns.T  # (n_envs, T)
+
+        rep_loss, metrics, rate_stats_updated = compute_rate_reduction_loss(
+            h_bt=h_bt,
+            returns=sampled_returns,
+            beta=args.rr_beta,
+            alpha=args.rr_alpha,
+            alpha_g=args.rr_alpha_g,
+            global_lambda=args.rr_global_lambda,
+            eps=args.rr_eps,
+            weight_type=args.rr_weight_type,
+            topk=args.rr_topk,
+            # Clipping parameters
+            rate_stats=rate_stats,
+            clip_rates=args.rr_clip_rates,
+            max_deviation=args.rr_max_deviation,
+            min_rate=args.rr_min_rate,
+            max_rate=args.rr_max_rate,
+            ema_decay=args.rr_ema_decay,
+            warmup_updates=args.rr_warmup_updates,
+        )
+
+        return rep_loss, (metrics, rate_stats_updated)
+
+    # Compute gradients only w.r.t. network_params (argnums=0)
+    rep_loss_grad_fn = jax.value_and_grad(rep_loss_fn, argnums=0, has_aux=True)
+
     def _zero_encoder_grads(grads):
         """Zero out encoder gradients, keeping actor/critic gradients intact."""
-        return {
+        return flax.core.freeze({
             'network': jax.tree_map(jnp.zeros_like, grads['network']),
             'actor': grads['actor'],
             'critic': grads['critic'],
-        }
+        })
 
     @partial(jax.jit, static_argnames=['freeze_encoder'])
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
+        rate_stats: RateStats,
         freeze_encoder: bool = False,
     ):
+        """
+        PPO update with rate-reduction loss and EMA-based rate clipping.
+
+        Rate-reduction loss is computed once per update on the full rollout batch
+        (not on shuffled minibatches) to preserve trajectory structure.
+        """
+        # Compute rate-reduction loss on full batch (once per update)
+        # storage.obs: (num_steps, n_envs, ...)
+        # storage.returns: (num_steps, n_envs)
+        if args.rep_loss_coef > 0:
+            (rep_loss, (rr_metrics, rate_stats)), rep_grads = rep_loss_grad_fn(
+                agent_state.params['network'],
+                storage.obs,
+                storage.returns,
+                rate_stats,
+            )
+        else:
+            rep_loss = jnp.float32(0.0)
+            rr_metrics = {
+                "rr/good_rate": jnp.float32(0.0),
+                "rr/good_rate_raw": jnp.float32(0.0),
+                "rr/global_rate": jnp.float32(0.0),
+                "rr/global_rate_raw": jnp.float32(0.0),
+                "rr/good_rate_ema": jnp.float32(0.0),
+                "rr/global_rate_ema": jnp.float32(0.0),
+                "rr/rep_loss": jnp.float32(0.0),
+                "rr/weight_max": jnp.float32(0.0),
+                "rr/weight_min": jnp.float32(0.0),
+                "rr/weight_entropy": jnp.float32(0.0),
+                "rr/rate_stats_count": jnp.float32(0.0),
+            }
+            rep_grads = jax.tree_map(jnp.zeros_like, agent_state.params['network'])
+
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
             key, subkey = jax.random.split(key)
@@ -1320,7 +1677,7 @@ if __name__ == "__main__":
 
             def update_minibatch(carry, minibatch):
                 agent_state = carry
-                (loss, (pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss)), grads = ppo_loss_grad_fn(
+                (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
                     minibatch.actions,
@@ -1329,22 +1686,38 @@ if __name__ == "__main__":
                     minibatch.returns,
                     minibatch.values,
                 )
+
+                # Add rate-reduction gradients to encoder
+                # Scale by rep_loss_coef and divide by num_minibatches*num_epochs
+                # to amortize the single rep_loss computation across all updates
+                if args.rep_loss_coef > 0:
+                    scale = args.rep_loss_coef / (args.num_minibatches * args.update_epochs)
+                    scaled_rep_grads = jax.tree_map(lambda g: g * scale, rep_grads)
+                    # Add rep_grads to network gradients, preserve FrozenDict structure
+                    new_network_grads = jax.tree_map(jnp.add, grads['network'], scaled_rep_grads)
+                    grads = flax.core.freeze({
+                        'network': new_network_grads,
+                        'actor': grads['actor'],
+                        'critic': grads['critic'],
+                    })
+
                 # Zero out encoder gradients if frozen
                 if freeze_encoder:
                     grads = _zero_encoder_grads(grads)
-                agent_state = agent_state.apply_gradients(grads=grads)
-                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads)
 
-            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads) = jax.lax.scan(
+                agent_state = agent_state.apply_gradients(grads=grads)
+                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
+
+            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
                 update_minibatch, agent_state, shuffled_storage
             )
-            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads)
+            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
-        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, grads) = jax.lax.scan(
+        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
             update_epoch, (agent_state, key), (), length=args.update_epochs
         )
         final_grads = jax.tree_map(lambda x: x[-1, -1], grads)
-        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, final_grads, key
+        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, rep_loss, rr_metrics, final_grads, key, rate_stats
 
     # Start training
     global_step = 0
@@ -1362,6 +1735,7 @@ if __name__ == "__main__":
     next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
 
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
+    rate_stats = RateStats.create()
 
     def step_once(carry, step):
         agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
@@ -1423,10 +1797,11 @@ if __name__ == "__main__":
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
         freeze_encoder = iteration <= args.freeze_encoder_updates
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, parseval_loss, final_grads, key = update_ppo(
+        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, rep_loss, rr_metrics, final_grads, key, rate_stats = update_ppo(
             agent_state,
             storage,
             key,
+            rate_stats,
             freeze_encoder=freeze_encoder,
         )
 
@@ -1441,11 +1816,13 @@ if __name__ == "__main__":
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
 
+            rep_loss_val = float(jax.device_get(rep_loss))
             print(
                 f"update={iteration} step={global_step} "
                 f"ep_return={avg_episodic_return:.1f} "
                 f"ep_len={avg_episodic_length * args.action_repeat:.0f} "
                 f"loss={loss[-1, -1].item():.4f} "
+                f"rep_loss={rep_loss_val:.4f} "
                 f"SPS={sps}"
             )
 
@@ -1474,8 +1851,8 @@ if __name__ == "__main__":
                     "losses/policy_loss": pg_loss[-1, -1].item(),
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
-                    "losses/parseval": parseval_loss[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
+                    "losses/rep_loss": rep_loss_val,
                     "training/encoder_frozen": int(freeze_encoder),
                     "policy/log_std_mean": log_std_mean,
                     "policy/log_std_min": log_std_min,
@@ -1483,10 +1860,14 @@ if __name__ == "__main__":
                     "policy/std_mean": std_mean,
                 }
 
+                # Rate-reduction metrics
+                for k, v in rr_metrics.items():
+                    log_dict[k] = float(jax.device_get(v))
+
                 if args.debug_repr:
                     # Compute representation health averaged over rollout batch
                     batch_obs = storage.obs.reshape((-1,) + storage.obs.shape[2:])
-                    hidden = network.apply(agent_state.params['network'], batch_obs)
+                    hidden = network_apply_inference(agent_state.params['network'], batch_obs)
                     health_metrics = repr_health(hidden)
                     for k, v in health_metrics.items():
                         log_dict[k] = float(jax.device_get(v))
@@ -1508,18 +1889,6 @@ if __name__ == "__main__":
                     )
                     critic_sat_metrics = tanh_saturation_metrics(critic_activations, "critic_tanh")
                     for k, v in critic_sat_metrics.items():
-                        log_dict[k] = float(jax.device_get(v))
-
-                if args.debug_temporal_attn:
-                    # Extract temporal attention patterns
-                    # Use a smaller batch to reduce compute
-                    sample_obs = storage.obs[:8, :8]  # (8 steps, 8 envs, T, H, W, C)
-                    sample_obs = sample_obs.reshape((-1,) + sample_obs.shape[2:])  # (64, T, H, W, C)
-                    temporal_attns = extract_temporal_attention(
-                        network, agent_state.params['network'], sample_obs
-                    )
-                    attn_metrics = temporal_attention_metrics(temporal_attns, args.temporal_stack)
-                    for k, v in attn_metrics.items():
                         log_dict[k] = float(jax.device_get(v))
 
                 wandb.log(log_dict, step=global_step)
