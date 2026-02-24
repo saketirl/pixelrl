@@ -140,7 +140,7 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn', 'mlp', or 'vit'"""
+    """encoder architecture to use: 'cnn', 'mlp', 'vit', 'hybrid_vit', or 'drq_vit'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_warmup_updates: int = 0
@@ -149,6 +149,8 @@ class Args:
     """ViT patch size (pixels) for both height and width."""
     vit_hidden_size: int = 192
     """ViT token/embedding hidden dimension."""
+    vit_proj_dim: int = 512
+    """RL projection head output dimension for ViT/HybridViT encoders."""
     vit_mlp_dim: int = 768
     """ViT MLP expansion dimension in transformer blocks."""
     vit_num_heads: int = 3
@@ -168,7 +170,7 @@ class Args:
     vit_conv_stem_kernel: int = 3
     """Kernel size for the optional ViT CNN stem convolutions."""
     vit_apply_output_tanh: bool = False
-    """If true, apply tanh bottleneck on ViT 512-dim output."""
+    """If true, apply tanh bottleneck on ViT encoder output projection."""
     vit_qk_stiefel: bool = False
     """If true, apply Stiefel-constrained updates to ViT attention Q/K kernels."""
     vit_qk_stiefel_lr: float = 1e-4
@@ -181,6 +183,20 @@ class Args:
     """Number of matrix-sign iterations for ViT Q/K Stiefel updates."""
     vit_qk_stiefel_max_grad_norm: float = 0.5
     """Max grad norm clip for ViT Q/K Stiefel parameter group."""
+    hybrid_vit_stem_c1: int = 24
+    """HybridViT conv stem stage-1 output channels."""
+    hybrid_vit_stem_c2: int = 48
+    """HybridViT conv stem stage-2 output channels."""
+    hybrid_vit_stem_c3: int = 96
+    """HybridViT conv stem stage-3 output channels."""
+    hybrid_vit_stem_c4: int = 192
+    """HybridViT conv stem stage-4 output channels."""
+    drq_vit_stem_channels: int = 32
+    """DrQViT conv stem channel width (all 4 stem layers use this)."""
+    drq_vit_token_downsample: int = 1
+    """Optional patch-like downsample factor after DrQ bridge conv (1 disables)."""
+    drq_vit_apply_output_tanh: bool = False
+    """If true, apply tanh to DrQViT encoder output projection."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -662,6 +678,7 @@ if __name__ == "__main__":
     if args.encoder_type.lower() == "vit":
         print(f"  vit_patch_size: {args.vit_patch_size}")
         print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
         print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
         print(f"  vit_num_heads: {args.vit_num_heads}")
         print(f"  vit_num_layers: {args.vit_num_layers}")
@@ -678,6 +695,25 @@ if __name__ == "__main__":
         print(f"  vit_qk_stiefel_dual_steps: {args.vit_qk_stiefel_dual_steps}")
         print(f"  vit_qk_stiefel_msign_steps: {args.vit_qk_stiefel_msign_steps}")
         print(f"  vit_qk_stiefel_max_grad_norm: {args.vit_qk_stiefel_max_grad_norm}")
+    if args.encoder_type.lower() == "hybrid_vit":
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  hybrid_vit_stem_c1: {args.hybrid_vit_stem_c1}")
+        print(f"  hybrid_vit_stem_c2: {args.hybrid_vit_stem_c2}")
+        print(f"  hybrid_vit_stem_c3: {args.hybrid_vit_stem_c3}")
+        print(f"  hybrid_vit_stem_c4: {args.hybrid_vit_stem_c4}")
+    if args.encoder_type.lower() == "drq_vit":
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  drq_vit_stem_channels: {args.drq_vit_stem_channels}")
+        print(f"  drq_vit_token_downsample: {args.drq_vit_token_downsample}")
+        print(f"  drq_vit_apply_output_tanh: {args.drq_vit_apply_output_tanh}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
@@ -715,6 +751,14 @@ if __name__ == "__main__":
         conv_stem_channels=args.vit_conv_stem_channels,
         conv_stem_kernel=args.vit_conv_stem_kernel,
         apply_output_tanh=args.vit_apply_output_tanh,
+        stem_c1=args.hybrid_vit_stem_c1,
+        stem_c2=args.hybrid_vit_stem_c2,
+        stem_c3=args.hybrid_vit_stem_c3,
+        stem_c4=args.hybrid_vit_stem_c4,
+        drq_stem_channels=args.drq_vit_stem_channels,
+        drq_token_downsample=args.drq_vit_token_downsample,
+        drq_apply_output_tanh=args.drq_vit_apply_output_tanh,
+        proj_dim=args.vit_proj_dim,
     )
     network = build_encoder(
         args.encoder_type,

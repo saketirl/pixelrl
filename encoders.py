@@ -25,6 +25,14 @@ class ViTConfig:
     conv_stem_channels: int = 64
     conv_stem_kernel: int = 3
     apply_output_tanh: bool = False
+    stem_c1: int = 24
+    stem_c2: int = 48
+    stem_c3: int = 96
+    stem_c4: int = 192
+    drq_stem_channels: int = 32
+    drq_token_downsample: int = 1
+    drq_apply_output_tanh: bool = False
+    proj_dim: int = 512
 
 
 class AddPositionEmbs(nn.Module):
@@ -136,6 +144,7 @@ class ViTEncoder(nn.Module):
     conv_stem_channels: int = 64
     conv_stem_kernel: int = 3
     apply_output_tanh: bool = False
+    proj_dim: int = 512
 
     @nn.compact
     def __call__(self, x):
@@ -179,6 +188,7 @@ class ViTEncoder(nn.Module):
                 f"patch_size={self.patch_size}"
             )
 
+        # Standard ViT patchify + linear projection in one conv op.
         x = nn.Conv(
             features=self.hidden_size,
             kernel_size=(self.patch_size, self.patch_size),
@@ -209,10 +219,214 @@ class ViTEncoder(nn.Module):
             x = jnp.mean(x, axis=1)
 
         x = nn.Dense(
-            512,
+            self.proj_dim,
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
-            name="proj_512",
+            name="proj_head",
+        )(x)
+        x = nn.LayerNorm(name="proj_norm")(x)
+        if self.apply_output_tanh:
+            x = nn.tanh(self.tanh_scale * x)
+        return x
+
+
+class HybridViTEncoder(nn.Module):
+    """Hybrid ViT encoder: 4-stage stride-2 conv stem → 1×1 proj → Transformer.
+
+    Spatial resolution for 84×84 input (SAME padding, stride-2 ×4):
+    84 → 42 → 21 → 11 → 6  ⟹  6×6 = 36 tokens (+ 1 CLS = 37).
+
+    https://proceedings.neurips.cc/paper/2021/file/ff1418e8cc993fe8abcfe3ce2003e5c5-Paper.pdf
+    Uses layernorm instead of batchnorm
+    """
+
+    tanh_scale: float = 0.5
+    hidden_size: int = 192
+    mlp_dim: int = 576
+    num_heads: int = 3
+    num_layers: int = 12
+    dropout_rate: float = 0.0
+    attention_dropout_rate: float = 0.0
+    apply_output_tanh: bool = False
+    stem_c1: int = 24
+    stem_c2: int = 48
+    stem_c3: int = 96
+    stem_c4: int = 192
+    proj_dim: int = 512
+
+    @nn.compact
+    def __call__(self, x):
+        if x.ndim != 4:
+            raise ValueError(f"Expected NHWC image input, got shape={x.shape}")
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+        x = x.astype(jnp.float32) / 255.0
+
+        # 4-stage conv stem: each stage halves spatial resolution
+        for i, channels in enumerate(
+            [self.stem_c1, self.stem_c2, self.stem_c3, self.stem_c4]
+        ):
+            x = nn.Conv(
+                features=channels,
+                kernel_size=(3, 3),
+                strides=(2, 2),
+                padding="SAME",
+                kernel_init=nn.initializers.xavier_uniform(),
+                name=f"stem_conv_{i}",
+            )(x)
+            x = nn.LayerNorm(name=f"stem_ln_{i}")(x)
+            x = nn.relu(x)
+
+        # 1×1 projection to transformer hidden dim (no norm)
+        x = nn.Conv(
+            features=self.hidden_size,
+            kernel_size=(1, 1),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="proj_conv",
+        )(x)
+
+        # Reshape (B, H', W', D) → (B, N, D) token sequence
+        batch_size = x.shape[0]
+        x = x.reshape((batch_size, -1, self.hidden_size))
+
+        # Prepend learnable CLS token
+        cls = self.param("cls", nn.initializers.zeros, (1, 1, self.hidden_size))
+        cls = jnp.tile(cls, (batch_size, 1, 1))
+        x = jnp.concatenate([cls, x], axis=1)
+
+        # Transformer encoder (includes AddPositionEmbs, Dropout, L-1 blocks, LayerNorm)
+        x = Encoder(
+            num_layers=self.num_layers - 1,
+            mlp_dim=self.mlp_dim,
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate,
+            attention_dropout_rate=self.attention_dropout_rate,
+            name="Transformer",
+        )(x)
+
+        # Extract CLS token
+        x = x[:, 0]
+
+        # RL projection head
+        x = nn.Dense(
+            self.proj_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="proj_head",
+        )(x)
+        x = nn.LayerNorm(name="proj_norm")(x)
+        if self.apply_output_tanh:
+            x = nn.tanh(self.tanh_scale * x)
+        return x
+
+
+class DrQViTEncoder(nn.Module):
+    """DrQ-style hybrid encoder: shallow VALID conv stem → bridge conv → Transformer.
+
+    Spatial math for 84×84 input (VALID padding):
+      84 →(3×3,s=2)→ 41 →(3×3,s=1)→ 39 →(s=1)→ 37 →(s=1)→ 35
+      →bridge(3×3,s=2,pad=1): floor((35+2-3)/2)+1 = 18 → 18×18 = 324 tokens
+
+    No LayerNorm in conv stem (pure conv+ReLU like original DrQ/DreamerV3).
+    No CLS token — uses Global Average Pool instead.
+    """
+
+    tanh_scale: float = 0.5
+    hidden_size: int = 192
+    mlp_dim: int = 768
+    num_heads: int = 6
+    num_layers: int = 4
+    dropout_rate: float = 0.0
+    attention_dropout_rate: float = 0.0
+    drq_stem_channels: int = 32
+    token_downsample: int = 1
+    apply_output_tanh: bool = False
+
+    @nn.compact
+    def __call__(self, x):
+        if x.ndim != 4:
+            raise ValueError(f"Expected NHWC image input, got shape={x.shape}")
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_heads ({self.num_heads})"
+            )
+        if self.token_downsample <= 0:
+            raise ValueError(
+                f"token_downsample must be positive, got {self.token_downsample}"
+            )
+        x = x.astype(jnp.float32) / 255.0
+
+        # 4-layer conv stem: no LayerNorm, VALID padding, uniform channels
+        strides = [(2, 2), (1, 1), (1, 1), (1, 1)]
+        for i, s in enumerate(strides):
+            x = nn.Conv(
+                features=self.drq_stem_channels,
+                kernel_size=(3, 3),
+                strides=s,
+                padding="VALID",
+                kernel_init=nn.initializers.xavier_uniform(),
+                name=f"stem_conv_{i}",
+            )(x)
+            x = nn.relu(x)
+
+        # Bridge conv: stride-2, pad=1 each side → 18×18 tokens
+        x = nn.Conv(
+            features=self.hidden_size,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding=((1, 1), (1, 1)),
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="bridge_conv",
+        )(x)
+
+        # Optional patch-like compression before attention to reduce token count.
+        if self.token_downsample > 1:
+            height, width = x.shape[1], x.shape[2]
+            if (height % self.token_downsample != 0) or (
+                width % self.token_downsample != 0
+            ):
+                raise ValueError(
+                    f"DrQ token map ({height}, {width}) is not divisible by "
+                    f"token_downsample={self.token_downsample}"
+                )
+            x = nn.Conv(
+                features=self.hidden_size,
+                kernel_size=(self.token_downsample, self.token_downsample),
+                strides=(self.token_downsample, self.token_downsample),
+                padding="VALID",
+                kernel_init=nn.initializers.xavier_uniform(),
+                name="token_downsample",
+            )(x)
+
+        # Reshape (B, H', W', D) → (B, N, D)
+        batch_size = x.shape[0]
+        x = x.reshape((batch_size, -1, self.hidden_size))
+
+        # Transformer encoder (pos emb + dropout + blocks + LayerNorm)
+        x = Encoder(
+            num_layers=self.num_layers,
+            mlp_dim=self.mlp_dim,
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate,
+            attention_dropout_rate=self.attention_dropout_rate,
+            name="Transformer",
+        )(x)
+
+        # Global Average Pool
+        x = jnp.mean(x, axis=1)
+
+        # RL projection head
+        x = nn.Dense(
+            self.hidden_size,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="proj_head",
         )(x)
         x = nn.LayerNorm(name="proj_norm")(x)
         if self.apply_output_tanh:
@@ -317,7 +531,39 @@ def build_encoder(
             conv_stem_channels=cfg.conv_stem_channels,
             conv_stem_kernel=cfg.conv_stem_kernel,
             apply_output_tanh=cfg.apply_output_tanh,
+            proj_dim=cfg.proj_dim,
+        )
+    if kind == "hybrid_vit":
+        cfg = vit_config or ViTConfig()
+        return HybridViTEncoder(
+            tanh_scale=tanh_scale,
+            hidden_size=cfg.hidden_size,
+            mlp_dim=cfg.mlp_dim,
+            num_heads=cfg.num_heads,
+            num_layers=cfg.num_layers,
+            dropout_rate=cfg.dropout_rate,
+            attention_dropout_rate=cfg.attention_dropout_rate,
+            apply_output_tanh=cfg.apply_output_tanh,
+            stem_c1=cfg.stem_c1,
+            stem_c2=cfg.stem_c2,
+            stem_c3=cfg.stem_c3,
+            stem_c4=cfg.stem_c4,
+            proj_dim=cfg.proj_dim,
+        )
+    if kind == "drq_vit":
+        cfg = vit_config or ViTConfig()
+        return DrQViTEncoder(
+            tanh_scale=tanh_scale,
+            hidden_size=cfg.hidden_size,
+            mlp_dim=cfg.mlp_dim,
+            num_heads=cfg.num_heads,
+            num_layers=cfg.num_layers,
+            dropout_rate=cfg.dropout_rate,
+            attention_dropout_rate=cfg.attention_dropout_rate,
+            drq_stem_channels=cfg.drq_stem_channels,
+            token_downsample=cfg.drq_token_downsample,
+            apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'mlp', 'vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )
