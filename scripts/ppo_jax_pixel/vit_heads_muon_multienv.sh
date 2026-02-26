@@ -91,7 +91,6 @@ COMMON_ARGS=(
   --encoder-lr 5e-5
   --heads-muon-lr 0.001
   --heads-adam-lr 3e-4
-  --jepa-heads-lr 3e-4
   --weight-decay 1e-4
   --gamma 0.99
   --gae-lambda 0.95
@@ -105,7 +104,6 @@ COMMON_ARGS=(
   --action-repeat 4
   --anneal-lr
   --encoder-warmup-updates 500
-  --jepa-mode none
   --encoder-type vit
   --encoder-tanh-scale 0.25
   --vit-patch-size 21
