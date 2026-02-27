@@ -60,6 +60,7 @@ class Args:
     """the physics backend (spring, generalized, positional)"""
     n_envs: int = 512
     """the number of parallel game environments"""
+
     hw: int = 84
     """height/width of the observation images"""
 
