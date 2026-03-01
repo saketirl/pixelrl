@@ -40,6 +40,42 @@ os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
 
+class CRATEFeedForward(nn.Module):
+    """CRATE-style FeedForward layer implementing an ISTA step.
+
+    Computes: output = swish(x + step_size * (W.T @ x - W.T @ W @ x))
+
+    This implements a gradient descent step for sparse coding with dictionary W.
+    Reference: https://github.com/Ma-Lab-Berkeley/CRATE/blob/main/model/crate.py
+    """
+    dim: int
+    step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        # Weight matrix W of shape (dim, dim), initialized with Kaiming uniform
+        weight = self.param(
+            "weight",
+            nn.initializers.kaiming_uniform(),
+            (self.dim, self.dim)
+        )
+
+        # Compute D^T * D * x (W @ x then W.T @ result)
+        x1 = x @ weight.T  # (batch, dim) @ (dim, dim) -> (batch, dim)
+        grad_1 = x1 @ weight  # (batch, dim) @ (dim, dim) -> (batch, dim)
+
+        # Compute D^T * x
+        grad_2 = x @ weight  # (batch, dim) @ (dim, dim) -> (batch, dim)
+
+        # Compute gradient update: step_size * (D^T * x - D^T * D * x)
+        # lambda is set to 0.0 so we omit the - step_size * lambda term
+        grad_update = self.step_size * (grad_2 - grad_1)
+
+        # Apply swish activation (instead of ReLU in original CRATE)
+        output = nn.swish(x + grad_update)
+        return output
+
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -198,6 +234,12 @@ class Args:
     drq_vit_apply_output_tanh: bool = False
     """If true, apply tanh to DrQViT encoder output projection."""
 
+    # CRATE head architecture
+    use_crate_head: bool = False
+    """If true, use CRATE-style FeedForward as final hidden layer in actor/critic."""
+    crate_step_size: float = 0.1
+    """Step size for CRATE FeedForward ISTA update."""
+
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -228,6 +270,41 @@ class Actor(nn.Module):
         x = nn.swish(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
+        actor_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0)
+        )(x)
+        actor_logstd = self.param(
+            "log_std",
+            nn.initializers.zeros,
+            (self.action_dim,)
+        )
+        return actor_mean, actor_logstd
+
+
+class CRATECritic(nn.Module):
+    """Value network with CRATE FeedForward as final hidden layer."""
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.swish(x)
+        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
+        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+
+
+class CRATEActor(nn.Module):
+    """Continuous action actor with CRATE FeedForward as final hidden layer."""
+    action_dim: int
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.swish(x)
+        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
@@ -765,8 +842,13 @@ if __name__ == "__main__":
         args.encoder_tanh_scale,
         vit_config=vit_config,
     )
-    actor = Actor(action_dim=action_dim)
-    critic = Critic()
+    if args.use_crate_head:
+        actor = CRATEActor(action_dim=action_dim, crate_step_size=args.crate_step_size)
+        critic = CRATECritic(crate_step_size=args.crate_step_size)
+        print(f"Using CRATE heads with step_size={args.crate_step_size}")
+    else:
+        actor = Actor(action_dim=action_dim)
+        critic = Critic()
 
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
