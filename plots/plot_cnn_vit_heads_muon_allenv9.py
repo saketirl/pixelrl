@@ -50,6 +50,11 @@ CONDITION_META = {
     "vit_muon": {"label": "ViT Encoder + Manifold Muon (ours)", "color": "tab:red"},
 }
 
+FIGSIZE = (10, 6)  # default/wide aspect ratio
+LINEWIDTH = 2.5
+AXIS_LABEL_FONTSIZE = 22
+TICK_LABEL_FONTSIZE = 18
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -217,11 +222,11 @@ def plot_curves(
     curves: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]],
     y_label: str,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
 
     for condition_key, steps, mean, stderr in curves:
         meta = CONDITION_META[condition_key]
-        ax.plot(steps, mean, label=meta["label"], color=meta["color"], linewidth=2)
+        ax.plot(steps, mean, label=meta["label"], color=meta["color"], linewidth=LINEWIDTH)
         ax.fill_between(
             steps,
             mean - stderr,
@@ -230,10 +235,12 @@ def plot_curves(
             alpha=0.25,
         )
 
-    ax.set_xlabel("Steps", fontsize=12)
-    ax.set_ylabel(y_label, fontsize=12)
+    ax.set_xlabel("Steps", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel(y_label, fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
+    ax.xaxis.get_offset_text().set_size(TICK_LABEL_FONTSIZE)
+    ax.yaxis.get_offset_text().set_size(TICK_LABEL_FONTSIZE)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=10)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

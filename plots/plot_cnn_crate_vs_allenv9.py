@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Plot CRATE special-case comparisons against allenv9 CNN Adam baselines.
+"""Plot CRATE special-case comparisons against allenv9 CNN baselines.
 
-Produces two plots per environment (ant, humanoid):
+Produces three plots per environment (ant, humanoid):
   1) CNN Adam baseline vs CNN CRATE Manifold Muon
   2) CNN Adam baseline vs CNN CRATE Manifold Muon vs CNN CRATE Adam
+  3) CNN Adam baseline vs CNN Muon baseline vs CNN CRATE Manifold Muon vs CNN CRATE Adam
 """
 
 from __future__ import annotations
@@ -28,15 +29,22 @@ TARGET_ENVS = ["ant", "humanoid"]
 
 LABELS = {
     "baseline_cnn_adam": "CNN Encoder + Adam",
+    "baseline_cnn_muon": "CNN Encoder + Manifold Muon (ours)",
     "crate_muon": "CNN CRATE Encoder + Manifold Muon (ours)",
     "crate_adam": "CNN CRATE Encoder + Adam",
 }
 
 COLORS = {
     "baseline_cnn_adam": "tab:blue",
-    "crate_muon": "tab:orange",
+    "baseline_cnn_muon": "tab:orange",
+    "crate_muon": "tab:red",
     "crate_adam": "tab:green",
 }
+
+FIGSIZE = (10, 6)  # default/wide aspect ratio
+LINEWIDTH = 2.5
+AXIS_LABEL_FONTSIZE = 22
+TICK_LABEL_FONTSIZE = 18
 
 
 def parse_args() -> argparse.Namespace:
@@ -281,8 +289,16 @@ def parse_crate_csv(
     )
 
 
-def collect_baseline_runs(api: wandb.Api, prefix: str) -> Dict[str, List]:
-    grouped = defaultdict(list)
+def _baseline_condition_from_config(config: Dict) -> Optional[str]:
+    encoder_type = str(config.get("encoder_type", "")).strip().lower()
+    use_heads_muon = _coerce_bool(config.get("use_heads_muon"))
+    if encoder_type != "cnn" or use_heads_muon is None:
+        return None
+    return "baseline_cnn_muon" if use_heads_muon else "baseline_cnn_adam"
+
+
+def collect_baseline_runs(api: wandb.Api, prefix: str) -> Dict[str, Dict[str, List]]:
+    grouped = defaultdict(lambda: defaultdict(list))
     seen_ids: Set[str] = set()
 
     runs = api.runs(path=prefix, filters={"tags": {"$in": ["allenv9"]}})
@@ -305,16 +321,15 @@ def collect_baseline_runs(api: wandb.Api, prefix: str) -> Dict[str, List]:
         if env_name not in TARGET_ENVS:
             continue
 
-        encoder_type = str(config.get("encoder_type", "")).strip().lower()
-        use_heads_muon = _coerce_bool(config.get("use_heads_muon"))
-        if encoder_type != "cnn" or use_heads_muon is not False:
+        condition = _baseline_condition_from_config(config)
+        if condition is None:
             continue
 
-        grouped[env_name].append(run)
+        grouped[env_name][condition].append(run)
         matched += 1
 
     print(f"Fetched {fetched} runs with server-side allenv9 filter.")
-    print(f"Matched {matched} allenv9 CNN Adam runs for target envs.")
+    print(f"Matched {matched} allenv9 CNN baseline runs for target envs.")
     return grouped
 
 
@@ -329,23 +344,27 @@ def plot_curves(
     output_path: str,
     curves: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]],
     y_label: str,
+    color_overrides: Optional[Dict[str, str]] = None,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=FIGSIZE)
 
     for key, steps, mean, stderr in curves:
-        ax.plot(steps, mean, label=LABELS[key], color=COLORS[key], linewidth=2)
+        color = color_overrides.get(key, COLORS[key]) if color_overrides else COLORS[key]
+        ax.plot(steps, mean, label=LABELS[key], color=color, linewidth=LINEWIDTH)
         ax.fill_between(
             steps,
             mean - stderr,
             mean + stderr,
-            color=COLORS[key],
+            color=color,
             alpha=0.25,
         )
 
-    ax.set_xlabel("Steps", fontsize=12)
-    ax.set_ylabel(y_label, fontsize=12)
+    ax.set_xlabel("Steps", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel(y_label, fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONTSIZE)
+    ax.xaxis.get_offset_text().set_size(TICK_LABEL_FONTSIZE)
+    ax.yaxis.get_offset_text().set_size(TICK_LABEL_FONTSIZE)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=10)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -366,18 +385,31 @@ def main() -> None:
         print(f"\n=== {env_name} ===")
         env_summary = {"env": env_name, "written": [], "skipped": []}
 
-        baseline = aggregate_wandb_runs(
-            runs=baseline_runs.get(env_name, []),
+        baseline_adam = aggregate_wandb_runs(
+            runs=baseline_runs.get(env_name, {}).get("baseline_cnn_adam", []),
             metric_key=args.metric_key,
             samples=args.samples,
             num_points=args.num_points,
             min_runs_per_condition=args.min_runs_per_condition,
         )
-        if baseline[0] is None:
+        if baseline_adam[0] is None:
             env_summary["skipped"].append("baseline_cnn_adam")
             print(f"  baseline_cnn_adam: unavailable")
         else:
-            print(f"  baseline_cnn_adam: aggregated {baseline[3]} runs")
+            print(f"  baseline_cnn_adam: aggregated {baseline_adam[3]} runs")
+
+        baseline_muon = aggregate_wandb_runs(
+            runs=baseline_runs.get(env_name, {}).get("baseline_cnn_muon", []),
+            metric_key=args.metric_key,
+            samples=args.samples,
+            num_points=args.num_points,
+            min_runs_per_condition=args.min_runs_per_condition,
+        )
+        if baseline_muon[0] is None:
+            env_summary["skipped"].append("baseline_cnn_muon")
+            print(f"  baseline_cnn_muon: unavailable")
+        else:
+            print(f"  baseline_cnn_muon: aggregated {baseline_muon[3]} runs")
 
         crate_muon_path = os.path.join(args.crate_data_dir, f"{env_name}_crate_muon.csv")
         crate_adam_path = os.path.join(args.crate_data_dir, f"{env_name}_crate_adam.csv")
@@ -397,31 +429,60 @@ def main() -> None:
             print(f"  crate_adam: aggregated {crate_adam[3]} runs")
 
         # Plot 1: baseline vs crate muon
-        if baseline[0] is not None and crate_muon[0] is not None:
+        if baseline_adam[0] is not None and crate_muon[0] is not None:
             output_1 = os.path.join(args.plots_dir, f"{env_name}_cnn_adam_vs_crate_muon.png")
             curves_1 = [
                 ("crate_muon", crate_muon[0], crate_muon[1], crate_muon[2]),
-                ("baseline_cnn_adam", baseline[0], baseline[1], baseline[2]),
+                ("baseline_cnn_adam", baseline_adam[0], baseline_adam[1], baseline_adam[2]),
             ]
-            plot_curves(output_1, curves_1, y_label=y_label)
+            color_overrides_1 = {"crate_muon": "tab:orange"} if env_name == "humanoid" else None
+            plot_curves(output_1, curves_1, y_label=y_label, color_overrides=color_overrides_1)
             env_summary["written"].append(os.path.basename(output_1))
         else:
             env_summary["skipped"].append("plot_baseline_vs_crate_muon")
 
         # Plot 2: baseline vs crate muon vs crate adam
-        if baseline[0] is not None and crate_muon[0] is not None and crate_adam[0] is not None:
+        if (
+            baseline_adam[0] is not None
+            and crate_muon[0] is not None
+            and crate_adam[0] is not None
+        ):
             output_2 = os.path.join(
                 args.plots_dir, f"{env_name}_cnn_adam_vs_crate_muon_vs_crate_adam.png"
             )
             curves_2 = [
                 ("crate_muon", crate_muon[0], crate_muon[1], crate_muon[2]),
                 ("crate_adam", crate_adam[0], crate_adam[1], crate_adam[2]),
-                ("baseline_cnn_adam", baseline[0], baseline[1], baseline[2]),
+                ("baseline_cnn_adam", baseline_adam[0], baseline_adam[1], baseline_adam[2]),
             ]
             plot_curves(output_2, curves_2, y_label=y_label)
             env_summary["written"].append(os.path.basename(output_2))
         else:
             env_summary["skipped"].append("plot_baseline_vs_crate_muon_vs_crate_adam")
+
+        # Plot 3: baseline adam vs baseline muon vs crate muon vs crate adam
+        if (
+            baseline_adam[0] is not None
+            and baseline_muon[0] is not None
+            and crate_muon[0] is not None
+            and crate_adam[0] is not None
+        ):
+            output_3 = os.path.join(
+                args.plots_dir,
+                f"{env_name}_cnn_adam_vs_cnn_muon_vs_crate_muon_vs_crate_adam.png",
+            )
+            curves_3 = [
+                ("baseline_cnn_adam", baseline_adam[0], baseline_adam[1], baseline_adam[2]),
+                ("baseline_cnn_muon", baseline_muon[0], baseline_muon[1], baseline_muon[2]),
+                ("crate_muon", crate_muon[0], crate_muon[1], crate_muon[2]),
+                ("crate_adam", crate_adam[0], crate_adam[1], crate_adam[2]),
+            ]
+            plot_curves(output_3, curves_3, y_label=y_label)
+            env_summary["written"].append(os.path.basename(output_3))
+        else:
+            env_summary["skipped"].append(
+                "plot_baseline_adam_vs_baseline_muon_vs_crate_muon_vs_crate_adam"
+            )
 
         summary.append(env_summary)
 

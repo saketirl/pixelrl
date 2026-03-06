@@ -90,9 +90,9 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Environment arguments
-    env_name: str = "halfcheetah"
+    env_name: str = "inverted_pendulum"
     """the name of the environment"""
-    backend: str = "spring"
+    backend: str = "generalized"
     """the physics backend (spring, generalized, positional)"""
     n_envs: int = 512
     """the number of parallel game environments"""
@@ -173,6 +173,22 @@ class Args:
     # Debug/analysis flags
     debug_repr: bool = False
     """Toggle debug logging for encoder representations"""
+
+    # Checkpoint saving
+    save_checkpoint: bool = False
+    """If true, save model params to disk at end of training"""
+    checkpoint_dir: str = "checkpoints"
+    """Directory for saved checkpoints"""
+
+    # Online linear probe
+    probe_interval: int = 0
+    """Run linear probe every N global steps (0 disables). E.g. 100000."""
+    probe_n_eval_steps: int = 400
+    """Number of random-action rollout steps for probe data collection."""
+    probe_output_dir: str = "probe_results"
+    """Directory for probe plots (subdirectory per probe call is created)."""
+    probe_save_plots: bool = False
+    """If true, generate probe/additive plots to disk and log them to wandb when tracking."""
 
     # Encoder architecture
     encoder_type: str = "cnn"
@@ -1292,6 +1308,65 @@ if __name__ == "__main__":
 
     print("\nStarting training...")
     cumulative_episodic_return = 0.0
+
+    def collect_probe_plot_images(output_dir: str) -> dict:
+        """Load probe plot PNGs as wandb.Image for logging, if tracking is enabled."""
+        if not args.track or not args.probe_save_plots or output_dir is None:
+            return {}
+
+        plot_files = {
+            "probe/plots/r2_vs_k": f"{args.env_name}_r2_vs_k.png",
+            "probe/plots/scree": f"{args.env_name}_scree.png",
+            "probe/plots/corr_heatmap": f"{args.env_name}_corr_heatmap.png",
+            "additive/plots/parity": f"{args.env_name}_additive_parity.png",
+            "additive/plots/cosine_gram": f"{args.env_name}_cosine_gram.png",
+            "additive/plots/raw_gram": f"{args.env_name}_raw_gram.png",
+            "additive/plots/component_norms": f"{args.env_name}_component_norms.png",
+        }
+
+        image_logs = {}
+        for log_key, file_name in plot_files.items():
+            file_path = os.path.join(output_dir, file_name)
+            if os.path.exists(file_path):
+                image_logs[log_key] = wandb.Image(file_path)
+        return image_logs
+
+    # Track next probe threshold as an absolute step count so LCM cadence issues
+    # don't arise when global_step jumps by (num_steps * n_envs) each iteration.
+    next_probe_step = args.probe_interval if args.probe_interval > 0 else float("inf")
+    # Probe metrics are buffered here and flushed into the main wandb.log call
+    # so we never call wandb.log twice at the same step.
+    pending_probe_metrics: dict = {}
+
+    # Probe at initialisation (step 0) — establishes random-encoder baseline.
+    if args.probe_interval > 0:
+        from linear_probe import run_online_probe
+        import pickle
+        probe_init_output = os.path.join(args.probe_output_dir, "step_0") if args.probe_output_dir else None
+        probe_init_metrics = run_online_probe(
+            network=network,
+            network_params=agent_state.params["network"],
+            envs=envs,
+            args_dict=vars(args),
+            n_eval_envs=args.n_envs,
+            n_eval_steps=args.probe_n_eval_steps,
+            seed=args.seed,
+            output_dir=probe_init_output if args.probe_save_plots else None,
+        )
+        print(f"[probe] step=0 (init) metrics={probe_init_metrics}")
+        if args.save_checkpoint:
+            ckpt_dir = os.path.join(args.checkpoint_dir, run_name)
+            os.makedirs(ckpt_dir, exist_ok=True)
+            params_bytes = flax.serialization.to_bytes(agent_state.params)
+            ckpt_path = os.path.join(ckpt_dir, "params_step0.pkl")
+            with open(ckpt_path, "wb") as f:
+                pickle.dump({"params_bytes": params_bytes, "args": vars(args),
+                             "global_step": 0}, f)
+            print(f"Checkpoint saved to {ckpt_path}")
+        if args.track:
+            probe_init_media = collect_probe_plot_images(probe_init_output)
+            wandb.log({**probe_init_metrics, **probe_init_media}, step=0)
+
     for iteration in range(1, args.num_updates + 1):
         iteration_time_start = time.time()
         (
@@ -1332,6 +1407,44 @@ if __name__ == "__main__":
             storage,
             key,
         )
+
+        # Online linear probe — fire when global_step crosses the next threshold.
+        # Using >= avoids the LCM cadence problem that % would cause when
+        # global_step jumps by (num_steps * n_envs = 1280) each iteration.
+        if global_step >= next_probe_step:
+            from linear_probe import run_online_probe
+            probe_output = os.path.join(args.probe_output_dir, f"step_{global_step}")
+            probe_metrics = run_online_probe(
+                network=network,
+                network_params=agent_state.params["network"],
+                envs=envs,
+                args_dict=vars(args),
+                n_eval_envs=args.n_envs,
+                n_eval_steps=args.probe_n_eval_steps,
+                seed=args.seed + iteration,
+                output_dir=probe_output if args.probe_save_plots else None,
+            )
+            print(f"[probe] step={global_step} metrics={probe_metrics}")
+            # Buffer into pending_probe_metrics; flushed in the main wandb.log
+            # call below so we never call wandb.log twice at the same step.
+            pending_probe_metrics.update(probe_metrics)
+            if args.track:
+                pending_probe_metrics.update(collect_probe_plot_images(probe_output))
+
+            # Save a checkpoint at each probe point so the probe can be re-run
+            # offline on any training snapshot without retraining.
+            if args.save_checkpoint:
+                import pickle
+                ckpt_dir = os.path.join(args.checkpoint_dir, run_name)
+                os.makedirs(ckpt_dir, exist_ok=True)
+                params_bytes = flax.serialization.to_bytes(agent_state.params)
+                ckpt_path = os.path.join(ckpt_dir, f"params_step{global_step}.pkl")
+                with open(ckpt_path, "wb") as f:
+                    pickle.dump({"params_bytes": params_bytes, "args": vars(args),
+                                 "global_step": global_step}, f)
+                print(f"Checkpoint saved to {ckpt_path}")
+
+            next_probe_step += args.probe_interval
 
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
@@ -1401,11 +1514,26 @@ if __name__ == "__main__":
                     for k, v in grad_metrics.items():
                         log_dict[k] = float(v)
 
+                # Flush any buffered probe metrics into the same wandb step.
+                if pending_probe_metrics:
+                    log_dict.update(pending_probe_metrics)
+                    pending_probe_metrics = {}
+
                 wandb.log(log_dict, step=global_step)
 
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed:.1f}s")
     print(f"Average SPS: {args.total_timesteps / elapsed:.0f}")
+
+    if args.save_checkpoint:
+        import pickle
+        ckpt_dir = os.path.join(args.checkpoint_dir, run_name)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        params_bytes = flax.serialization.to_bytes(agent_state.params)
+        ckpt_path = os.path.join(ckpt_dir, "params.pkl")
+        with open(ckpt_path, "wb") as f:
+            pickle.dump({"params_bytes": params_bytes, "args": vars(args)}, f)
+        print(f"Checkpoint saved to {ckpt_path}")
 
     if args.track:
         wandb.finish()
