@@ -470,6 +470,63 @@ def encoder_repr_metrics(hidden: jnp.ndarray) -> dict:
     return metrics
 
 
+def cnn_dense_metrics(
+    dense_pre_ln: jnp.ndarray,
+    hidden: jnp.ndarray,
+    network_params: dict,
+    network_grads: dict,
+) -> dict:
+    """Compute scalar debug metrics for the CNN encoder's final Dense layer."""
+    eps = 1e-8
+    metrics = {}
+
+    metrics["cnn_dense/pre_ln_mean"] = jnp.mean(dense_pre_ln)
+    metrics["cnn_dense/pre_ln_std"] = jnp.std(dense_pre_ln)
+    metrics["cnn_dense/pre_ln_abs_mean"] = jnp.mean(jnp.abs(dense_pre_ln))
+    metrics["cnn_dense/pre_ln_max_abs"] = jnp.max(jnp.abs(dense_pre_ln))
+    metrics["cnn_dense/pre_ln_l2_mean"] = jnp.mean(jnp.linalg.norm(dense_pre_ln, axis=-1))
+
+    metrics["cnn_dense/tanh_sat_frac_0.95"] = jnp.mean(jnp.abs(hidden) > 0.95)
+    metrics["cnn_dense/tanh_sat_frac_0.99"] = jnp.mean(jnp.abs(hidden) > 0.99)
+
+    hidden_centered = hidden - jnp.mean(hidden, axis=0, keepdims=True)
+    feature_var = jnp.var(hidden_centered, axis=0)
+    metrics["cnn_dense/feature_var_min"] = jnp.min(feature_var)
+    metrics["cnn_dense/feature_var_max"] = jnp.max(feature_var)
+    metrics["cnn_dense/feature_var_ratio"] = jnp.max(feature_var) / (jnp.min(feature_var) + eps)
+
+    batch_denom = float(max(hidden.shape[0] - 1, 1))
+    cov = (hidden_centered.T @ hidden_centered) / batch_denom
+    feature_std = jnp.sqrt(feature_var + eps)
+    corr = cov / (feature_std[:, None] * feature_std[None, :] + eps)
+    corr_mask = 1.0 - jnp.eye(corr.shape[0], dtype=corr.dtype)
+    metrics["cnn_dense/mean_abs_corr"] = (
+        jnp.sum(jnp.abs(corr) * corr_mask) / (jnp.sum(corr_mask) + eps)
+    )
+
+    eigvals = jnp.clip(jnp.linalg.eigvalsh(cov), a_min=0.0)
+    eig_sum = jnp.sum(eigvals)
+    eig_sq_sum = jnp.sum(jnp.square(eigvals))
+    top_eig = jnp.max(eigvals)
+    metrics["cnn_dense/participation_ratio"] = (eig_sum ** 2) / (eig_sq_sum + eps)
+    metrics["cnn_dense/top_eig_fraction"] = top_eig / (eig_sum + eps)
+    metrics["cnn_dense/stable_rank"] = eig_sum / (top_eig + eps)
+
+    dense_kernel = network_params["params"]["Dense_0"]["kernel"]
+    dense_kernel_grad = network_grads["params"]["Dense_0"]["kernel"]
+    singular_values = jnp.linalg.svd(dense_kernel, compute_uv=False)
+    sigma_max = jnp.max(singular_values)
+    metrics["cnn_dense/weight_mean"] = jnp.mean(dense_kernel)
+    metrics["cnn_dense/weight_std"] = jnp.std(dense_kernel)
+    metrics["cnn_dense/weight_spectral_norm"] = sigma_max
+    metrics["cnn_dense/weight_stable_rank"] = (
+        jnp.sum(jnp.square(singular_values)) / (jnp.square(sigma_max) + eps)
+    )
+    metrics["cnn_dense/weight_grad_norm"] = jnp.linalg.norm(dense_kernel_grad)
+
+    return metrics
+
+
 def compute_grad_norms(grads: dict) -> dict:
     """Compute gradient norms for key model components."""
     def tree_norm(tree):
@@ -828,6 +885,7 @@ if __name__ == "__main__":
         tx=tx,
     )
 
+    network_debug_apply = jax.jit(network.apply, static_argnames=("return_intermediates",))
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
@@ -1354,7 +1412,23 @@ if __name__ == "__main__":
                 # Debug metrics for encoder representations
                 if args.debug_repr:
                     sample_obs = storage.obs[0, :256]
-                    hidden = network.apply(agent_state.params["network"], sample_obs)
+                    if encoder_type == "cnn":
+                        cnn_debug = network_debug_apply(
+                            agent_state.params["network"],
+                            sample_obs,
+                            return_intermediates=True,
+                        )
+                        hidden = cnn_debug["hidden"]
+                        dense_metrics = cnn_dense_metrics(
+                            cnn_debug["dense_pre_ln"],
+                            hidden,
+                            agent_state.params["network"],
+                            final_grads["network"],
+                        )
+                        for k, v in dense_metrics.items():
+                            log_dict[k] = float(v)
+                    else:
+                        hidden = network.apply(agent_state.params["network"], sample_obs)
 
                     repr_metrics = encoder_repr_metrics(hidden)
                     for k, v in repr_metrics.items():

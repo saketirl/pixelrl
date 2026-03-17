@@ -440,7 +440,7 @@ class CNNEncoder(nn.Module):
     tanh_scale: float = 0.5
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_intermediates: bool = False):
         x = x.astype(jnp.float32) / 255.0
 
         x = nn.Conv(
@@ -477,10 +477,19 @@ class CNNEncoder(nn.Module):
         x = nn.relu(x)
 
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.LayerNorm()(x)
-        x = nn.tanh(self.tanh_scale * x)
-        return x
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        hidden = nn.LayerNorm()(dense_pre_ln)
+        hidden = nn.tanh(self.tanh_scale * hidden)
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "dense_pre_ln": dense_pre_ln,
+            }
+        return hidden
 
 
 class MLPEncoder(nn.Module):

@@ -186,3 +186,10 @@ lqr_ac_compare/Stiefel_Ascent_RLC.pdf
 
 # secrets
 secrets/
+
+# checkpoints
+checkpoints/
+*.pkl
+
+node_modules/
+
