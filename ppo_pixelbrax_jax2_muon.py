@@ -30,8 +30,8 @@ import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
-from manifold_muon_optax import manifold_muon, manifold_muon_per_head
-from encoders import ViTConfig, build_encoder
+from manifold_muon_optax import manifold_muon
+from encoders import build_encoder
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -192,63 +192,11 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn', 'mlp', 'vit', 'hybrid_vit', or 'drq_vit'"""
+    """encoder architecture to use: 'cnn' or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_warmup_updates: int = 0
     """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
-    vit_patch_size: int = 14
-    """ViT patch size (pixels) for both height and width."""
-    vit_hidden_size: int = 192
-    """ViT token/embedding hidden dimension."""
-    vit_proj_dim: int = 512
-    """RL projection head output dimension for ViT/HybridViT encoders."""
-    vit_mlp_dim: int = 768
-    """ViT MLP expansion dimension in transformer blocks."""
-    vit_num_heads: int = 3
-    """ViT number of self-attention heads."""
-    vit_num_layers: int = 4
-    """ViT number of transformer encoder blocks."""
-    vit_dropout_rate: float = 0.0
-    """ViT dropout rate (kept deterministic unless encoder path is extended)."""
-    vit_attention_dropout_rate: float = 0.0
-    """ViT attention dropout rate (kept deterministic unless encoder path is extended)."""
-    vit_use_cls_token: bool = False
-    """If true, use CLS-token readout; otherwise mean-pool patch tokens."""
-    vit_use_conv_stem: bool = True
-    """If true, apply a lightweight CNN stem before ViT patch embedding."""
-    vit_conv_stem_channels: int = 64
-    """Channel width for the optional ViT CNN stem."""
-    vit_conv_stem_kernel: int = 3
-    """Kernel size for the optional ViT CNN stem convolutions."""
-    vit_apply_output_tanh: bool = False
-    """If true, apply tanh bottleneck on ViT encoder output projection."""
-    vit_qk_stiefel: bool = False
-    """If true, apply Stiefel-constrained updates to ViT attention Q/K kernels."""
-    vit_qk_stiefel_lr: float = 1e-4
-    """Learning rate for ViT Q/K Stiefel updates."""
-    vit_qk_stiefel_dual_lr: float = 0.01
-    """Dual-variable learning rate for ViT Q/K Stiefel updates."""
-    vit_qk_stiefel_dual_steps: int = 5
-    """Number of dual optimization steps for ViT Q/K Stiefel updates."""
-    vit_qk_stiefel_msign_steps: int = 5
-    """Number of matrix-sign iterations for ViT Q/K Stiefel updates."""
-    vit_qk_stiefel_max_grad_norm: float = 0.5
-    """Max grad norm clip for ViT Q/K Stiefel parameter group."""
-    hybrid_vit_stem_c1: int = 24
-    """HybridViT conv stem stage-1 output channels."""
-    hybrid_vit_stem_c2: int = 48
-    """HybridViT conv stem stage-2 output channels."""
-    hybrid_vit_stem_c3: int = 96
-    """HybridViT conv stem stage-3 output channels."""
-    hybrid_vit_stem_c4: int = 192
-    """HybridViT conv stem stage-4 output channels."""
-    drq_vit_stem_channels: int = 32
-    """DrQViT conv stem channel width (all 4 stem layers use this)."""
-    drq_vit_token_downsample: int = 1
-    """Optional patch-like downsample factor after DrQ bridge conv (1 disables)."""
-    drq_vit_apply_output_tanh: bool = False
-    """If true, apply tanh to DrQViT encoder output projection."""
 
     # CRATE head architecture
     use_crate_head: bool = False
@@ -555,18 +503,11 @@ def create_optimizer(
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
-    vit_qk_stiefel: bool = False,
-    vit_qk_stiefel_lr: float = 1e-4,
-    vit_qk_stiefel_dual_lr: float = 0.01,
-    vit_qk_stiefel_dual_steps: int = 5,
-    vit_qk_stiefel_msign_steps: int = 5,
-    vit_qk_stiefel_max_grad_norm: float = 0.5,
     use_heads_muon: bool = True,
 ):
     """
     Create optimizer that uses:
     - Adam/AdamW for encoder (all params) - supports lr schedule, with grad clipping
-    - Optional per-head manifold MUON for ViT encoder attention Q/K kernels
     - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
@@ -588,18 +529,6 @@ def create_optimizer(
     encoder_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
         adam_opt(encoder_lr),
-    )
-
-    # Optional Stiefel-constrained updates for ViT Q/K kernels (per-head)
-    encoder_qk_stiefel_tx = optax.chain(
-        optax.clip_by_global_norm(vit_qk_stiefel_max_grad_norm),
-        manifold_muon_per_head(
-            learning_rate=vit_qk_stiefel_lr,
-            dual_lr=vit_qk_stiefel_dual_lr,
-            dual_steps=vit_qk_stiefel_dual_steps,
-            msign_steps=vit_qk_stiefel_msign_steps,
-            min_ndim=2,
-        ),
     )
 
     # Adam/AdamW for head vectors/scalars (with schedule support and grad clipping)
@@ -632,11 +561,10 @@ def create_optimizer(
         ),
     )
 
-    # 5 transforms: encoder, encoder_qk_stiefel, actor_muon (matrices),
+    # 4 transforms: encoder, actor_muon (matrices),
     # critic_muon (matrices), heads_adam (actor/critic vectors/scalars)
     transforms = {
         'encoder': encoder_tx,
-        'encoder_qk_stiefel': encoder_qk_stiefel_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
@@ -647,16 +575,6 @@ def create_optimizer(
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
-                is_vit_qk_kernel = (
-                    len(path) >= 7
-                    and path[1] == 'params'
-                    and 'Transformer' in path
-                    and 'SelfAttention_0' in path
-                    and path[-1] == 'kernel'
-                    and path[-2] in ('query', 'key')
-                )
-                if vit_qk_stiefel and is_vit_qk_kernel:
-                    return 'encoder_qk_stiefel'
                 return 'encoder'
             # For actor/critic heads, check if matrix or vector/scalar
             is_matrix = param.ndim >= 2 and min(param.shape) > 1
@@ -768,47 +686,14 @@ if __name__ == "__main__":
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
     print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
-    if args.encoder_type.lower() == "vit":
-        print(f"  vit_patch_size: {args.vit_patch_size}")
-        print(f"  vit_hidden_size: {args.vit_hidden_size}")
-        print(f"  vit_proj_dim: {args.vit_proj_dim}")
-        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
-        print(f"  vit_num_heads: {args.vit_num_heads}")
-        print(f"  vit_num_layers: {args.vit_num_layers}")
-        print(f"  vit_dropout_rate: {args.vit_dropout_rate}")
-        print(f"  vit_attention_dropout_rate: {args.vit_attention_dropout_rate}")
-        print(f"  vit_use_cls_token: {args.vit_use_cls_token}")
-        print(f"  vit_use_conv_stem: {args.vit_use_conv_stem}")
-        print(f"  vit_conv_stem_channels: {args.vit_conv_stem_channels}")
-        print(f"  vit_conv_stem_kernel: {args.vit_conv_stem_kernel}")
-        print(f"  vit_apply_output_tanh: {args.vit_apply_output_tanh}")
-        print(f"  vit_qk_stiefel: {args.vit_qk_stiefel}")
-        print(f"  vit_qk_stiefel_lr: {args.vit_qk_stiefel_lr}")
-        print(f"  vit_qk_stiefel_dual_lr: {args.vit_qk_stiefel_dual_lr}")
-        print(f"  vit_qk_stiefel_dual_steps: {args.vit_qk_stiefel_dual_steps}")
-        print(f"  vit_qk_stiefel_msign_steps: {args.vit_qk_stiefel_msign_steps}")
-        print(f"  vit_qk_stiefel_max_grad_norm: {args.vit_qk_stiefel_max_grad_norm}")
-    if args.encoder_type.lower() == "hybrid_vit":
-        print(f"  vit_hidden_size: {args.vit_hidden_size}")
-        print(f"  vit_proj_dim: {args.vit_proj_dim}")
-        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
-        print(f"  vit_num_heads: {args.vit_num_heads}")
-        print(f"  vit_num_layers: {args.vit_num_layers}")
-        print(f"  hybrid_vit_stem_c1: {args.hybrid_vit_stem_c1}")
-        print(f"  hybrid_vit_stem_c2: {args.hybrid_vit_stem_c2}")
-        print(f"  hybrid_vit_stem_c3: {args.hybrid_vit_stem_c3}")
-        print(f"  hybrid_vit_stem_c4: {args.hybrid_vit_stem_c4}")
-    if args.encoder_type.lower() == "drq_vit":
-        print(f"  vit_hidden_size: {args.vit_hidden_size}")
-        print(f"  vit_proj_dim: {args.vit_proj_dim}")
-        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
-        print(f"  vit_num_heads: {args.vit_num_heads}")
-        print(f"  vit_num_layers: {args.vit_num_layers}")
-        print(f"  drq_vit_stem_channels: {args.drq_vit_stem_channels}")
-        print(f"  drq_vit_token_downsample: {args.drq_vit_token_downsample}")
-        print(f"  drq_vit_apply_output_tanh: {args.drq_vit_apply_output_tanh}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
+
+    encoder_type = args.encoder_type.lower()
+    if encoder_type not in {"cnn", "mlp"}:
+        raise ValueError(
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['cnn', 'mlp']"
+        )
 
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
@@ -831,33 +716,7 @@ if __name__ == "__main__":
     )
 
     # Initialize networks
-    vit_config = ViTConfig(
-        patch_size=args.vit_patch_size,
-        hidden_size=args.vit_hidden_size,
-        mlp_dim=args.vit_mlp_dim,
-        num_heads=args.vit_num_heads,
-        num_layers=args.vit_num_layers,
-        dropout_rate=args.vit_dropout_rate,
-        attention_dropout_rate=args.vit_attention_dropout_rate,
-        use_cls_token=args.vit_use_cls_token,
-        use_conv_stem=args.vit_use_conv_stem,
-        conv_stem_channels=args.vit_conv_stem_channels,
-        conv_stem_kernel=args.vit_conv_stem_kernel,
-        apply_output_tanh=args.vit_apply_output_tanh,
-        stem_c1=args.hybrid_vit_stem_c1,
-        stem_c2=args.hybrid_vit_stem_c2,
-        stem_c3=args.hybrid_vit_stem_c3,
-        stem_c4=args.hybrid_vit_stem_c4,
-        drq_stem_channels=args.drq_vit_stem_channels,
-        drq_token_downsample=args.drq_vit_token_downsample,
-        drq_apply_output_tanh=args.drq_vit_apply_output_tanh,
-        proj_dim=args.vit_proj_dim,
-    )
-    network = build_encoder(
-        args.encoder_type,
-        args.encoder_tanh_scale,
-        vit_config=vit_config,
-    )
+    network = build_encoder(encoder_type, args.encoder_tanh_scale)
     if args.use_crate_head:
         actor = CRATEActor(action_dim=action_dim, crate_step_size=args.crate_step_size)
         critic = CRATECritic(crate_step_size=args.crate_step_size)
@@ -960,12 +819,6 @@ if __name__ == "__main__":
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
         weight_decay=args.weight_decay,
-        vit_qk_stiefel=args.vit_qk_stiefel,
-        vit_qk_stiefel_lr=args.vit_qk_stiefel_lr,
-        vit_qk_stiefel_dual_lr=args.vit_qk_stiefel_dual_lr,
-        vit_qk_stiefel_dual_steps=args.vit_qk_stiefel_dual_steps,
-        vit_qk_stiefel_msign_steps=args.vit_qk_stiefel_msign_steps,
-        vit_qk_stiefel_max_grad_norm=args.vit_qk_stiefel_max_grad_norm,
         use_heads_muon=args.use_heads_muon,
     )
 
@@ -1488,9 +1341,6 @@ if __name__ == "__main__":
                     "charts/encoder_lr": float(encoder_lr_current),
                     "charts/heads_adam_lr": float(heads_adam_lr_current),
                     "charts/heads_muon_lr": args.heads_muon_lr,
-                    "charts/vit_qk_stiefel_lr": (
-                        args.vit_qk_stiefel_lr if args.vit_qk_stiefel else 0.0
-                    ),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),
