@@ -31,7 +31,14 @@ from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
 from manifold_muon_optax import manifold_muon, manifold_muon_per_head
-from encoders import ViTConfig, build_encoder
+from encoders import (
+    ViTConfig,
+    build_encoder,
+    MIMJEPAPredictor,
+    BottleneckProjection,
+    LatentTransition,
+    LinearLatentTransition,
+)
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -192,9 +199,11 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn', 'mlp', 'vit', 'hybrid_vit', or 'drq_vit'"""
+    """encoder architecture to use: 'cnn', 'stiefel_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit', or 'scott'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
+    stiefel_latent_dim: int = 32
+    """Latent dimension for stiefel_cnn projection output."""
     encoder_warmup_updates: int = 0
     """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
     vit_patch_size: int = 14
@@ -250,6 +259,106 @@ class Args:
     drq_vit_apply_output_tanh: bool = False
     """If true, apply tanh to DrQViT encoder output projection."""
 
+    # SCOTT encoder args
+    scott_use_swiglu: bool = True
+    """Use SwiGLU FFN in SCOTT transformer blocks."""
+    scott_num_register_tokens: int = 0
+    """Number of learnable register tokens for SCOTT encoder."""
+    scott_dropout_rate: float = 0.0
+    """SCOTT transformer dropout rate."""
+    scott_attention_dropout_rate: float = 0.0
+    """SCOTT attention dropout rate."""
+    scott_stochastic_depth_rate: float = 0.0
+    """SCOTT stochastic depth rate."""
+
+    # MIM-JEPA auxiliary loss
+    mim_jepa: bool = False
+    """Enable MIM-JEPA self-supervised auxiliary loss (requires scott encoder)."""
+    mim_jepa_lambda: float = 0.05
+    """Coefficient for MIM-JEPA reconstruction loss."""
+    mim_jepa_ema_tau: float = 0.996
+    """EMA momentum for target encoder (closer to 1 = slower update)."""
+    mim_jepa_mask_ratio: float = 0.6
+    """Fraction of tokens to mask in MIM-JEPA context encoder."""
+    mim_jepa_predictor_depth: int = 2
+    """Number of transformer layers in MIM-JEPA predictor."""
+    mim_jepa_warmup_updates: int = 2
+    """Number of PPO updates before MIM-JEPA lambda starts ramping up."""
+    mim_jepa_rampup_updates: int = 10
+    """Number of updates to linearly ramp MIM-JEPA lambda from 0 to mim_jepa_lambda."""
+
+    # LeJEPA auxiliary loss
+    lejepa: bool = False
+    """Enable LeJEPA auxiliary loss on top of the CNN encoder."""
+    lejepa_lambda: float = 0.1
+    """Mixing coefficient between agreement and SIGReg terms."""
+    lejepa_aux_coef: float = 1e-3
+    """Outer coefficient scaling LeJEPA against PPO."""
+    lejepa_proj_dim: int = 128
+    """Projector output dimension for LeJEPA."""
+    lejepa_num_views: int = 2
+    """Number of augmented views of each observation used by LeJEPA."""
+    lejepa_num_slices: int = 64
+    """Number of random projection slices used by SIGReg."""
+    lejepa_warmup_updates: int = 10
+    """Number of PPO updates before LeJEPA starts ramping up."""
+    lejepa_rampup_updates: int = 50
+    """Number of PPO updates to linearly ramp LeJEPA to lejepa_aux_coef."""
+    lejepa_t_points: int = 17
+    """Number of evaluation points for the 1D characteristic-function grid."""
+    lejepa_t_min: float = -5.0
+    """Minimum t-value for SIGReg's characteristic-function grid."""
+    lejepa_t_max: float = 5.0
+    """Maximum t-value for SIGReg's characteristic-function grid."""
+    lejepa_view_mode: str = "shift"
+    """LeJEPA view generation mode: shift, shift_noise, or temporal."""
+    lejepa_use_layernorm: bool = True
+    """If true, apply LayerNorm in the LeJEPA projector."""
+    lejepa_sigreg_mode: str = "epps_pulley"
+    """SIGReg implementation: epps_pulley or legacy."""
+
+    # Simplified latent bottleneck + dynamics auxiliary
+    use_latent_bottleneck: bool = False
+    """If true, project the encoder feature into a deterministic latent before actor/critic."""
+    latent_dim: int = 32
+    """Deterministic bottleneck dimension used by actor/critic and latent auxiliaries."""
+    latent_transition_type: str = "mlp"
+    """Latent transition type: 'mlp' (existing) or 'linear' (A z + B u + b)."""
+    use_latent_dynamics: bool = False
+    """If true, train a deterministic one-step latent transition on rollout data."""
+    latent_dyn_coef: float = 1e-3
+    """Target coefficient for the latent dynamics auxiliary loss."""
+    latent_dyn_warmup_updates: int = 10
+    """Number of PPO updates before the latent dynamics coefficient starts ramping."""
+    latent_dyn_rampup_updates: int = 50
+    """Number of PPO updates to linearly ramp latent dynamics to latent_dyn_coef."""
+    latent_cov_coef: float = 0.0
+    """Optional covariance decorrelation penalty on z_t."""
+    latent_var_coef: float = 0.0
+    """Optional variance-floor anti-collapse penalty on z_t."""
+    latent_whiten_coef: float = 0.0
+    """Optional whitening penalty for z_t to match identity covariance."""
+    latent_subspace_coef: float = 0.0
+    """Optional subspace projection residual penalty for stiefel_cnn latent map."""
+    cnn_sigreg_coef: float = 0.0
+    """SIGReg coefficient on pre-tanh CNN latents (vanilla cnn only)."""
+    cnn_sigreg_warmup_updates: int = 0
+    """Number of PPO updates before CNN SIGReg starts ramping up."""
+    cnn_sigreg_rampup_updates: int = 50
+    """Number of PPO updates to linearly ramp CNN SIGReg to cnn_sigreg_coef."""
+    cnn_sigreg_num_slices: int = 64
+    """Number of random projection slices used by CNN SIGReg."""
+    cnn_sigreg_t_points: int = 17
+    """Number of evaluation points for CNN SIGReg characteristic-function grid."""
+    cnn_sigreg_t_min: float = -5.0
+    """Minimum t-value for CNN SIGReg's characteristic-function grid."""
+    cnn_sigreg_t_max: float = 5.0
+    """Maximum t-value for CNN SIGReg's characteristic-function grid."""
+    log_latent_grad_alignment: bool = False
+    """If true, periodically log PPO-vs-latent-dynamics encoder gradient alignment."""
+    latent_grad_alignment_interval: int = 10
+    """Update interval for expensive latent gradient alignment logging."""
+
     # CRATE head architecture
     use_crate_head: bool = False
     """If true, use CRATE-style FeedForward as final hidden layer in actor/critic."""
@@ -299,6 +408,24 @@ class Actor(nn.Module):
         return actor_mean, actor_logstd
 
 
+class LeJEPAProjector(nn.Module):
+    """Project encoder latents into the LeJEPA auxiliary space."""
+
+    proj_dim: int
+    use_layernorm: bool = True
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(
+            self.proj_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        if self.use_layernorm:
+            x = nn.LayerNorm()(x)
+        return x
+
+
 class CRATECritic(nn.Module):
     """Value network with CRATE FeedForward as final hidden layer."""
     crate_step_size: float = 0.1
@@ -340,10 +467,14 @@ class Storage:
     actions: jnp.array
     logprobs: jnp.array
     dones: jnp.array
+    step_idx: jnp.array
+    env_idx: jnp.array
     values: jnp.array
     advantages: jnp.array
     returns: jnp.array
     rewards: jnp.array
+    next_obs: jnp.array
+    next_dones: jnp.array
 
 
 @flax.struct.dataclass
@@ -455,7 +586,7 @@ class RewardNormalizer:
 #  Debug Metrics for Encoder Representations
 # --------------------------------------------------------
 
-def encoder_repr_metrics(hidden: jnp.ndarray) -> dict:
+def encoder_repr_metrics(hidden: jnp.ndarray, prefix: str = "repr") -> dict:
     """
     Compute metrics for encoder representation health.
 
@@ -468,43 +599,43 @@ def encoder_repr_metrics(hidden: jnp.ndarray) -> dict:
     metrics = {}
 
     # Basic statistics
-    metrics["repr/mean"] = jnp.mean(hidden)
-    metrics["repr/std"] = jnp.std(hidden)
-    metrics["repr/min"] = jnp.min(hidden)
-    metrics["repr/max"] = jnp.max(hidden)
+    metrics[f"{prefix}/mean"] = jnp.mean(hidden)
+    metrics[f"{prefix}/std"] = jnp.std(hidden)
+    metrics[f"{prefix}/min"] = jnp.min(hidden)
+    metrics[f"{prefix}/max"] = jnp.max(hidden)
 
     # Per-unit statistics (across batch)
     unit_means = jnp.mean(hidden, axis=0)  # (hidden_dim,)
     unit_stds = jnp.std(hidden, axis=0)    # (hidden_dim,)
 
-    metrics["repr/unit_mean_avg"] = jnp.mean(unit_means)
-    metrics["repr/unit_std_avg"] = jnp.mean(unit_stds)
-    metrics["repr/unit_std_min"] = jnp.min(unit_stds)
-    metrics["repr/unit_std_max"] = jnp.max(unit_stds)
+    metrics[f"{prefix}/unit_mean_avg"] = jnp.mean(unit_means)
+    metrics[f"{prefix}/unit_std_avg"] = jnp.mean(unit_stds)
+    metrics[f"{prefix}/unit_std_min"] = jnp.min(unit_stds)
+    metrics[f"{prefix}/unit_std_max"] = jnp.max(unit_stds)
 
     # Dead units: units with very low variance (not learning)
     dead_threshold = 0.01
     dead_units = jnp.mean(unit_stds < dead_threshold)
-    metrics["repr/dead_units_frac"] = dead_units
+    metrics[f"{prefix}/dead_units_frac"] = dead_units
 
     # Saturated units: units always near boundaries (for tanh encoder output)
     saturated_high = jnp.mean(jnp.abs(hidden) > 0.95)
-    metrics["repr/saturated_frac"] = saturated_high
+    metrics[f"{prefix}/saturated_frac"] = saturated_high
 
     # Active units: units with reasonable variance
     active_units = jnp.mean(unit_stds > dead_threshold)
-    metrics["repr/active_units_frac"] = active_units
+    metrics[f"{prefix}/active_units_frac"] = active_units
 
     # Norms
     sample_norms = jnp.linalg.norm(hidden, axis=-1)  # (batch,)
-    metrics["repr/norm_mean"] = jnp.mean(sample_norms)
-    metrics["repr/norm_std"] = jnp.std(sample_norms)
-    metrics["repr/norm_min"] = jnp.min(sample_norms)
-    metrics["repr/norm_max"] = jnp.max(sample_norms)
+    metrics[f"{prefix}/norm_mean"] = jnp.mean(sample_norms)
+    metrics[f"{prefix}/norm_std"] = jnp.std(sample_norms)
+    metrics[f"{prefix}/norm_min"] = jnp.min(sample_norms)
+    metrics[f"{prefix}/norm_max"] = jnp.max(sample_norms)
 
     # Sparsity: fraction of near-zero activations
     sparsity = jnp.mean(jnp.abs(hidden) < 0.01)
-    metrics["repr/sparsity"] = sparsity
+    metrics[f"{prefix}/sparsity"] = sparsity
 
     # Feature correlation (expensive, use subset)
     # Compute correlation between random pairs of features
@@ -517,20 +648,22 @@ def encoder_repr_metrics(hidden: jnp.ndarray) -> dict:
         # Average absolute off-diagonal correlation
         mask = 1 - jnp.eye(corr_matrix.shape[0])
         avg_corr = jnp.sum(jnp.abs(corr_matrix) * mask) / (jnp.sum(mask) + 1e-8)
-        metrics["repr/feature_correlation"] = avg_corr
+        metrics[f"{prefix}/feature_correlation"] = avg_corr
 
     return metrics
 
 
 def compute_grad_norms(grads: dict) -> dict:
     """Compute gradient norms for key model components."""
-    def tree_norm(tree):
-        leaves = jax.tree_util.tree_leaves(tree)
-        return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves))
-
     metrics = {}
     if 'network' in grads:
-        metrics["grads/encoder_norm"] = tree_norm(grads['network'])
+        metrics["grads/encoder_norm"] = tree_norm(
+            latent_param_tree(grads, 'bottleneck' in grads)
+        )
+    if 'lejepa_head' in grads:
+        metrics["grads/lejepa_head_norm"] = tree_norm(grads['lejepa_head'])
+    if 'latent_transition' in grads:
+        metrics["grads/latent_transition_norm"] = tree_norm(grads['latent_transition'])
     if 'actor' in grads:
         metrics["grads/actor_norm"] = tree_norm(grads['actor'])
     if 'critic' in grads:
@@ -561,12 +694,16 @@ def create_optimizer(
     vit_qk_stiefel_dual_steps: int = 5,
     vit_qk_stiefel_msign_steps: int = 5,
     vit_qk_stiefel_max_grad_norm: float = 0.5,
+    use_stiefel_encoder_muon: bool = True,
+    stiefel_encoder_muon_lr: float = 0.02,
+    stiefel_encoder_muon_max_grad_norm: float = 0.5,
     use_heads_muon: bool = True,
 ):
     """
     Create optimizer that uses:
     - Adam/AdamW for encoder (all params) - supports lr schedule, with grad clipping
     - Optional per-head manifold MUON for ViT encoder attention Q/K kernels
+    - Optional manifold MUON for Stiefel projection kernel
     - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
@@ -602,6 +739,18 @@ def create_optimizer(
         ),
     )
 
+    # Optional manifold MUON for Stiefel projection kernel
+    encoder_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(stiefel_encoder_muon_max_grad_norm),
+        manifold_muon(
+            learning_rate=stiefel_encoder_muon_lr,
+            dual_lr=muon_dual_lr,
+            dual_steps=muon_dual_steps,
+            msign_steps=muon_msign_steps,
+            min_ndim=2,
+        ),
+    )
+
     # Adam/AdamW for head vectors/scalars (with schedule support and grad clipping)
     heads_adam_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
@@ -632,14 +781,35 @@ def create_optimizer(
         ),
     )
 
-    # 5 transforms: encoder, encoder_qk_stiefel, actor_muon (matrices),
-    # critic_muon (matrices), heads_adam (actor/critic vectors/scalars)
+    # Predictor Adam (same settings as encoder Adam)
+    predictor_tx = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        adam_opt(encoder_lr),
+    )
+
+    lejepa_tx = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        adam_opt(encoder_lr),
+    )
+
+    latent_tx = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        adam_opt(encoder_lr),
+    )
+
+    # 9 transforms: encoder, encoder_qk_stiefel, encoder_stiefel,
+    # actor_muon (matrices), critic_muon (matrices), heads_adam,
+    # predictor_adam, lejepa_adam, latent_adam
     transforms = {
         'encoder': encoder_tx,
         'encoder_qk_stiefel': encoder_qk_stiefel_tx,
+        'encoder_stiefel': encoder_stiefel_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
+        'predictor_adam': predictor_tx,
+        'lejepa_adam': lejepa_tx,
+        'latent_adam': latent_tx,
     }
 
     # Label function
@@ -647,6 +817,16 @@ def create_optimizer(
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
+                is_stiefel_projection_kernel = (
+                    use_stiefel_encoder_muon
+                    and len(path) >= 4
+                    and path[1] == 'params'
+                    and path[-2] == 'stiefel_projection'
+                    and path[-1] == 'kernel'
+                )
+                if is_stiefel_projection_kernel:
+                    return 'encoder_stiefel'
+
                 is_vit_qk_kernel = (
                     len(path) >= 7
                     and path[1] == 'params'
@@ -658,6 +838,12 @@ def create_optimizer(
                 if vit_qk_stiefel and is_vit_qk_kernel:
                     return 'encoder_qk_stiefel'
                 return 'encoder'
+            if path[0] == 'predictor':
+                return 'predictor_adam'
+            if path[0] == 'lejepa_head':
+                return 'lejepa_adam'
+            if path[0] in ('bottleneck', 'latent_transition'):
+                return 'latent_adam'
             # For actor/critic heads, check if matrix or vector/scalar
             is_matrix = param.ndim >= 2 and min(param.shape) > 1
             if path[0] == 'actor':
@@ -676,6 +862,7 @@ def create_optimizer(
         transforms=transforms,
         param_labels=label_fn,
     )
+
 
 
 def make_pixelbrax_envs(args):
@@ -701,6 +888,70 @@ def make_pixelbrax_envs(args):
     return envs, action_dim
 
 
+def sample_block_mask(
+    key: jax.random.PRNGKey,
+    batch_size: int,
+    grid_h: int,
+    grid_w: int,
+    mask_ratio: float,
+) -> jnp.ndarray:
+    """Generate upstream-style blockwise keep masks. Returns (B, N) float32."""
+    total = grid_h * grid_w
+    num_mask = jnp.asarray(jnp.ceil(mask_ratio * total), dtype=jnp.int32)
+    max_iters = max(8, total * 4)
+    log_aspect_lo = np.log(0.3)
+    log_aspect_hi = np.log(3.3)
+
+    def single_mask(k):
+        def cond_fn(state):
+            _, masked, step, _ = state
+            return jnp.logical_and(masked < num_mask, step < max_iters)
+
+        def body_fn(state):
+            mask, masked, step, rng = state
+            rng, area_key, aspect_key, top_key, left_key = jax.random.split(rng, 5)
+            remaining = jnp.maximum(1, num_mask - masked)
+            area_lo = jnp.minimum(remaining, jnp.asarray(16, dtype=jnp.int32))
+            area = jax.random.randint(area_key, (), 1, remaining + 1)
+            area = jnp.maximum(area, area_lo)
+            aspect = jnp.exp(jax.random.uniform(aspect_key, (), minval=log_aspect_lo, maxval=log_aspect_hi))
+            h = jnp.maximum(1, jnp.round(jnp.sqrt(area * aspect)).astype(jnp.int32))
+            w = jnp.maximum(1, jnp.round(jnp.sqrt(area / aspect)).astype(jnp.int32))
+            h = jnp.minimum(h, grid_h)
+            w = jnp.minimum(w, grid_w)
+            top = jax.random.randint(top_key, (), 0, grid_h - h + 1)
+            left = jax.random.randint(left_key, (), 0, grid_w - w + 1)
+
+            row_ids = jnp.arange(grid_h)[:, None]
+            col_ids = jnp.arange(grid_w)[None, :]
+            rect = (
+                (row_ids >= top)
+                & (row_ids < top + h)
+                & (col_ids >= left)
+                & (col_ids < left + w)
+            )
+            delta = jnp.sum(jnp.logical_and(rect, jnp.logical_not(mask)))
+            accept = jnp.logical_and(delta > 0, delta <= remaining)
+            mask = jnp.where(accept, jnp.logical_or(mask, rect), mask)
+            masked = masked + jnp.where(accept, delta, 0)
+            return mask, masked, step + 1, rng
+
+        init = (jnp.zeros((grid_h, grid_w), dtype=bool), jnp.int32(0), jnp.int32(0), k)
+        mask, masked, _, rng = jax.lax.while_loop(cond_fn, body_fn, init)
+
+        remaining = num_mask - masked
+        flat_mask = mask.reshape(-1)
+        scores = jax.random.uniform(rng, (total,), minval=0.0, maxval=1.0)
+        scores = jnp.where(flat_mask, 2.0, scores)
+        order = jnp.argsort(scores)
+        pick = jnp.arange(total) < remaining
+        extra_mask = jnp.zeros(total, dtype=bool).at[order].set(pick)
+        flat_mask = jnp.logical_or(flat_mask, extra_mask)
+        return 1.0 - flat_mask.astype(jnp.float32)
+
+    return jax.vmap(single_mask)(jax.random.split(key, batch_size))
+
+
 def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.ndarray:
     """DrQ-style random shift augmentation."""
     b, h, w, c = x.shape
@@ -714,6 +965,217 @@ def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.n
         return jax.lax.dynamic_slice(x_pad, (ch, cw, 0), (h, w, c))
 
     return jax.vmap(crop_single)(x_padded, crop_h, crop_w)
+
+
+def random_shift_with_noise(
+    key: jax.random.PRNGKey,
+    x: jnp.ndarray,
+    pad: int = 4,
+    noise_std: float = 2.0,
+    brightness_delta: float = 0.05,
+) -> jnp.ndarray:
+    """Random shift plus mild additive noise and brightness jitter."""
+    shift_key, noise_key, bright_key = jax.random.split(key, 3)
+    shifted = random_shift(shift_key, x, pad=pad).astype(jnp.float32)
+    brightness = jax.random.uniform(
+        bright_key, (shifted.shape[0], 1, 1, 1), minval=1.0 - brightness_delta, maxval=1.0 + brightness_delta
+    )
+    noise = noise_std * jax.random.normal(noise_key, shifted.shape)
+    augmented = shifted * brightness + noise
+    if jnp.issubdtype(x.dtype, jnp.integer):
+        return jnp.clip(jnp.rint(augmented), 0.0, 255.0).astype(x.dtype)
+    return augmented.astype(x.dtype)
+
+
+def empirical_char_diff(samples: jnp.ndarray, t_values: jnp.ndarray) -> jnp.ndarray:
+    """Characteristic-function distance to a standard 1D Gaussian."""
+    phases = samples[:, :, None] * t_values[None, None, :]
+    real_part = jnp.mean(jnp.cos(phases), axis=0)
+    imag_part = jnp.mean(jnp.sin(phases), axis=0)
+    target_real = jnp.exp(-0.5 * jnp.square(t_values))[None, :]
+    return jnp.mean(jnp.square(real_part - target_real) + jnp.square(imag_part))
+
+
+def sigreg_epps_pulley(
+    samples: jnp.ndarray,
+    directions: jnp.ndarray,
+    t_values: jnp.ndarray,
+) -> jnp.ndarray:
+    """Epps-Pulley-style SIGReg with Gaussian weighting over random 1D projections."""
+    projected = samples @ directions.T
+    phases = projected[:, :, None] * t_values[None, None, :]
+    ecf_real = jnp.mean(jnp.cos(phases), axis=0)
+    ecf_imag = jnp.mean(jnp.sin(phases), axis=0)
+    target_real = jnp.exp(-0.5 * jnp.square(t_values))[None, :]
+    squared_error = jnp.square(ecf_real - target_real) + jnp.square(ecf_imag)
+    weights = jnp.exp(-0.5 * jnp.square(t_values))[None, :]
+    integrand = squared_error * weights
+    integrated = jnp.trapezoid(integrand, t_values, axis=-1)
+    return samples.shape[0] * jnp.mean(integrated)
+
+
+def tree_norm(tree) -> jnp.ndarray:
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.array(0.0, dtype=jnp.float32)
+    return jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in leaves))
+
+
+def tree_dot(tree_a, tree_b) -> jnp.ndarray:
+    leaves_a = jax.tree_util.tree_leaves(tree_a)
+    leaves_b = jax.tree_util.tree_leaves(tree_b)
+    if not leaves_a or not leaves_b:
+        return jnp.array(0.0, dtype=jnp.float32)
+    return sum(jnp.sum(a * b) for a, b in zip(leaves_a, leaves_b))
+
+
+def latent_covariance_loss(z_t: jnp.ndarray) -> jnp.ndarray:
+    """Decorrelation loss on latent dimensions across the minibatch."""
+    batch_size = z_t.shape[0]
+    if batch_size <= 1:
+        return jnp.array(0.0, dtype=jnp.float32)
+    z_centered = z_t - z_t.mean(axis=0, keepdims=True)
+    cov = (z_centered.T @ z_centered) / jnp.maximum(1.0, batch_size - 1)
+    off_diag = cov * (1.0 - jnp.eye(cov.shape[0], dtype=cov.dtype))
+    return jnp.sum(jnp.square(off_diag)) / z_t.shape[-1]
+
+
+def latent_variance_loss(z_t: jnp.ndarray) -> jnp.ndarray:
+    """Penalize collapsed latent dimensions with low variance."""
+    std = jnp.sqrt(jnp.var(z_t, axis=0) + 1e-4)
+    return jnp.mean(jnp.maximum(1.0 - std, 0.0))
+
+
+def latent_whiten_loss(z_t: jnp.ndarray) -> jnp.ndarray:
+    """Match latent covariance to identity for conditioning control."""
+    batch_size = z_t.shape[0]
+    if batch_size <= 1:
+        return jnp.array(0.0, dtype=jnp.float32)
+    z_centered = z_t - jnp.mean(z_t, axis=0, keepdims=True)
+    cov = (z_centered.T @ z_centered) / jnp.maximum(1.0, batch_size - 1)
+    ident = jnp.eye(cov.shape[0], dtype=cov.dtype)
+    return jnp.mean(jnp.square(cov - ident))
+
+
+def latent_stiefel_projection_loss(h_t: jnp.ndarray, network_params: flax.core.FrozenDict) -> jnp.ndarray:
+    """Penalize Stiefel latent features for not lying in the learned subspace."""
+    try:
+        kernel = network_params["network"]["params"]["stiefel_projection"]["kernel"]
+    except (TypeError, KeyError):
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    z_t = h_t @ kernel
+    h_t_hat = z_t @ kernel.T
+    return jnp.mean(jnp.sum(jnp.square(h_t - h_t_hat), axis=-1))
+
+
+def latent_cnn_sigreg_loss(h_t: jnp.ndarray, sigreg_key: jax.random.PRNGKey) -> jnp.ndarray:
+    """SIGReg loss on pre-tanh CNN latents against standard normal projections."""
+    directions = jax.random.normal(
+        sigreg_key,
+        (args.cnn_sigreg_num_slices, h_t.shape[-1]),
+    )
+    directions = directions / (jnp.linalg.norm(directions, axis=-1, keepdims=True) + 1e-8)
+    t_values = jnp.linspace(
+        args.cnn_sigreg_t_min,
+        args.cnn_sigreg_t_max,
+        num=args.cnn_sigreg_t_points,
+    )
+    return sigreg_epps_pulley(h_t, directions, t_values)
+
+
+def latent_param_tree(tree, include_bottleneck: bool):
+    """Select encoder-side params for alignment checks."""
+    selected = {"network": tree["network"]}
+    if include_bottleneck and "bottleneck" in tree:
+        selected["bottleneck"] = tree["bottleneck"]
+    return selected
+
+
+def latent_auxiliary_enabled() -> bool:
+    """Return whether any latent-side auxiliary terms are in use."""
+    return bool(
+        args.use_latent_dynamics
+        or args.latent_cov_coef > 0.0
+        or args.latent_var_coef > 0.0
+        or args.latent_whiten_coef > 0.0
+        or (args.latent_subspace_coef > 0.0 and args.encoder_type.lower() == "stiefel_cnn")
+        or (args.cnn_sigreg_coef > 0.0 and args.encoder_type.lower() == "cnn")
+    )
+
+
+def latent_path_is_active() -> bool:
+    """Whether actor/critic are driven by a dedicated latent manifold."""
+    return bool(args.use_latent_bottleneck or args.encoder_type.lower() == "stiefel_cnn")
+
+
+def latent_transition_matrix_metrics(transition_params) -> dict:
+    """Return singular-value diagnostics for linear latent transition matrices."""
+    if transition_params is None:
+        return {
+            "latent_transition/F_sigma_max": 0.0,
+            "latent_transition/F_sigma_min": 0.0,
+            "latent_transition/F_condition_number": 0.0,
+            "latent_transition/G_sigma_max": 0.0,
+            "latent_transition/G_sigma_min": 0.0,
+            "latent_transition/G_condition_number": 0.0,
+        }
+    try:
+        f_matrix = np.array(jax.device_get(transition_params["params"]["F"]))
+        g_matrix = np.array(jax.device_get(transition_params["params"]["G"]))
+    except (TypeError, KeyError):
+        return {
+            "latent_transition/F_sigma_max": 0.0,
+            "latent_transition/F_sigma_min": 0.0,
+            "latent_transition/F_condition_number": 0.0,
+            "latent_transition/G_sigma_max": 0.0,
+            "latent_transition/G_sigma_min": 0.0,
+            "latent_transition/G_condition_number": 0.0,
+        }
+
+    if f_matrix.size == 0:
+        f_sigma_max = 0.0
+        f_sigma_min = 0.0
+        f_cond = 0.0
+    else:
+        f_sv = np.linalg.svd(f_matrix, full_matrices=False, compute_uv=False)
+        f_sigma_max = float(f_sv[0]) if f_sv.size > 0 else 0.0
+        f_sigma_min = float(f_sv[-1]) if f_sv.size > 0 else 0.0
+        f_cond = float(f_sigma_max / (f_sigma_min + 1e-12)) if f_sv.size > 0 else 0.0
+
+    if g_matrix.size == 0:
+        g_sigma_max = 0.0
+        g_sigma_min = 0.0
+        g_cond = 0.0
+    else:
+        g_sv = np.linalg.svd(g_matrix, full_matrices=False, compute_uv=False)
+        g_sigma_max = float(g_sv[0]) if g_sv.size > 0 else 0.0
+        g_sigma_min = float(g_sv[-1]) if g_sv.size > 0 else 0.0
+        g_cond = float(g_sigma_max / (g_sigma_min + 1e-12)) if g_sv.size > 0 else 0.0
+
+    return {
+        "latent_transition/F_sigma_max": f_sigma_max,
+        "latent_transition/F_sigma_min": f_sigma_min,
+        "latent_transition/F_condition_number": f_cond,
+        "latent_transition/G_sigma_max": g_sigma_max,
+        "latent_transition/G_sigma_min": g_sigma_min,
+        "latent_transition/G_condition_number": g_cond,
+    }
+
+
+def ramped_aux_coef(
+    iteration: int,
+    target_coef: float,
+    warmup_updates: int,
+    rampup_updates: int,
+) -> float:
+    """Warmup at zero, then linearly ramp to target_coef."""
+    if iteration <= warmup_updates:
+        return 0.0
+    if iteration <= warmup_updates + rampup_updates:
+        ramp_frac = (iteration - warmup_updates) / max(1, rampup_updates)
+        return float(target_coef) * ramp_frac
+    return float(target_coef)
 
 
 if __name__ == "__main__":
@@ -768,6 +1230,32 @@ if __name__ == "__main__":
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
     print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
+    print(f"  stiefel_latent_dim: {args.stiefel_latent_dim}")
+    if args.encoder_type.lower() == "stiefel_cnn":
+        print(f"  latent_transition_type: {args.latent_transition_type}")
+    print(f"  use_latent_bottleneck: {args.use_latent_bottleneck}")
+    if args.use_latent_bottleneck:
+        print(f"  latent_dim: {args.latent_dim}")
+    print(f"  use_latent_dynamics: {args.use_latent_dynamics}")
+    if args.use_latent_dynamics:
+        print(f"  latent_transition_type: {args.latent_transition_type}")
+        print(f"  latent_dyn_coef: {args.latent_dyn_coef}")
+        print(f"  latent_dyn_warmup_updates: {args.latent_dyn_warmup_updates}")
+        print(f"  latent_dyn_rampup_updates: {args.latent_dyn_rampup_updates}")
+    print(f"  latent_cov_coef: {args.latent_cov_coef}")
+    print(f"  latent_var_coef: {args.latent_var_coef}")
+    print(f"  latent_whiten_coef: {args.latent_whiten_coef}")
+    print(f"  latent_subspace_coef: {args.latent_subspace_coef}")
+    print(f"  cnn_sigreg_coef: {args.cnn_sigreg_coef}")
+    print(f"  cnn_sigreg_warmup_updates: {args.cnn_sigreg_warmup_updates}")
+    print(f"  cnn_sigreg_rampup_updates: {args.cnn_sigreg_rampup_updates}")
+    print(f"  cnn_sigreg_num_slices: {args.cnn_sigreg_num_slices}")
+    print(f"  cnn_sigreg_t_points: {args.cnn_sigreg_t_points}")
+    print(f"  cnn_sigreg_t_min: {args.cnn_sigreg_t_min}")
+    print(f"  cnn_sigreg_t_max: {args.cnn_sigreg_t_max}")
+    print(f"  log_latent_grad_alignment: {args.log_latent_grad_alignment}")
+    print(f"  latent_grad_alignment_interval: {args.latent_grad_alignment_interval}")
+    print(f"  lejepa: {args.lejepa}")
     if args.encoder_type.lower() == "vit":
         print(f"  vit_patch_size: {args.vit_patch_size}")
         print(f"  vit_hidden_size: {args.vit_hidden_size}")
@@ -807,6 +1295,31 @@ if __name__ == "__main__":
         print(f"  drq_vit_stem_channels: {args.drq_vit_stem_channels}")
         print(f"  drq_vit_token_downsample: {args.drq_vit_token_downsample}")
         print(f"  drq_vit_apply_output_tanh: {args.drq_vit_apply_output_tanh}")
+    if args.encoder_type.lower() == "scott":
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  scott_use_swiglu: {args.scott_use_swiglu}")
+        print(f"  scott_num_register_tokens: {args.scott_num_register_tokens}")
+        print(f"  scott_dropout_rate: {args.scott_dropout_rate}")
+        print(f"  scott_attention_dropout_rate: {args.scott_attention_dropout_rate}")
+        print(f"  scott_stochastic_depth_rate: {args.scott_stochastic_depth_rate}")
+    if args.lejepa:
+        print(f"  lejepa_lambda: {args.lejepa_lambda}")
+        print(f"  lejepa_aux_coef: {args.lejepa_aux_coef}")
+        print(f"  lejepa_proj_dim: {args.lejepa_proj_dim}")
+        print(f"  lejepa_num_views: {args.lejepa_num_views}")
+        print(f"  lejepa_num_slices: {args.lejepa_num_slices}")
+        print(f"  lejepa_warmup_updates: {args.lejepa_warmup_updates}")
+        print(f"  lejepa_rampup_updates: {args.lejepa_rampup_updates}")
+        print(f"  lejepa_t_points: {args.lejepa_t_points}")
+        print(f"  lejepa_t_min: {args.lejepa_t_min}")
+        print(f"  lejepa_t_max: {args.lejepa_t_max}")
+        print(f"  lejepa_view_mode: {args.lejepa_view_mode}")
+        print(f"  lejepa_use_layernorm: {args.lejepa_use_layernorm}")
+        print(f"  lejepa_sigreg_mode: {args.lejepa_sigreg_mode}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
@@ -822,6 +1335,75 @@ if __name__ == "__main__":
     print(f"frame_stack: {args.frame_stack}")
     print(f"action_repeat: {args.action_repeat}")
     print(f"obs_shape (with {args.frame_stack} stacked frames): {obs_shape}")
+    if args.mim_jepa and args.encoder_type.lower() != "scott":
+        raise ValueError("--mim-jepa requires --encoder-type scott")
+    if args.lejepa and args.encoder_type.lower() != "cnn":
+        raise ValueError("--lejepa requires --encoder-type cnn in the first pass")
+    if args.lejepa and args.mim_jepa:
+        raise ValueError("--lejepa cannot be combined with --mim-jepa")
+    if args.lejepa_num_views < 2:
+        raise ValueError("--lejepa-num-views must be at least 2")
+    if args.lejepa_num_slices < 1:
+        raise ValueError("--lejepa-num-slices must be positive")
+    if args.lejepa_t_points < 1:
+        raise ValueError("--lejepa-t-points must be positive")
+    if args.lejepa_aux_coef < 0:
+        raise ValueError("--lejepa-aux-coef must be non-negative")
+    if args.lejepa_warmup_updates < 0:
+        raise ValueError("--lejepa-warmup-updates must be non-negative")
+    if args.lejepa_rampup_updates < 0:
+        raise ValueError("--lejepa-rampup-updates must be non-negative")
+    if args.lejepa_view_mode not in {"shift", "shift_noise", "temporal"}:
+        raise ValueError("--lejepa-view-mode must be one of: shift, shift_noise, temporal")
+    if args.lejepa_sigreg_mode not in {"legacy", "epps_pulley"}:
+        raise ValueError("--lejepa-sigreg-mode must be one of: legacy, epps_pulley")
+    if args.lejepa and args.lejepa_view_mode == "temporal" and args.lejepa_num_views != 2:
+        raise ValueError("--lejepa-view-mode temporal currently requires --lejepa-num-views 2")
+    if args.latent_transition_type not in {"mlp", "linear"}:
+        raise ValueError("--latent-transition-type must be one of: mlp, linear")
+
+    supports_latent_transitions = args.use_latent_bottleneck or args.encoder_type.lower() == "stiefel_cnn"
+    if args.use_latent_dynamics and not supports_latent_transitions:
+        raise ValueError(
+            "--use-latent-dynamics currently supports --encoder-type stiefel_cnn or --use-latent-bottleneck"
+        )
+
+    if args.use_latent_bottleneck and args.latent_dim < 1:
+        raise ValueError("--latent-dim must be positive")
+    if args.latent_dyn_coef < 0:
+        raise ValueError("--latent-dyn-coef must be non-negative")
+    if args.latent_cov_coef < 0:
+        raise ValueError("--latent-cov-coef must be non-negative")
+    if args.latent_var_coef < 0:
+        raise ValueError("--latent-var-coef must be non-negative")
+    if args.latent_whiten_coef < 0:
+        raise ValueError("--latent-whiten-coef must be non-negative")
+    if args.latent_subspace_coef < 0:
+        raise ValueError("--latent-subspace-coef must be non-negative")
+    if args.latent_subspace_coef > 0 and args.encoder_type.lower() != "stiefel_cnn":
+        raise ValueError("--latent-subspace-coef currently applies only when --encoder-type stiefel_cnn")
+    if args.cnn_sigreg_coef > 0 and args.encoder_type.lower() != "cnn":
+        raise ValueError("--cnn-sigreg-coef currently applies only when --encoder-type cnn")
+    if args.cnn_sigreg_coef < 0:
+        raise ValueError("--cnn-sigreg-coef must be non-negative")
+    if args.cnn_sigreg_warmup_updates < 0:
+        raise ValueError("--cnn-sigreg-warmup-updates must be non-negative")
+    if args.cnn_sigreg_rampup_updates < 0:
+        raise ValueError("--cnn-sigreg-rampup-updates must be non-negative")
+    if args.cnn_sigreg_num_slices < 1:
+        raise ValueError("--cnn-sigreg-num-slices must be positive")
+    if args.cnn_sigreg_t_points < 1:
+        raise ValueError("--cnn-sigreg-t-points must be positive")
+    if args.latent_dyn_warmup_updates < 0:
+        raise ValueError("--latent-dyn-warmup-updates must be non-negative")
+    if args.latent_dyn_rampup_updates < 0:
+        raise ValueError("--latent-dyn-rampup-updates must be non-negative")
+    if args.latent_grad_alignment_interval < 1:
+        raise ValueError("--latent-grad-alignment-interval must be at least 1")
+    if args.use_latent_bottleneck and args.encoder_type.lower() not in ("cnn", "stiefel_cnn"):
+        raise ValueError("--use-latent-bottleneck currently supports --encoder-type cnn or stiefel_cnn")
+    if args.use_latent_bottleneck and args.mim_jepa:
+        raise ValueError("--use-latent-bottleneck and --mim-jepa are mutually exclusive")
 
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
@@ -852,12 +1434,21 @@ if __name__ == "__main__":
         drq_token_downsample=args.drq_vit_token_downsample,
         drq_apply_output_tanh=args.drq_vit_apply_output_tanh,
         proj_dim=args.vit_proj_dim,
+        scott_use_swiglu=args.scott_use_swiglu,
+        scott_num_register_tokens=args.scott_num_register_tokens,
+        scott_dropout_rate=args.scott_dropout_rate,
+        scott_attention_dropout_rate=args.scott_attention_dropout_rate,
+        scott_stochastic_depth_rate=args.scott_stochastic_depth_rate,
     )
     network = build_encoder(
         args.encoder_type,
         args.encoder_tanh_scale,
         vit_config=vit_config,
+        stiefel_latent_dim=args.stiefel_latent_dim,
     )
+    bottleneck = None
+    latent_transition = None
+    latent_transition_dim = None
     if args.use_crate_head:
         actor = CRATEActor(action_dim=action_dim, crate_step_size=args.crate_step_size)
         critic = CRATECritic(crate_step_size=args.crate_step_size)
@@ -865,18 +1456,102 @@ if __name__ == "__main__":
     else:
         actor = Actor(action_dim=action_dim)
         critic = Critic()
+    lejepa_head = None
 
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
     dummy_hidden = network.apply(network_params, dummy_obs)
+    actor_input = dummy_hidden
+    bottleneck_params = None
+    if args.use_latent_bottleneck:
+        key, bottleneck_key = jax.random.split(key)
+        bottleneck = BottleneckProjection(latent_dim=args.latent_dim)
+        bottleneck_params = bottleneck.init(bottleneck_key, dummy_hidden)
+        actor_input = bottleneck.apply(bottleneck_params, dummy_hidden)
+        latent_transition_dim = args.latent_dim
+    elif args.encoder_type.lower() == "stiefel_cnn":
+        latent_transition_dim = args.stiefel_latent_dim
+    scott_dummy_tokens = None
+    scott_num_patches = None
+    scott_grid_size = None
+    if args.encoder_type.lower() == "scott":
+        scott_dummy_tokens = network.apply(network_params, dummy_obs, return_tokens=True)
+        scott_num_patches = int(scott_dummy_tokens.shape[1])
+        scott_grid_size = int(round(np.sqrt(scott_num_patches)))
+        if scott_grid_size * scott_grid_size != scott_num_patches:
+            raise ValueError(
+                f"SCOTT produced a non-square token grid: {scott_num_patches} tokens"
+            )
+        print(f"scott_num_patches: {scott_num_patches}")
+        print(f"scott_grid_size: {scott_grid_size}x{scott_grid_size}")
 
     params_dict = {
         "network": network_params,
-        "actor": actor.init(actor_key, dummy_hidden),
-        "critic": critic.init(critic_key, dummy_hidden),
+        "actor": actor.init(actor_key, actor_input),
+        "critic": critic.init(critic_key, actor_input),
     }
+    if bottleneck_params is not None:
+        params_dict["bottleneck"] = bottleneck_params
+
+    if args.lejepa:
+        key, lejepa_key = jax.random.split(key)
+        lejepa_head = LeJEPAProjector(
+            proj_dim=args.lejepa_proj_dim,
+            use_layernorm=args.lejepa_use_layernorm,
+        )
+        params_dict["lejepa_head"] = lejepa_head.init(lejepa_key, dummy_hidden)
+        print(f"lejepa_proj_dim: {args.lejepa_proj_dim}")
+        print(f"lejepa_num_views: {args.lejepa_num_views}")
+
+    # MIM-JEPA: predictor + target encoder
+    target_params = None
+    predictor = None
+    if args.mim_jepa:
+        key, pred_key = jax.random.split(key)
+        predictor = MIMJEPAPredictor(
+            embed_dim=args.vit_hidden_size,
+            num_register_tokens=args.scott_num_register_tokens,
+            backbone_depth=args.vit_num_layers,
+            num_layers=args.mim_jepa_predictor_depth,
+            num_heads=args.vit_num_heads,
+            use_swiglu=args.scott_use_swiglu,
+            mlp_dim=args.vit_mlp_dim,
+            dropout_rate=args.scott_dropout_rate,
+            attention_dropout_rate=args.scott_attention_dropout_rate,
+            stochastic_depth_rate=args.scott_stochastic_depth_rate,
+        )
+        predictor_params = predictor.init(pred_key, scott_dummy_tokens)
+        params_dict["predictor"] = predictor_params
+        print(f"mim_jepa_mask_type: blockwise")
+        print(f"mim_jepa_ema_tau: {args.mim_jepa_ema_tau}")
+
+    if args.use_latent_dynamics:
+        key, transition_key = jax.random.split(key)
+        if latent_transition_dim is None:
+            raise ValueError("latent_transition_dim must be set when use_latent_dynamics is enabled")
+
+        if args.latent_transition_type == "linear":
+            latent_transition = LinearLatentTransition(
+                latent_dim=latent_transition_dim,
+                action_dim=action_dim,
+            )
+        elif args.latent_transition_type == "mlp":
+            latent_transition = LatentTransition(
+                latent_dim=latent_transition_dim,
+                action_dim=action_dim,
+            )
+        else:
+            raise ValueError(f"Unsupported latent transition type: {args.latent_transition_type}")
+
+        dummy_latent = jnp.zeros((1, latent_transition_dim))
+        dummy_action = jnp.zeros((1, action_dim))
+        params_dict["latent_transition"] = latent_transition.init(
+            transition_key, dummy_latent, dummy_action
+        )
 
     all_params = flax.core.freeze(params_dict)
+    if args.mim_jepa:
+        target_params = all_params["network"]
 
     # Count params by component and type
     def count_params(params, key):
@@ -895,7 +1570,15 @@ if __name__ == "__main__":
     encoder_params = count_params(all_params, "network")
     actor_params = count_params(all_params, "actor")
     critic_params = count_params(all_params, "critic")
-    total_params = encoder_params + actor_params + critic_params
+    predictor_params_count = count_params(all_params, "predictor")
+    lejepa_params_count = count_params(all_params, "lejepa_head")
+    total_params = (
+        encoder_params
+        + actor_params
+        + critic_params
+        + predictor_params_count
+        + lejepa_params_count
+    )
 
     actor_muon, actor_adam = count_by_type(all_params, "actor")
     critic_muon, critic_adam = count_by_type(all_params, "critic")
@@ -904,6 +1587,10 @@ if __name__ == "__main__":
     print(f"  Encoder (Adam): {encoder_params:,}")
     print(f"  Actor total: {actor_params:,} (MUON: {actor_muon:,}, Adam: {actor_adam:,})")
     print(f"  Critic total: {critic_params:,} (MUON: {critic_muon:,}, Adam: {critic_adam:,})")
+    if args.mim_jepa:
+        print(f"  Predictor (Adam): {predictor_params_count:,}")
+    if args.lejepa:
+        print(f"  LeJEPA projector (Adam): {lejepa_params_count:,}")
     print(f"  Total: {total_params:,}")
 
     # Create learning rate schedules for Adam optimizers
@@ -966,6 +1653,9 @@ if __name__ == "__main__":
         vit_qk_stiefel_dual_steps=args.vit_qk_stiefel_dual_steps,
         vit_qk_stiefel_msign_steps=args.vit_qk_stiefel_msign_steps,
         vit_qk_stiefel_max_grad_norm=args.vit_qk_stiefel_max_grad_norm,
+        use_stiefel_encoder_muon=(args.encoder_type.lower() == "stiefel_cnn"),
+        stiefel_encoder_muon_lr=args.heads_muon_lr,
+        stiefel_encoder_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         use_heads_muon=args.use_heads_muon,
     )
 
@@ -975,9 +1665,261 @@ if __name__ == "__main__":
         tx=tx,
     )
 
+    network_apply = network.apply  # raw apply before JIT wrapping
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
+    if args.mim_jepa:
+        predictor.apply = jax.jit(predictor.apply)
+    if args.lejepa:
+        lejepa_head.apply = jax.jit(lejepa_head.apply)
+    if args.use_latent_bottleneck:
+        bottleneck.apply = jax.jit(bottleneck.apply)
+    if args.use_latent_dynamics:
+        latent_transition.apply = jax.jit(latent_transition.apply)
+
+    # MIM-JEPA loss helpers (defined only when mim_jepa=True; closed over network/predictor/args)
+    if args.mim_jepa:
+        _mim_grid_size = scott_grid_size
+        _mim_num_patches = scott_num_patches
+
+        def compute_mim_jepa_loss(params, target_params, obs, mask_key):
+            """SmoothL1 reconstruction loss on masked token positions."""
+            B = obs.shape[0]
+            keep_masks = sample_block_mask(
+                mask_key, B, _mim_grid_size, _mim_grid_size, args.mim_jepa_mask_ratio
+            )
+            target_tokens = network_apply(target_params, obs, return_tokens=True)
+            target_tokens = jax.lax.stop_gradient(target_tokens)
+            t_mean = jnp.mean(target_tokens, axis=-1, keepdims=True)
+            t_var = jnp.var(target_tokens, axis=-1, keepdims=True)
+            target_tokens = (target_tokens - t_mean) / jnp.sqrt(t_var + 1e-5)
+            context_tokens = network_apply(
+                params["network"], obs, return_tokens=True, masks=keep_masks
+            )
+            pred_tokens = predictor.apply(params["predictor"], context_tokens)
+            drop_masks = 1.0 - keep_masks  # (B, N) — 1 where masked
+            diff = pred_tokens - target_tokens
+            abs_diff = jnp.abs(diff)
+            huber = jnp.where(abs_diff < 1.0, 0.5 * diff ** 2, abs_diff - 0.5)
+            D = pred_tokens.shape[-1]
+            huber = huber * drop_masks[:, :, None]  # (B, N, D) — zero at kept positions
+            loss_per_sample = (huber.sum(axis=-1) / D).sum(axis=-1) / (
+                drop_masks.sum(axis=-1) + 1e-8
+            )
+            return loss_per_sample.mean()
+
+    if args.lejepa:
+        lejepa_t_values = jnp.linspace(
+            args.lejepa_t_min,
+            args.lejepa_t_max,
+            args.lejepa_t_points,
+            dtype=jnp.float32,
+        )
+        temporal_offsets = jnp.array([1, 2, 3], dtype=jnp.int32)
+
+        def sample_temporal_partner_obs(
+            rollout_obs: jnp.ndarray,
+            rollout_dones: jnp.ndarray,
+            step_idx: jnp.ndarray,
+            env_idx: jnp.ndarray,
+            temporal_key: jax.random.PRNGKey,
+        ) -> jnp.ndarray:
+            """Sample same-env nearby rollout observations without crossing episode boundaries."""
+            num_steps = rollout_obs.shape[0]
+            offset_key, direction_key = jax.random.split(temporal_key)
+            offset_idx = jax.random.randint(
+                offset_key, step_idx.shape, 0, temporal_offsets.shape[0]
+            )
+            signed_offsets = temporal_offsets[offset_idx]
+            direction = jax.random.bernoulli(
+                direction_key, 0.5, step_idx.shape
+            ).astype(jnp.int32) * 2 - 1
+            candidate_step = step_idx + direction * signed_offsets
+            candidate_step = jnp.clip(candidate_step, 0, num_steps - 1)
+
+            def sample_one(t0, t1, env):
+                lo = jnp.minimum(t0, t1)
+                hi = jnp.maximum(t0, t1)
+                env_dones = rollout_dones[:, env]
+                between_mask = jnp.logical_and(
+                    jnp.arange(num_steps) > lo,
+                    jnp.arange(num_steps) <= hi,
+                )
+                valid = jnp.logical_and(
+                    t0 != t1,
+                    jnp.logical_not(jnp.any(jnp.logical_and(between_mask, env_dones))),
+                )
+                return jax.lax.cond(
+                    valid,
+                    lambda _: rollout_obs[t1, env],
+                    lambda _: rollout_obs[t0, env],
+                    operand=None,
+                )
+
+            return jax.vmap(sample_one)(step_idx, candidate_step, env_idx)
+
+        def make_lejepa_views(
+            obs: jnp.ndarray,
+            aux_key: jax.random.PRNGKey,
+            rollout_obs: jnp.ndarray,
+            rollout_dones: jnp.ndarray,
+            step_idx: jnp.ndarray,
+            env_idx: jnp.ndarray,
+        ) -> jnp.ndarray:
+            """Build LeJEPA views according to the configured RL-safe view mode."""
+            if args.lejepa_view_mode == "temporal":
+                if args.lejepa_num_views != 2:
+                    raise ValueError("--lejepa-view-mode temporal currently requires --lejepa-num-views 2")
+                first_key, second_key = jax.random.split(aux_key)
+                first_view = random_shift(first_key, obs, pad=args.augment_pad)
+                temporal_obs = sample_temporal_partner_obs(
+                    rollout_obs, rollout_dones, step_idx, env_idx, second_key
+                )
+                second_view = random_shift(second_key, temporal_obs, pad=args.augment_pad)
+                return jnp.stack([first_view, second_view], axis=0)
+
+            view_keys = jax.random.split(aux_key, args.lejepa_num_views)
+            if args.lejepa_view_mode == "shift_noise":
+                return jax.vmap(
+                    lambda k: random_shift_with_noise(k, obs, pad=args.augment_pad)
+                )(view_keys)
+            return jax.vmap(lambda k: random_shift(k, obs, pad=args.augment_pad))(view_keys)
+
+        def compute_lejepa_loss(
+            params,
+            obs,
+            aux_key,
+            rollout_obs,
+            rollout_dones,
+            step_idx,
+            env_idx,
+        ):
+            """Agreement-plus-SIGReg loss on projected CNN latents."""
+            view_key, slice_key = jax.random.split(aux_key)
+            views = make_lejepa_views(
+                obs,
+                view_key,
+                rollout_obs,
+                rollout_dones,
+                step_idx,
+                env_idx,
+            )
+            hidden_views = jax.vmap(
+                lambda view_obs: network_apply(params["network"], view_obs)
+            )(views)
+            proj_views = jax.vmap(
+                lambda hidden: lejepa_head.apply(params["lejepa_head"], hidden)
+            )(hidden_views)
+
+            centers = jnp.mean(proj_views, axis=0, keepdims=True)
+            sim_loss = jnp.mean(jnp.square(proj_views - centers))
+
+            directions = jax.random.normal(
+                slice_key,
+                (args.lejepa_num_slices, args.lejepa_proj_dim),
+            )
+            directions = directions / (
+                jnp.linalg.norm(directions, axis=-1, keepdims=True) + 1e-8
+            )
+            if args.lejepa_sigreg_mode == "legacy":
+                projected = jnp.einsum("vbk,sk->vbs", proj_views, directions)
+                sigreg_loss = jnp.mean(
+                    jax.vmap(lambda samples: empirical_char_diff(samples, lejepa_t_values))(projected)
+                )
+            else:
+                sigreg_loss = jnp.mean(
+                    jax.vmap(lambda samples: sigreg_epps_pulley(samples, directions, lejepa_t_values))(proj_views)
+                )
+
+            total_loss = (
+                (1.0 - args.lejepa_lambda) * sim_loss
+                + args.lejepa_lambda * sigreg_loss
+            )
+            return total_loss, sim_loss, sigreg_loss
+
+    def compute_latent_losses(
+        params,
+        obs: jnp.ndarray,
+        actions: jnp.ndarray,
+        cnn_sigreg_key: jax.random.PRNGKey = None,
+        next_obs: jnp.ndarray = None,
+        next_dones: jnp.ndarray = None,
+        include_cnn_sigreg: bool = True,
+    ):
+        """Compute optional latent auxiliary losses.
+
+        Returns (z_t, latent_dyn_loss, latent_cov_loss,
+                 latent_var_loss, latent_whiten_loss, latent_subspace_loss,
+                 latent_cnn_sigreg_loss).
+        """
+        return_pre_tanh = args.encoder_type.lower() == "cnn" and args.cnn_sigreg_coef > 0.0
+        h_t, z_t = encode_features(params, obs, return_preproj=True, return_pre_tanh=return_pre_tanh)
+        latent_dyn_loss_raw = jnp.array(0.0, dtype=jnp.float32)
+        latent_cov_loss = latent_covariance_loss(z_t)
+        latent_var_loss = latent_variance_loss(z_t)
+        latent_whiten_loss_val = latent_whiten_loss(z_t)
+
+        latent_subspace_loss = jnp.array(0.0, dtype=jnp.float32)
+        if args.latent_subspace_coef > 0.0 and args.encoder_type.lower() == "stiefel_cnn":
+            latent_subspace_loss = latent_stiefel_projection_loss(h_t, params)
+
+        if args.use_latent_dynamics:
+            if next_obs is None or next_dones is None:
+                latent_dyn_loss_raw = jnp.array(0.0, dtype=jnp.float32)
+            else:
+                _, z_next = encode_features(params, next_obs)
+                z_next_pred = latent_transition.apply(
+                    params["latent_transition"], z_t, actions
+                )
+                not_done = 1.0 - next_dones.astype(jnp.float32)
+                pred_error = (z_next_pred - z_next) * not_done[:, None]
+                latent_dyn_loss_raw = jnp.mean(jnp.sum(jnp.square(pred_error), axis=-1))
+
+        latent_cnn_sigreg_raw = jnp.array(0.0, dtype=jnp.float32)
+        if return_pre_tanh and args.cnn_sigreg_coef > 0.0 and include_cnn_sigreg:
+            if cnn_sigreg_key is None:
+                raise ValueError("cnn_sigreg_key must be provided when cnn_sigreg_coef > 0")
+            latent_cnn_sigreg_raw = latent_cnn_sigreg_loss(h_t, cnn_sigreg_key)
+
+        return (
+            z_t,
+            latent_dyn_loss_raw,
+            latent_cov_loss,
+            latent_var_loss,
+            latent_whiten_loss_val,
+            latent_subspace_loss,
+            latent_cnn_sigreg_raw,
+        )
+
+    def encode_features(params, obs, return_preproj: bool = False, return_pre_tanh: bool = False):
+        is_stiefel = args.encoder_type.lower() == "stiefel_cnn"
+        is_cnn = args.encoder_type.lower() == "cnn"
+        if is_stiefel and (return_preproj or args.use_latent_bottleneck):
+            h_t, z_t = network_apply(
+                params["network"],
+                obs,
+                return_preproj=True,
+            )
+        elif is_cnn and (return_pre_tanh or return_preproj):
+            h_t = network_apply(
+                params["network"],
+                obs,
+                return_pre_tanh=True,
+            )
+            z_t = jnp.tanh(h_t)
+        else:
+            h_t = network_apply(params["network"], obs)
+            z_t = h_t
+
+        if args.use_latent_bottleneck:
+            z_t = bottleneck.apply(params["bottleneck"], h_t)
+
+        return h_t, z_t
+
+    def actor_critic_input(params, obs):
+        _, features = encode_features(params, obs)
+        return features
 
     @jax.jit
     def get_action_and_value(
@@ -986,15 +1928,15 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """Sample action, calculate value, logprob, and return updated key."""
-        hidden = network.apply(agent_state.params["network"], next_obs)
-        actor_mean, actor_logstd = actor.apply(agent_state.params["actor"], hidden)
+        features = actor_critic_input(agent_state.params, next_obs)
+        actor_mean, actor_logstd = actor.apply(agent_state.params["actor"], features)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         key, subkey = jax.random.split(key)
         action = pi.sample(seed=subkey)
         logprob = pi.log_prob(action)
-        value = critic.apply(agent_state.params["critic"], hidden)
+        value = critic.apply(agent_state.params["critic"], features)
 
         action = jnp.clip(action, -args.max_action, args.max_action)
 
@@ -1007,14 +1949,14 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """Calculate value, logprob of supplied action, and entropy."""
-        hidden = network.apply(params["network"], x)
-        actor_mean, actor_logstd = actor.apply(params["actor"], hidden)
+        features = actor_critic_input(params, x)
+        actor_mean, actor_logstd = actor.apply(params["actor"], features)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
-        value = critic.apply(params["critic"], hidden).squeeze(-1)
+        value = critic.apply(params["critic"], features).squeeze(-1)
 
         return logprob, entropy, value
 
@@ -1038,7 +1980,7 @@ if __name__ == "__main__":
     ):
         next_value = critic.apply(
             agent_state.params["critic"],
-            network.apply(agent_state.params["network"], next_obs),
+            actor_critic_input(agent_state.params, next_obs),
         ).squeeze(-1)
 
         advantages = jnp.zeros((args.n_envs,))
@@ -1056,7 +1998,7 @@ if __name__ == "__main__":
         )
         return storage
 
-    def ppo_loss(
+    def ppo_objective_loss(
         params,
         x,
         a,
@@ -1065,11 +2007,9 @@ if __name__ == "__main__":
         mb_returns,
         mb_values,
         aug_key,
+        *_unused,
     ):
-        """PPO loss function."""
-        if args.use_augmentation:
-            x = random_shift(aug_key, x, pad=args.augment_pad)
-
+        """Pure PPO objective without auxiliary losses."""
         newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
@@ -1091,27 +2031,208 @@ if __name__ == "__main__":
             v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
         entropy_loss = entropy.mean()
-        total_loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-        return total_loss, (
+        ppo_only_loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+        return ppo_only_loss, (
             pg_loss,
             v_loss,
             entropy_loss,
             jax.lax.stop_gradient(approx_kl),
         )
 
+    def lejepa_raw_loss(
+        params,
+        orig_x,
+        step_idx,
+        env_idx,
+        rollout_obs,
+        rollout_dones,
+        mask_key,
+    ):
+        """Raw LeJEPA loss before outer coefficient scaling."""
+        if not args.lejepa:
+            return (
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+            )
+        return compute_lejepa_loss(
+            params,
+            orig_x,
+            mask_key,
+            rollout_obs,
+            rollout_dones,
+            step_idx,
+            env_idx,
+        )
+
+    def maybe_augment_obs(obs, aug_key):
+        return random_shift(aug_key, obs, pad=args.augment_pad) if args.use_augmentation else obs
+
+    def ppo_loss(
+        params,
+        x,
+        a,
+        logp,
+        mb_advantages,
+        mb_returns,
+        mb_values,
+        aug_key,
+        step_idx,
+        env_idx,
+        rollout_obs,
+        rollout_dones,
+        target_params=None,
+        mask_key=None,
+        mim_lambda=jnp.float32(0.0),
+        lejepa_aux_coef=jnp.float32(0.0),
+        latent_dyn_coef_active=jnp.float32(0.0),
+        cnn_sigreg_coef_active=jnp.float32(0.0),
+        mb_next_obs=None,
+        mb_next_dones=None,
+        cnn_sigreg_key=None,
+    ):
+        """PPO loss function with optional MIM-JEPA and LeJEPA auxiliaries."""
+        orig_x = x
+        ppo_x = maybe_augment_obs(x, aug_key)
+        ppo_only_loss, (
+            pg_loss,
+            v_loss,
+            entropy_loss,
+            approx_kl,
+        ) = ppo_objective_loss(
+            params,
+            ppo_x,
+            a,
+            logp,
+            mb_advantages,
+            mb_returns,
+            mb_values,
+            aug_key,
+        )
+        total_loss = ppo_only_loss
+
+        if args.mim_jepa:
+            mim_loss = compute_mim_jepa_loss(params, target_params, ppo_x, mask_key)
+            total_loss = total_loss + mim_lambda * mim_loss
+        else:
+            mim_loss = jnp.float32(0.0)
+
+        if args.lejepa:
+            lejepa_loss_raw, lejepa_sim_loss, lejepa_sigreg_loss = lejepa_raw_loss(
+                params,
+                orig_x,
+                step_idx,
+                env_idx,
+                rollout_obs,
+                rollout_dones,
+                mask_key,
+            )
+            lejepa_loss = lejepa_aux_coef * lejepa_loss_raw
+            total_loss = total_loss + lejepa_loss
+        else:
+            lejepa_loss_raw = jnp.float32(0.0)
+            lejepa_loss = jnp.float32(0.0)
+            lejepa_sim_loss = jnp.float32(0.0)
+            lejepa_sigreg_loss = jnp.float32(0.0)
+
+        if latent_auxiliary_enabled() or args.use_latent_dynamics:
+            (
+                z_t,
+                latent_dyn_loss_raw,
+                latent_cov_loss,
+                latent_var_loss,
+                latent_whiten_loss_val,
+                latent_subspace_loss,
+                latent_cnn_sigreg_loss_raw,
+            ) = compute_latent_losses(
+                params,
+                orig_x,
+                a,
+                cnn_sigreg_key,
+                mb_next_obs,
+                mb_next_dones,
+            )
+            latent_dyn_loss = latent_dyn_coef_active * latent_dyn_loss_raw
+            latent_cnn_sigreg_loss = cnn_sigreg_coef_active * latent_cnn_sigreg_loss_raw
+            if args.use_latent_dynamics:
+                total_loss = total_loss + latent_dyn_loss
+            if args.cnn_sigreg_coef > 0.0:
+                total_loss = total_loss + latent_cnn_sigreg_loss
+            if args.latent_cov_coef > 0.0:
+                total_loss = total_loss + args.latent_cov_coef * latent_cov_loss
+            if args.latent_var_coef > 0.0:
+                total_loss = total_loss + args.latent_var_coef * latent_var_loss
+            if args.latent_whiten_coef > 0.0:
+                total_loss = total_loss + args.latent_whiten_coef * latent_whiten_loss_val
+            if args.latent_subspace_coef > 0.0:
+                total_loss = total_loss + args.latent_subspace_coef * latent_subspace_loss
+        else:
+                latent_dyn_loss = jnp.float32(0.0)
+                latent_dyn_loss_raw = jnp.float32(0.0)
+                latent_cov_loss = jnp.float32(0.0)
+                latent_var_loss = jnp.float32(0.0)
+                latent_whiten_loss_val = jnp.float32(0.0)
+                latent_subspace_loss = jnp.float32(0.0)
+                latent_cnn_sigreg_loss = jnp.float32(0.0)
+                latent_cnn_sigreg_loss_raw = jnp.float32(0.0)
+
+        return total_loss, (
+            ppo_only_loss,
+            pg_loss,
+            v_loss,
+            entropy_loss,
+            mim_loss,
+            lejepa_loss,
+            lejepa_loss_raw,
+            lejepa_sim_loss,
+            lejepa_sigreg_loss,
+            latent_dyn_loss,
+            latent_dyn_loss_raw,
+            latent_cov_loss,
+            latent_var_loss,
+            latent_whiten_loss_val,
+            latent_subspace_loss,
+            latent_cnn_sigreg_loss,
+            latent_cnn_sigreg_loss_raw,
+            jax.lax.stop_gradient(approx_kl),
+        )
+
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+    ppo_only_grad_fn = jax.grad(
+        lambda params, x, a, logp, mb_advantages, mb_returns, mb_values, aug_key:
+        ppo_objective_loss(
+            params, x, a, logp, mb_advantages, mb_returns, mb_values, aug_key
+        )[0]
+    )
+    lejepa_raw_grad_fn = jax.grad(
+        lambda params, orig_x, step_idx, env_idx, rollout_obs, rollout_dones, mask_key:
+        lejepa_raw_loss(
+            params, orig_x, step_idx, env_idx, rollout_obs, rollout_dones, mask_key
+        )[0]
+    )
+    latent_dyn_grad_fn = jax.grad(
+        lambda params, obs, actions, next_obs, next_dones, latent_dyn_coef_active:
+        latent_dyn_coef_active * compute_latent_losses(
+            params, obs, actions, None, next_obs, next_dones, include_cnn_sigreg=False
+        )[1]
+    )
 
     @jax.jit
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
+        target_params=None,
+        mim_lambda: jnp.ndarray = jnp.float32(0.0),
+        lejepa_aux_coef: jnp.ndarray = jnp.float32(0.0),
+        latent_dyn_coef_active: jnp.ndarray = jnp.float32(0.0),
+        cnn_sigreg_coef_active: jnp.ndarray = jnp.float32(0.0),
+        compute_latent_grad_alignment: jnp.ndarray = jnp.array(False),
     ):
-        """PPO update."""
+        """PPO update, optionally with MIM-JEPA auxiliary loss."""
         def update_epoch(carry, unused_inp):
             agent_state, key, last_grads = carry
-            key, subkey, aug_key = jax.random.split(key, 3)
+            key, subkey, aug_key, mim_key, cnn_sigreg_key = jax.random.split(key, 5)
 
             def flatten(x):
                 return x.reshape((-1,) + x.shape[2:])
@@ -1125,17 +2246,33 @@ if __name__ == "__main__":
             shuffled_storage = jax.tree_util.tree_map(convert_data, flatten_storage)
 
             aug_keys = jax.random.split(aug_key, args.num_minibatches)
+            mim_keys = jax.random.split(mim_key, args.num_minibatches)
+            cnn_sigreg_keys = jax.random.split(cnn_sigreg_key, args.num_minibatches)
 
             def update_minibatch(carry, inputs):
                 agent_state, _ = carry
-                minibatch, mb_aug_key = inputs
+                minibatch, mb_aug_key, mb_mim_key, mb_cnn_sigreg_key = inputs
 
                 (
                     loss,
                     (
+                        ppo_only_loss,
                         pg_loss,
                         v_loss,
                         entropy_loss,
+                        mim_loss,
+                        lejepa_loss,
+                        lejepa_loss_raw,
+                        lejepa_sim_loss,
+                        lejepa_sigreg_loss,
+                        latent_dyn_loss,
+                        latent_dyn_loss_raw,
+                        latent_cov_loss,
+                        latent_var_loss,
+                        latent_whiten_loss_val,
+                        latent_subspace_loss,
+                        latent_cnn_sigreg_loss,
+                        latent_cnn_sigreg_loss_raw,
                         approx_kl,
                     ),
                 ), grads = ppo_loss_grad_fn(
@@ -1147,42 +2284,206 @@ if __name__ == "__main__":
                     minibatch.returns,
                     minibatch.values,
                     mb_aug_key,
+                    minibatch.step_idx,
+                    minibatch.env_idx,
+                    storage.obs,
+                    storage.dones,
+                    target_params,
+                    mb_mim_key,
+                    mim_lambda,
+                    lejepa_aux_coef,
+                    latent_dyn_coef_active,
+                    cnn_sigreg_coef_active,
+                    minibatch.next_obs,
+                    minibatch.next_dones,
+                    mb_cnn_sigreg_key,
                 )
 
                 grad_norm = optax.global_norm(grads)
+                should_compute_alignment = (
+                    compute_latent_grad_alignment
+                    & jnp.asarray(latent_path_is_active())
+                    & jnp.asarray(args.use_latent_dynamics)
+                )
+
+                def compute_alignment_metrics(_):
+                    ppo_encoder_grads_full = ppo_only_grad_fn(
+                        agent_state.params,
+                        maybe_augment_obs(minibatch.obs, mb_aug_key),
+                        minibatch.actions,
+                        minibatch.logprobs,
+                        minibatch.advantages,
+                        minibatch.returns,
+                        minibatch.values,
+                        mb_aug_key,
+                    )
+                    ppo_encoder_grads = latent_param_tree(
+                        ppo_encoder_grads_full, args.use_latent_bottleneck
+                    )
+                    latent_dyn_grads_full = latent_dyn_grad_fn(
+                        agent_state.params,
+                        minibatch.obs,
+                        minibatch.actions,
+                        minibatch.next_obs,
+                        minibatch.next_dones,
+                        latent_dyn_coef_active,
+                    )
+                    latent_dyn_grads = latent_param_tree(
+                        latent_dyn_grads_full, args.use_latent_bottleneck
+                    )
+                    encoder_ppo_norm = tree_norm(ppo_encoder_grads)
+                    encoder_latent_dyn_norm = tree_norm(latent_dyn_grads)
+                    cosine_denom = encoder_ppo_norm * encoder_latent_dyn_norm
+                    encoder_latent_dyn_cosine = jnp.where(
+                        cosine_denom > 0,
+                        tree_dot(ppo_encoder_grads, latent_dyn_grads) / (cosine_denom + 1e-8),
+                        0.0,
+                    )
+                    return (
+                        encoder_ppo_norm,
+                        encoder_latent_dyn_norm,
+                        encoder_latent_dyn_cosine,
+                    )
+
+                encoder_ppo_norm, encoder_latent_dyn_norm, encoder_latent_dyn_cosine = jax.lax.cond(
+                    should_compute_alignment,
+                    compute_alignment_metrics,
+                    lambda _: (
+                        jnp.float32(0.0),
+                        jnp.float32(0.0),
+                        jnp.float32(0.0),
+                    ),
+                    operand=None,
+                )
+                if args.lejepa:
+                    lejepa_encoder_grads = lejepa_raw_grad_fn(
+                        agent_state.params,
+                        minibatch.obs,
+                        minibatch.step_idx,
+                        minibatch.env_idx,
+                        storage.obs,
+                        storage.dones,
+                        mb_mim_key,
+                    )
+                    lejepa_encoder_grads = latent_param_tree(
+                        lejepa_encoder_grads, False
+                    )["network"]
+                    encoder_lejepa_norm = tree_norm(lejepa_encoder_grads)
+                    ppo_network_grads = ppo_only_grad_fn(
+                        agent_state.params,
+                        maybe_augment_obs(minibatch.obs, mb_aug_key),
+                        minibatch.actions,
+                        minibatch.logprobs,
+                        minibatch.advantages,
+                        minibatch.returns,
+                        minibatch.values,
+                        mb_aug_key,
+                    )["network"]
+                    ppo_network_norm = tree_norm(ppo_network_grads)
+                    encoder_ppo_norm = jnp.where(
+                        should_compute_alignment,
+                        encoder_ppo_norm,
+                        ppo_network_norm,
+                    )
+                    cosine_denom = ppo_network_norm * encoder_lejepa_norm
+                    encoder_grad_cosine = jnp.where(
+                        cosine_denom > 0,
+                        tree_dot(ppo_network_grads, lejepa_encoder_grads) / (cosine_denom + 1e-8),
+                        0.0,
+                    )
+                else:
+                    encoder_lejepa_norm = jnp.float32(0.0)
+                    encoder_grad_cosine = jnp.float32(0.0)
                 agent_state = agent_state.apply_gradients(grads=grads)
 
                 return (agent_state, grads), (
                     loss,
+                    ppo_only_loss,
                     pg_loss,
                     v_loss,
                     entropy_loss,
+                    mim_loss,
+                    lejepa_loss,
+                    lejepa_loss_raw,
+                    lejepa_sim_loss,
+                    lejepa_sigreg_loss,
+                    latent_dyn_loss,
+                    latent_dyn_loss_raw,
+                    latent_cov_loss,
+                    latent_var_loss,
+                    latent_whiten_loss_val,
+                    latent_subspace_loss,
+                    latent_cnn_sigreg_loss,
+                    latent_cnn_sigreg_loss_raw,
                     approx_kl,
                     grad_norm,
+                    encoder_ppo_norm,
+                    encoder_latent_dyn_norm,
+                    encoder_latent_dyn_cosine,
+                    encoder_lejepa_norm,
+                    encoder_grad_cosine,
                 )
 
             (
                 (agent_state, last_grads),
                 (
                     loss,
+                    ppo_only_loss,
                     pg_loss,
                     v_loss,
                     entropy_loss,
+                    mim_loss,
+                    lejepa_loss,
+                    lejepa_loss_raw,
+                    lejepa_sim_loss,
+                    lejepa_sigreg_loss,
+                    latent_dyn_loss,
+                    latent_dyn_loss_raw,
+                    latent_cov_loss,
+                    latent_var_loss,
+                    latent_whiten_loss_val,
+                    latent_subspace_loss,
+                    latent_cnn_sigreg_loss,
+                    latent_cnn_sigreg_loss_raw,
                     approx_kl,
                     grad_norm,
+                    encoder_ppo_norm,
+                    encoder_latent_dyn_norm,
+                    encoder_latent_dyn_cosine,
+                    encoder_lejepa_norm,
+                    encoder_grad_cosine,
                 ),
             ) = jax.lax.scan(
                 update_minibatch,
                 (agent_state, last_grads),
-                (shuffled_storage, aug_keys),
+                (shuffled_storage, aug_keys, mim_keys, cnn_sigreg_keys),
             )
             return (agent_state, key, last_grads), (
                 loss,
+                ppo_only_loss,
                 pg_loss,
                 v_loss,
                 entropy_loss,
+                mim_loss,
+                lejepa_loss,
+                lejepa_loss_raw,
+                lejepa_sim_loss,
+                lejepa_sigreg_loss,
+                latent_dyn_loss,
+                latent_dyn_loss_raw,
+                latent_cov_loss,
+                latent_var_loss,
+                latent_whiten_loss_val,
+                latent_subspace_loss,
+                latent_cnn_sigreg_loss,
+                latent_cnn_sigreg_loss_raw,
                 approx_kl,
                 grad_norm,
+                encoder_ppo_norm,
+                encoder_latent_dyn_norm,
+                encoder_latent_dyn_cosine,
+                encoder_lejepa_norm,
+                encoder_grad_cosine,
             )
 
         init_grads = jax.tree_util.tree_map(jnp.zeros_like, agent_state.params)
@@ -1190,11 +2491,30 @@ if __name__ == "__main__":
             (agent_state, key, final_grads),
             (
                 loss,
+                ppo_only_loss,
                 pg_loss,
                 v_loss,
                 entropy_loss,
+                mim_loss,
+                lejepa_loss,
+                lejepa_loss_raw,
+                lejepa_sim_loss,
+                lejepa_sigreg_loss,
+                latent_dyn_loss,
+                latent_dyn_loss_raw,
+                latent_cov_loss,
+                latent_var_loss,
+                latent_whiten_loss_val,
+                latent_subspace_loss,
+                latent_cnn_sigreg_loss,
+                latent_cnn_sigreg_loss_raw,
                 approx_kl,
                 grad_norm,
+                encoder_ppo_norm,
+                encoder_latent_dyn_norm,
+                encoder_latent_dyn_cosine,
+                encoder_lejepa_norm,
+                encoder_grad_cosine,
             ),
         ) = jax.lax.scan(
             update_epoch,
@@ -1205,11 +2525,30 @@ if __name__ == "__main__":
         return (
             agent_state,
             loss,
+            ppo_only_loss,
             pg_loss,
             v_loss,
             entropy_loss,
+            mim_loss,
+            lejepa_loss,
+            lejepa_loss_raw,
+            lejepa_sim_loss,
+            lejepa_sigreg_loss,
+            latent_dyn_loss,
+            latent_dyn_loss_raw,
+            latent_cov_loss,
+            latent_var_loss,
+            latent_whiten_loss_val,
+            latent_subspace_loss,
+            latent_cnn_sigreg_loss,
+            latent_cnn_sigreg_loss_raw,
             approx_kl,
             grad_norm,
+            encoder_ppo_norm,
+            encoder_latent_dyn_norm,
+            encoder_latent_dyn_cosine,
+            encoder_lejepa_norm,
+            encoder_grad_cosine,
             final_grads,
             key,
         )
@@ -1270,10 +2609,14 @@ if __name__ == "__main__":
             actions=action,
             logprobs=logprob,
             dones=done,
+            step_idx=jnp.full((args.n_envs,), step, dtype=jnp.int32),
+            env_idx=jnp.arange(args.n_envs, dtype=jnp.int32),
             values=value,
             rewards=reward,
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
+            next_obs=next_obs_local,
+            next_dones=next_done_local,
         )
         return (
             agent_state,
@@ -1346,6 +2689,8 @@ if __name__ == "__main__":
         probe_init_metrics = run_online_probe(
             network=network,
             network_params=agent_state.params["network"],
+            bottleneck=bottleneck if args.use_latent_bottleneck else None,
+            bottleneck_params=agent_state.params.get("bottleneck") if args.use_latent_bottleneck else None,
             envs=envs,
             args_dict=vars(args),
             n_eval_envs=args.n_envs,
@@ -1392,21 +2737,107 @@ if __name__ == "__main__":
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
 
+        # Compute MIM-JEPA lambda with warmup + linear ramp-up
+        if args.mim_jepa:
+            mim_lambda_current = ramped_aux_coef(
+                iteration,
+                args.mim_jepa_lambda,
+                args.mim_jepa_warmup_updates,
+                args.mim_jepa_rampup_updates,
+            )
+            mim_lambda_jax = jnp.float32(mim_lambda_current)
+        else:
+            mim_lambda_jax = jnp.float32(0.0)
+
+        if args.lejepa:
+            lejepa_aux_coef_current = ramped_aux_coef(
+                iteration,
+                args.lejepa_aux_coef,
+                args.lejepa_warmup_updates,
+                args.lejepa_rampup_updates,
+            )
+            lejepa_aux_coef_jax = jnp.float32(lejepa_aux_coef_current)
+        else:
+            lejepa_aux_coef_current = 0.0
+            lejepa_aux_coef_jax = jnp.float32(0.0)
+
+        if args.use_latent_dynamics:
+            latent_dyn_coef_current = ramped_aux_coef(
+                iteration,
+                args.latent_dyn_coef,
+                args.latent_dyn_warmup_updates,
+                args.latent_dyn_rampup_updates,
+            )
+            latent_dyn_coef_jax = jnp.float32(latent_dyn_coef_current)
+        else:
+            latent_dyn_coef_current = 0.0
+            latent_dyn_coef_jax = jnp.float32(0.0)
+        if args.cnn_sigreg_coef > 0.0 and args.encoder_type.lower() == "cnn":
+            cnn_sigreg_coef_current = ramped_aux_coef(
+                iteration,
+                args.cnn_sigreg_coef,
+                args.cnn_sigreg_warmup_updates,
+                args.cnn_sigreg_rampup_updates,
+            )
+            cnn_sigreg_coef_jax = jnp.float32(cnn_sigreg_coef_current)
+        else:
+            cnn_sigreg_coef_current = 0.0
+            cnn_sigreg_coef_jax = jnp.float32(0.0)
+        compute_latent_grad_alignment = (
+            args.log_latent_grad_alignment
+            and args.use_latent_dynamics
+            and (iteration % args.latent_grad_alignment_interval == 0)
+        )
+
         (
             agent_state,
             loss,
+            ppo_only_loss,
             pg_loss,
             v_loss,
             entropy_loss,
+            mim_loss,
+            lejepa_loss,
+            lejepa_loss_raw,
+            lejepa_sim_loss,
+            lejepa_sigreg_loss,
+            latent_dyn_loss,
+            latent_dyn_loss_raw,
+            latent_cov_loss,
+            latent_var_loss,
+            latent_whiten_loss_val,
+            latent_subspace_loss,
+            latent_cnn_sigreg_loss,
+            latent_cnn_sigreg_loss_raw,
             approx_kl,
             grad_norm,
+            encoder_ppo_norm,
+            encoder_latent_dyn_norm,
+            encoder_latent_dyn_cosine,
+            encoder_lejepa_norm,
+            encoder_grad_cosine,
             final_grads,
             key,
         ) = update_ppo(
             agent_state,
             storage,
             key,
+            target_params=target_params,
+            mim_lambda=mim_lambda_jax,
+            lejepa_aux_coef=lejepa_aux_coef_jax,
+            latent_dyn_coef_active=latent_dyn_coef_jax,
+            cnn_sigreg_coef_active=cnn_sigreg_coef_jax,
+            compute_latent_grad_alignment=jnp.array(compute_latent_grad_alignment),
         )
+
+        # EMA update of target encoder (after optimizer step)
+        if args.mim_jepa:
+            tau = args.mim_jepa_ema_tau
+            target_params = jax.tree_util.tree_map(
+                lambda t, o: tau * t + (1.0 - tau) * o,
+                target_params,
+                agent_state.params["network"],
+            )
 
         # Online linear probe — fire when global_step crosses the next threshold.
         # Using >= avoids the LCM cadence problem that % would cause when
@@ -1417,6 +2848,8 @@ if __name__ == "__main__":
             probe_metrics = run_online_probe(
                 network=network,
                 network_params=agent_state.params["network"],
+                bottleneck=bottleneck if args.use_latent_bottleneck else None,
+                bottleneck_params=agent_state.params.get("bottleneck") if args.use_latent_bottleneck else None,
                 envs=envs,
                 args_dict=vars(args),
                 n_eval_envs=args.n_envs,
@@ -1493,22 +2926,80 @@ if __name__ == "__main__":
                     ),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
+                    "losses/ppo_only_loss": ppo_only_loss[-1, -1].item(),
                     "losses/value_loss": v_loss[-1, -1].item(),
                     "losses/policy_loss": pg_loss[-1, -1].item(),
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/grad_norm": grad_norm[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
+                    "charts/latent_dim": float(args.stiefel_latent_dim if args.encoder_type.lower() == "stiefel_cnn" else (args.latent_dim if args.use_latent_bottleneck else 0)),
+                    "charts/latent_dyn_coef_active": float(latent_dyn_coef_current),
+                    "charts/cnn_sigreg_coef_active": float(cnn_sigreg_coef_current),
                 }
+                if args.mim_jepa:
+                    log_dict["losses/mim_jepa_loss"] = mim_loss[-1, -1].item()
+                    log_dict["charts/mim_jepa_lambda"] = float(mim_lambda_current)
+                    log_dict["charts/mim_jepa_ema_tau"] = float(args.mim_jepa_ema_tau)
+                    log_dict["charts/mim_jepa_mask_type"] = 1.0
+                if args.lejepa:
+                    log_dict["losses/lejepa_loss"] = lejepa_loss[-1, -1].item()
+                    log_dict["losses/lejepa_loss_raw"] = lejepa_loss_raw[-1, -1].item()
+                    log_dict["losses/lejepa_sim_loss"] = lejepa_sim_loss[-1, -1].item()
+                    log_dict["losses/lejepa_sigreg_loss"] = lejepa_sigreg_loss[-1, -1].item()
+                    log_dict["charts/lejepa_lambda"] = float(args.lejepa_lambda)
+                    log_dict["charts/lejepa_aux_coef_active"] = float(lejepa_aux_coef_current)
+                    log_dict["grads/encoder_ppo_norm"] = encoder_ppo_norm[-1, -1].item()
+                    log_dict["grads/encoder_lejepa_norm"] = encoder_lejepa_norm[-1, -1].item()
+                    log_dict["grads/encoder_ppo_lejepa_cosine"] = encoder_grad_cosine[-1, -1].item()
+                if args.cnn_sigreg_coef > 0.0:
+                    log_dict["losses/cnn_sigreg_loss"] = latent_cnn_sigreg_loss[-1, -1].item()
+                    log_dict["losses/cnn_sigreg_loss_raw"] = latent_cnn_sigreg_loss_raw[-1, -1].item()
+                    log_dict["losses/cnn_sigreg_coef"] = float(cnn_sigreg_coef_current)
+                if latent_path_is_active():
+                    log_dict["losses/latent_dyn"] = latent_dyn_loss_raw[-1, -1].item()
+                    log_dict["losses/latent_cov"] = latent_cov_loss[-1, -1].item()
+                    log_dict["losses/latent_var"] = latent_var_loss[-1, -1].item()
+                    log_dict["losses/latent_whiten"] = latent_whiten_loss_val[-1, -1].item()
+                    log_dict["losses/latent_subspace"] = latent_subspace_loss[-1, -1].item()
+                    if compute_latent_grad_alignment:
+                        log_dict["grads/encoder_ppo_norm"] = encoder_ppo_norm[-1, -1].item()
+                        log_dict["grads/encoder_latent_dyn_norm"] = encoder_latent_dyn_norm[-1, -1].item()
+                        log_dict["grads/encoder_ppo_latent_dyn_cosine"] = (
+                            encoder_latent_dyn_cosine[-1, -1].item()
+                        )
+                if args.encoder_type.lower() == "scott":
+                    log_dict["charts/scott_num_patches"] = float(scott_num_patches)
+                    log_dict["charts/scott_grid_size"] = float(scott_grid_size)
+                if "latent_transition" in agent_state.params:
+                    log_dict.update(latent_transition_matrix_metrics(agent_state.params["latent_transition"]))
 
-                # Debug metrics for encoder representations
-                if args.debug_repr:
+                sample_obs = None
+                hidden = None
+                if latent_path_is_active() or args.debug_repr:
                     sample_obs = storage.obs[0, :256]
                     hidden = network.apply(agent_state.params["network"], sample_obs)
 
+                if latent_path_is_active():
+                    if args.encoder_type.lower() == "stiefel_cnn":
+                        latent_z = hidden
+                    else:
+                        latent_z = bottleneck.apply(agent_state.params["bottleneck"], hidden)
+                    latent_metrics = encoder_repr_metrics(latent_z, prefix="latent")
+                    for k, v in latent_metrics.items():
+                        log_dict[k] = float(v)
+
+                # Debug metrics for encoder representations
+                if args.debug_repr:
                     repr_metrics = encoder_repr_metrics(hidden)
                     for k, v in repr_metrics.items():
                         log_dict[k] = float(v)
+
+                    if args.lejepa:
+                        proj_hidden = lejepa_head.apply(agent_state.params["lejepa_head"], hidden)
+                        proj_metrics = encoder_repr_metrics(proj_hidden)
+                        for k, v in proj_metrics.items():
+                            log_dict[f"lejepa/{k.split('/', 1)[1]}"] = float(v)
 
                     grad_metrics = compute_grad_norms(final_grads)
                     for k, v in grad_metrics.items():

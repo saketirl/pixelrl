@@ -6,7 +6,7 @@ that predicts true simulator state.
 
 Usage (importable):
     from linear_probe import run_online_probe
-    metrics = run_online_probe(network, network_params, envs, vars(args))
+    metrics = run_online_probe(network, network_params, envs, vars(args), bottleneck=None, bottleneck_params=None)
 """
 
 import os
@@ -71,10 +71,13 @@ class FrameStack:
 # JIT-compiled encoder (stop_gradient on output)
 # --------------------------------------------------------
 
-def _make_encode_fn(network):
+def _make_encode_fn(network, bottleneck=None):
     @jax.jit
-    def _encode(params, obs):
-        return jax.lax.stop_gradient(network.apply(params, obs))
+    def _encode(network_params, bottleneck_params, obs):
+        features = network.apply(network_params, obs)
+        if bottleneck is not None and bottleneck_params is not None:
+            features = bottleneck.apply(bottleneck_params, features)
+        return jax.lax.stop_gradient(features)
     return _encode
 
 
@@ -89,6 +92,8 @@ def collect_probe_data(
     args_dict: dict,
     n_eval_steps: int,
     seed: int,
+    bottleneck=None,
+    bottleneck_params=None,
 ):
     """
     Run a random-action rollout and collect (features, low_dim_state) pairs.
@@ -104,7 +109,7 @@ def collect_probe_data(
     frame_stack_n = args_dict["frame_stack"]
     max_action = args_dict.get("max_action", 1.0)
 
-    encode_fn = _make_encode_fn(network)
+    encode_fn = _make_encode_fn(network, bottleneck=bottleneck)
 
     key = jax.random.PRNGKey(seed)
     key, reset_key = jax.random.split(key)
@@ -127,7 +132,7 @@ def collect_probe_data(
         action_dim = envs.env.action_size
 
     for _ in range(n_eval_steps):
-        features = encode_fn(network_params, obs)   # (n_envs, feat_dim) — on device
+        features = encode_fn(network_params, bottleneck_params, obs)   # (n_envs, feat_dim) — on device
         state_vec = env_state.obs                   # (n_envs, state_dim) — on device, this is the downstairs state vector
 
         all_features.append(features)
@@ -257,6 +262,34 @@ def decoder_svd_analysis(A: np.ndarray, X_train: np.ndarray, state_dim: int):
         avg_offdiag = 0.0
 
     return sv_ratio, avg_offdiag, sv, corr
+
+
+def _decoder_condition_metrics(A: np.ndarray) -> dict:
+    if A.ndim == 1:
+        A = A[:, None]
+
+    if A.size == 0:
+        return {
+            "probe/decoder_condition_number": 0.0,
+            "probe/decoder_sigma_max": 0.0,
+            "probe/decoder_sigma_min": 0.0,
+        }
+
+    sv = np.linalg.svd(A, full_matrices=False, compute_uv=False)
+    if sv.size == 0:
+        sigma_max = 0.0
+        sigma_min = 0.0
+        cond = 0.0
+    else:
+        sigma_max = float(sv[0])
+        sigma_min = float(sv[-1])
+        cond = float(sigma_max / (sigma_min + 1e-12))
+
+    return {
+        "probe/decoder_condition_number": float(cond),
+        "probe/decoder_sigma_max": float(sigma_max),
+        "probe/decoder_sigma_min": float(sigma_min),
+    }
 
 
 # --------------------------------------------------------
@@ -607,6 +640,8 @@ def run_online_probe(
     seed: int = 42,
     train_frac: float = 0.8,
     output_dir: str = None,
+    bottleneck=None,
+    bottleneck_params=None,
 ) -> dict:
     """
     Run full probe analysis on a frozen encoder.
@@ -624,6 +659,8 @@ def run_online_probe(
     features_np, states_np = collect_probe_data(
         network=network,
         network_params=network_params,
+        bottleneck=bottleneck,
+        bottleneck_params=bottleneck_params,
         envs=envs,
         args_dict=args_dict,
         n_eval_steps=n_eval_steps,
@@ -670,6 +707,7 @@ def run_online_probe(
         A_full, X_train, state_dim
     )
     print(f"[probe] decoder_sv_ratio={sv_ratio:.4f}, avg_offdiag_corr={avg_offdiag_corr:.4f}")
+    decoder_condition_metrics = _decoder_condition_metrics(A_full)
 
     # 6. Additive component decomposition probe (reuses same collected data)
     additive_metrics = run_additive_probe(
@@ -708,5 +746,6 @@ def run_online_probe(
         "probe/r2_at_state_dim": float(r2_at_state_dim),
         "probe/decoder_sv_ratio": float(sv_ratio),
         "probe/avg_offdiag_corr": float(avg_offdiag_corr),
+        **decoder_condition_metrics,
         **additive_metrics,
     }
