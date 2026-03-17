@@ -182,6 +182,7 @@ run_data/*
 #wandb
 wandb/
 *.json
+lqr_ac_compare/Stiefel_Ascent_RLC.pdf
 
 # secrets
 secrets/
