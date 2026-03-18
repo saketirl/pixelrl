@@ -492,6 +492,175 @@ class CNNEncoder(nn.Module):
         return hidden
 
 
+
+class CRATEFeedForward(nn.Module):
+    """CRATE-style FeedForward layer implementing an ISTA step."""
+
+    dim: int
+    step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        weight = self.param(
+            "weight",
+            nn.initializers.kaiming_uniform(),
+            (self.dim, self.dim),
+        )
+        x1 = x @ weight.T
+        grad_1 = x1 @ weight
+        grad_2 = x @ weight
+        grad_update = self.step_size * (grad_2 - grad_1)
+        return nn.swish(x + grad_update)
+
+
+class ProjectedSIGRegCNNEncoder(nn.Module):
+    """CNN encoder with optional CRATE block before a learned projector."""
+
+    tanh_scale: float = 0.5
+    proj_dim: int = 64
+    use_crate_block: bool = False
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        dense_pre_ln = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        z_raw = nn.LayerNorm()(dense_pre_ln)
+        z_raw = nn.tanh(self.tanh_scale * z_raw)
+
+        z_structured = z_raw
+        if self.use_crate_block:
+            z_structured = CRATEFeedForward(
+                dim=512,
+                step_size=self.crate_step_size,
+                name="crate_block",
+            )(z_structured)
+
+        projector_pre_ln = nn.Dense(
+            self.proj_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="projector",
+        )(z_structured)
+        u = nn.LayerNorm(name="projector_ln")(projector_pre_ln)
+
+        if return_intermediates:
+            return {
+                "hidden": u,
+                "dense_pre_ln": dense_pre_ln,
+                "z_raw": z_raw,
+                "z_structured": z_structured,
+                "projector_pre_ln": projector_pre_ln,
+                "u": u,
+            }
+        return u
+
+
+class InnovationCNNEncoder(nn.Module):
+    """Default CNN encoder with an auxiliary innovation projector branch."""
+
+    tanh_scale: float = 0.5
+    innovation_proj_dim: int = 64
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        hidden = nn.LayerNorm()(dense_pre_ln)
+        hidden = nn.tanh(self.tanh_scale * hidden)
+
+        projector_pre_ln = nn.Dense(
+            self.innovation_proj_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="innovation_projector",
+        )(hidden)
+        u = nn.LayerNorm(name="innovation_projector_ln")(projector_pre_ln)
+
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "dense_pre_ln": dense_pre_ln,
+                "u": u,
+                "projector_pre_ln": projector_pre_ln,
+            }
+        return hidden
+
+
 class MLPEncoder(nn.Module):
     """MLP encoder baseline for flattened pixel observations."""
 
@@ -513,15 +682,32 @@ class MLPEncoder(nn.Module):
         return x
 
 
+
 def build_encoder(
     encoder_type: str,
     tanh_scale: float = 0.5,
     vit_config: Optional[ViTConfig] = None,
+    sigreg_proj_dim: int = 64,
+    innovation_proj_dim: int = 64,
+    use_crate_block: bool = False,
+    crate_step_size: float = 0.1,
 ) -> nn.Module:
     """Build an encoder module by name."""
     kind = encoder_type.lower()
     if kind == "cnn":
         return CNNEncoder(tanh_scale=tanh_scale)
+    if kind == "sigreg_cnn":
+        return ProjectedSIGRegCNNEncoder(
+            tanh_scale=tanh_scale,
+            proj_dim=sigreg_proj_dim,
+            use_crate_block=use_crate_block,
+            crate_step_size=crate_step_size,
+        )
+    if kind == "innovation_cnn":
+        return InnovationCNNEncoder(
+            tanh_scale=tanh_scale,
+            innovation_proj_dim=innovation_proj_dim,
+        )
     if kind == "mlp":
         return MLPEncoder(tanh_scale=tanh_scale)
     if kind == "vit":
@@ -574,5 +760,5 @@ def build_encoder(
             apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'sigreg_cnn', 'innovation_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )
