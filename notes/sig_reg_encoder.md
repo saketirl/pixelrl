@@ -227,3 +227,106 @@ So the remaining key question is whether the problem is:
 4. Complement penalty.
 - Still relevant, but lower priority than the projector-only and auxiliary-only controls.
 - It only becomes clean once the projector geometry is handled more carefully.
+
+## Experiment log — 2026-03-18 20:19:16 UTC
+
+Today the first genuinely encouraging innovation-aware result appeared on Humanoid.
+
+### What was implemented
+
+A new `innovation_cnn` encoder was added in the worktree.
+
+- It keeps the default CNN trunk and the full 512-d latent as the policy/value input.
+- It adds an auxiliary projector branch `u_t = P(z_t)`.
+- It adds a small linear dynamics model to predict `u_{t+1}` from `u_t` and `a_t`.
+- It applies SIGReg to the innovation residual
+  `r_t = u_{t+1} - (F u_t + G a_t)`.
+- This auxiliary branch does not bottleneck or replace the main actor/critic input.
+
+This is the key design change relative to the failed projected-SIGReg experiments: the regularizer was moved off the main policy/value path and onto an auxiliary temporal branch.
+
+### New positive result
+
+Run:
+- `humanoid__ppo_muon_humanoid_innovationaux_proj64_coef1_s0_t2__0__1773862860`
+
+Config behind that run:
+- `encoder_type=innovation_cnn`
+- `innovation_proj_dim=64`
+- `innovation_coef=1e-3`
+- `use_heads_muon=True`
+- `use_crate_head=True`
+- `sigreg_mode=off`
+- `humanoid`, seed `0`
+
+Important note:
+- In the sweep naming, `coef1` is the sweep index, not the literal coefficient value.
+- For this run, `coef1` corresponds to `innovation_coef=1e-3`.
+
+### What seems special about the successful run
+
+Relative to the other runs in the same innovation sweep, this one combined:
+
+1. A smaller auxiliary projected subspace.
+- `innovation_proj_dim=64` rather than `128`.
+
+2. A stronger innovation auxiliary signal.
+- `innovation_coef=1e-3` rather than `1e-4`.
+
+3. The known-good head-side setup remained intact.
+- `Muon + CRATE heads` stayed on.
+- The actor and critic still consumed the full 512-d latent.
+
+### Small figure: what the innovation branch is doing
+
+```text
+obs_t ──> CNN ──> z_t ───────────────> actor / critic heads
+                │
+                └──> P(z_t)=u_t ──> [F u_t + G a_t] ──> û_{t+1}
+                              │                    │
+obs_{t+1} ─> CNN ─> z_{t+1} ──┘                    │
+         └────────> P(z_{t+1})=u_{t+1} <───────────┘
+
+innovation residual:
+
+r_t = u_{t+1} - û_{t+1}
+    = u_{t+1} - (F u_t + G a_t)
+```
+
+### What “innovation” means here
+
+The innovation is the part of the next auxiliary latent that is not explained by a simple one-step linear dynamics model.
+
+In plain terms:
+- `u_t` is a small auxiliary summary of the current latent.
+- `F u_t + G a_t` is the model's guess for the next auxiliary summary.
+- `r_t` is what is left over after subtracting that guess.
+
+So `r_t` is the unpredictable / residual part of the transition in the auxiliary subspace.
+
+The idea is not to make the main latent itself Gaussian or isotropic.
+The idea is to encourage the encoder to contain a small subspace where:
+- the predictable part of dynamics is easy to model, and
+- the leftover residual behaves like a simple noise term.
+
+That is much closer to the original downstairs/upstairs motivation than projected SIGReg on the main latent was.
+
+### Updated interpretation
+
+This is the first result so far that supports the idea that auxiliary structure can help without damaging the main head geometry.
+
+The working distinction now looks like:
+- bad: directly bottlenecking or Gaussianizing the policy/value input
+- potentially good: applying auxiliary temporal structure on a side branch while leaving the main latent untouched
+
+So the failure mode of projected SIGReg was probably not just “regularization is bad.”
+The more precise lesson seems to be:
+- regularizing the representation used by the heads is risky and often harmful
+- but regularizing an auxiliary latent that is encouraged to model innovations may be compatible with the `Muon + CRATE` head geometry
+
+### Immediate follow-up questions
+
+1. Is the gain reproducible across seeds?
+2. Does the same pattern appear on Ant?
+3. Does the success depend more on the smaller auxiliary subspace (`64`) or on the stronger coefficient (`1e-3`)?
+4. Does the same innovation auxiliary help when CRATE heads are turned off, or is it mainly useful in combination with `Muon + CRATE`?
