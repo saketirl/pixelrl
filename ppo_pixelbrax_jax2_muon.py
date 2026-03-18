@@ -32,6 +32,7 @@ from pixelbrax.env_utils import make_pixel_brax
 # Import manifold MUON optimizer
 from manifold_muon_optax import manifold_muon
 from encoders import build_encoder
+from sigreg import sigreg_loss, sigreg_loss_masked
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -149,6 +150,12 @@ class Args:
     # Manifold MUON optimizer arguments
     use_heads_muon: bool = True
     """if True, use manifold MUON for actor/critic weight matrices; if False, use Adam for all head params"""
+    use_encoder_final_muon: bool = False
+    """if True, use manifold MUON for the encoder's final Dense kernel only"""
+    encoder_muon_lr: float = 0.02
+    """learning rate for the encoder's final Dense kernel when using MUON"""
+    encoder_muon_max_grad_norm: float = 1.0
+    """maximum norm for gradient clipping on the encoder final Dense MUON branch"""
     muon_dual_lr: float = 0.01
     """dual learning rate for MUON"""
     muon_dual_steps: int = 5
@@ -192,11 +199,49 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn' or 'mlp'"""
+    """encoder architecture to use: 'cnn', 'sigreg_cnn', 'innovation_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_warmup_updates: int = 0
     """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
+    encoder_use_crate_block: bool = False
+    """If true, insert a CRATE block inside the encoder before the SIGReg projector."""
+    encoder_crate_step_size: float = 0.1
+    """Step size for the encoder CRATE block when enabled."""
+
+    # SIGReg regularization
+    sigreg_mode: str = "off"
+    """SIGReg mode to use: 'off' or 'projected'."""
+    sigreg_coef: float = 0.0
+    """Maximum coefficient for the SIGReg auxiliary loss."""
+    sigreg_proj_dim: int = 64
+    """Projected subspace dimension used by the SIGReg CNN encoder."""
+    sigreg_num_slices: int = 16
+    """Number of random projections used by SIGReg."""
+    sigreg_num_t: int = 8
+    """Number of evaluation points used by SIGReg."""
+    sigreg_t_max: float = 5.0
+    """Maximum absolute t value for the SIGReg characteristic-function grid."""
+    sigreg_warmup_updates: int = 0
+    """Number of PPO updates before enabling SIGReg."""
+    sigreg_ramp_updates: int = 0
+    """Number of PPO updates used to ramp SIGReg to its full coefficient."""
+
+    # Innovation-aware auxiliary regularization
+    innovation_coef: float = 0.0
+    """Maximum coefficient for the innovation-aware auxiliary loss."""
+    innovation_proj_dim: int = 64
+    """Projected subspace dimension used by the innovation-aware CNN encoder."""
+    innovation_num_slices: int = 16
+    """Number of random projections used by the innovation-aware residual SIGReg."""
+    innovation_num_t: int = 8
+    """Number of evaluation points used by the innovation-aware residual SIGReg."""
+    innovation_t_max: float = 5.0
+    """Maximum absolute t value for the innovation-aware characteristic-function grid."""
+    innovation_warmup_updates: int = 0
+    """Number of PPO updates before enabling the innovation-aware auxiliary loss."""
+    innovation_ramp_updates: int = 0
+    """Number of PPO updates used to ramp innovation-aware regularization to its full coefficient."""
 
     # CRATE head architecture
     use_crate_head: bool = False
@@ -282,12 +327,36 @@ class CRATEActor(nn.Module):
         return actor_mean, actor_logstd
 
 
+class InnovationDynamics(nn.Module):
+    """Linear latent dynamics model for innovation-aware auxiliary loss."""
+    action_dim: int
+    proj_dim: int
+
+    @nn.compact
+    def __call__(self, u_t, action):
+        state_term = nn.Dense(
+            self.proj_dim,
+            use_bias=False,
+            kernel_init=orthogonal(1.0),
+            name="state_transition",
+        )(u_t)
+        action_term = nn.Dense(
+            self.proj_dim,
+            use_bias=False,
+            kernel_init=orthogonal(1.0),
+            name="action_transition",
+        )(action)
+        return state_term + action_term
+
+
 @flax.struct.dataclass
 class Storage:
     obs: jnp.array
+    next_obs: jnp.array
     actions: jnp.array
     logprobs: jnp.array
     dones: jnp.array
+    next_dones: jnp.array
     values: jnp.array
     advantages: jnp.array
     returns: jnp.array
@@ -527,6 +596,30 @@ def cnn_dense_metrics(
     return metrics
 
 
+def projected_latent_metrics(projected: jnp.ndarray, prefix: str = "sigreg_proj") -> dict:
+    """Compute simple anisotropy metrics on an auxiliary projected latent."""
+    eps = 1e-8
+    metrics = {}
+    centered = projected - jnp.mean(projected, axis=0, keepdims=True)
+    feature_var = jnp.var(centered, axis=0)
+    cov = (centered.T @ centered) / float(max(projected.shape[0] - 1, 1))
+    feature_std = jnp.sqrt(feature_var + eps)
+    corr = cov / (feature_std[:, None] * feature_std[None, :] + eps)
+    corr_mask = 1.0 - jnp.eye(corr.shape[0], dtype=corr.dtype)
+    eigvals = jnp.clip(jnp.linalg.eigvalsh(cov), a_min=0.0)
+    eig_sum = jnp.sum(eigvals)
+    eig_sq_sum = jnp.sum(jnp.square(eigvals))
+    top_eig = jnp.max(eigvals)
+
+    metrics[f"{prefix}/mean_abs_corr"] = (
+        jnp.sum(jnp.abs(corr) * corr_mask) / (jnp.sum(corr_mask) + eps)
+    )
+    metrics[f"{prefix}/top_eig_fraction"] = top_eig / (eig_sum + eps)
+    metrics[f"{prefix}/participation_ratio"] = (eig_sum ** 2) / (eig_sq_sum + eps)
+    metrics[f"{prefix}/stable_rank"] = eig_sum / (top_eig + eps)
+    return metrics
+
+
 def compute_grad_norms(grads: dict) -> dict:
     """Compute gradient norms for key model components."""
     def tree_norm(tree):
@@ -559,12 +652,16 @@ def create_optimizer(
     max_grad_norm: float = 0.5,
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
+    encoder_muon_lr: float = 0.02,
+    encoder_muon_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
     use_heads_muon: bool = True,
+    use_encoder_final_muon: bool = False,
 ):
     """
     Create optimizer that uses:
-    - Adam/AdamW for encoder (all params) - supports lr schedule, with grad clipping
+    - Adam/AdamW for encoder (all params except optional final Dense kernel MUON branch) - supports lr schedule, with grad clipping
+    - Manifold MUON for the encoder final Dense kernel only when enabled
     - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
@@ -592,6 +689,18 @@ def create_optimizer(
     heads_adam_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
         adam_opt(heads_adam_lr),
+    )
+
+    # MUON for encoder final Dense kernel only (with separate grad clipping)
+    encoder_final_muon_tx = optax.chain(
+        optax.clip_by_global_norm(encoder_muon_max_grad_norm),
+        manifold_muon(
+            learning_rate=encoder_muon_lr,
+            dual_lr=muon_dual_lr,
+            dual_steps=muon_dual_steps,
+            msign_steps=muon_msign_steps,
+            min_ndim=2,
+        ),
     )
 
     # MUON for actor head matrices (with separate grad clipping)
@@ -622,6 +731,7 @@ def create_optimizer(
     # critic_muon (matrices), heads_adam (actor/critic vectors/scalars)
     transforms = {
         'encoder': encoder_tx,
+        'encoder_final_muon': encoder_final_muon_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
@@ -632,6 +742,11 @@ def create_optimizer(
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
+                is_encoder_final_dense_kernel = path == ('network', 'params', 'Dense_0', 'kernel')
+                if use_encoder_final_muon and is_encoder_final_dense_kernel:
+                    return 'encoder_final_muon'
+                return 'encoder'
+            if path[0] == 'innovation':
                 return 'encoder'
             # For actor/critic heads, check if matrix or vector/scalar
             is_matrix = param.ndim >= 2 and min(param.shape) > 1
@@ -714,7 +829,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, network_key, actor_key, critic_key = jax.random.split(key, 4)
+    key, network_key, innovation_key, actor_key, critic_key = jax.random.split(key, 5)
 
     # Environment setup
     print("=" * 60)
@@ -734,6 +849,9 @@ if __name__ == "__main__":
     print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
     print(f"  heads_muon_lr (MUON for actor/critic matrices): {args.heads_muon_lr}")
     print(f"  heads_adam_lr ({adam_type} for actor/critic vectors): {args.heads_adam_lr}")
+    print(f"  use_encoder_final_muon: {args.use_encoder_final_muon}")
+    print(f"  encoder_muon_lr: {args.encoder_muon_lr}")
+    print(f"  encoder_muon_max_grad_norm: {args.encoder_muon_max_grad_norm}")
     print(f"  weight_decay: {args.weight_decay}")
     print(f"  muon_dual_lr: {args.muon_dual_lr}")
     print(f"  muon_dual_steps: {args.muon_dual_steps}")
@@ -743,14 +861,41 @@ if __name__ == "__main__":
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
     print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
+    print(f"  encoder_use_crate_block: {args.encoder_use_crate_block}")
+    print(f"  encoder_crate_step_size: {args.encoder_crate_step_size}")
+    print(f"  sigreg_mode: {args.sigreg_mode}")
+    print(f"  sigreg_coef: {args.sigreg_coef}")
+    print(f"  sigreg_proj_dim: {args.sigreg_proj_dim}")
+    print(f"  sigreg_num_slices: {args.sigreg_num_slices}")
+    print(f"  sigreg_num_t: {args.sigreg_num_t}")
+    print(f"  sigreg_t_max: {args.sigreg_t_max}")
+    print(f"  sigreg_warmup_updates: {args.sigreg_warmup_updates}")
+    print(f"  sigreg_ramp_updates: {args.sigreg_ramp_updates}")
+    print(f"  innovation_coef: {args.innovation_coef}")
+    print(f"  innovation_proj_dim: {args.innovation_proj_dim}")
+    print(f"  innovation_num_slices: {args.innovation_num_slices}")
+    print(f"  innovation_num_t: {args.innovation_num_t}")
+    print(f"  innovation_t_max: {args.innovation_t_max}")
+    print(f"  innovation_warmup_updates: {args.innovation_warmup_updates}")
+    print(f"  innovation_ramp_updates: {args.innovation_ramp_updates}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
     encoder_type = args.encoder_type.lower()
-    if encoder_type not in {"cnn", "mlp"}:
+    if encoder_type not in {"cnn", "sigreg_cnn", "innovation_cnn", "mlp"}:
         raise ValueError(
-            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['cnn', 'mlp']"
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['cnn', 'sigreg_cnn', 'innovation_cnn', 'mlp']"
         )
+
+    sigreg_mode = args.sigreg_mode.lower()
+    if sigreg_mode not in {"off", "projected"}:
+        raise ValueError(
+            f"Unsupported sigreg_mode='{args.sigreg_mode}'. Expected one of: ['off', 'projected']"
+        )
+    if sigreg_mode == "projected" and encoder_type != "sigreg_cnn":
+        raise ValueError("Projected SIGReg requires encoder_type='sigreg_cnn'.")
+    if args.innovation_coef > 0 and encoder_type != "innovation_cnn":
+        raise ValueError("Innovation-aware regularization requires encoder_type='innovation_cnn'.")
 
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
@@ -773,7 +918,14 @@ if __name__ == "__main__":
     )
 
     # Initialize networks
-    network = build_encoder(encoder_type, args.encoder_tanh_scale)
+    network = build_encoder(
+        encoder_type,
+        args.encoder_tanh_scale,
+        sigreg_proj_dim=args.sigreg_proj_dim,
+        innovation_proj_dim=args.innovation_proj_dim,
+        use_crate_block=args.encoder_use_crate_block,
+        crate_step_size=args.encoder_crate_step_size,
+    )
     if args.use_crate_head:
         actor = CRATEActor(action_dim=action_dim, crate_step_size=args.crate_step_size)
         critic = CRATECritic(crate_step_size=args.crate_step_size)
@@ -784,13 +936,25 @@ if __name__ == "__main__":
 
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
+    innovation_model = None
     dummy_hidden = network.apply(network_params, dummy_obs)
 
     params_dict = {
         "network": network_params,
-        "actor": actor.init(actor_key, dummy_hidden),
-        "critic": critic.init(critic_key, dummy_hidden),
     }
+    if encoder_type == "innovation_cnn":
+        innovation_model = InnovationDynamics(
+            action_dim=action_dim,
+            proj_dim=args.innovation_proj_dim,
+        )
+        dummy_debug = network.apply(network_params, dummy_obs, return_intermediates=True)
+        params_dict["innovation"] = innovation_model.init(
+            innovation_key,
+            dummy_debug["u"],
+            jnp.zeros((1, action_dim), dtype=jnp.float32),
+        )
+    params_dict["actor"] = actor.init(actor_key, dummy_hidden)
+    params_dict["critic"] = critic.init(critic_key, dummy_hidden)
 
     all_params = flax.core.freeze(params_dict)
 
@@ -809,15 +973,28 @@ if __name__ == "__main__":
         return muon_count, adam_count
 
     encoder_params = count_params(all_params, "network")
+    innovation_params = count_params(all_params, "innovation")
     actor_params = count_params(all_params, "actor")
     critic_params = count_params(all_params, "critic")
-    total_params = encoder_params + actor_params + critic_params
+    total_params = encoder_params + innovation_params + actor_params + critic_params
 
     actor_muon, actor_adam = count_by_type(all_params, "actor")
     critic_muon, critic_adam = count_by_type(all_params, "critic")
+    encoder_final_muon_params = 0
+    if args.use_encoder_final_muon:
+        try:
+            encoder_final_muon_params = all_params["network"]["params"]["Dense_0"]["kernel"].size
+        except KeyError:
+            encoder_final_muon_params = 0
+    encoder_adam_params = encoder_params - encoder_final_muon_params
 
     print(f"\nParameter breakdown:")
-    print(f"  Encoder (Adam): {encoder_params:,}")
+    print(
+        f"  Encoder total: {encoder_params:,} "
+        f"(MUON final dense: {encoder_final_muon_params:,}, Adam rest: {encoder_adam_params:,})"
+    )
+    if innovation_params > 0:
+        print(f"  Innovation dynamics (Adam): {innovation_params:,}")
     print(f"  Actor total: {actor_params:,} (MUON: {actor_muon:,}, Adam: {actor_adam:,})")
     print(f"  Critic total: {critic_params:,} (MUON: {critic_muon:,}, Adam: {critic_adam:,})")
     print(f"  Total: {total_params:,}")
@@ -848,6 +1025,24 @@ if __name__ == "__main__":
 
         return schedule
 
+
+    def sigreg_coef_from_update(
+        base_coef: float,
+        update_idx: int,
+        warmup_updates: int = 0,
+        ramp_updates: int = 0,
+    ):
+        """Warmup + linear ramp helper for the SIGReg coefficient."""
+        if base_coef <= 0:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        update_idx = jnp.asarray(update_idx, dtype=jnp.float32)
+        warmup = float(max(0, warmup_updates))
+        ramp = float(max(0, ramp_updates))
+        if ramp_updates <= 0:
+            return jnp.where(update_idx < warmup, 0.0, base_coef)
+        ramp_progress = jnp.clip((update_idx - warmup + 1.0) / jnp.maximum(1.0, ramp), 0.0, 1.0)
+        return jnp.where(update_idx < warmup, 0.0, base_coef * ramp_progress)
+
     if args.anneal_lr:
         encoder_lr = make_linear_schedule(args.encoder_lr, args.encoder_warmup_updates)
         heads_adam_lr = make_linear_schedule(args.heads_adam_lr, warmup_updates=0)
@@ -875,8 +1070,11 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
+        encoder_muon_lr=args.encoder_muon_lr,
+        encoder_muon_max_grad_norm=args.encoder_muon_max_grad_norm,
         weight_decay=args.weight_decay,
         use_heads_muon=args.use_heads_muon,
+        use_encoder_final_muon=args.use_encoder_final_muon,
     )
 
     agent_state = TrainState.create(
@@ -889,6 +1087,14 @@ if __name__ == "__main__":
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
+    if innovation_model is not None:
+        innovation_model.apply = jax.jit(innovation_model.apply)
+
+
+    def encode_with_intermediates(network_params, obs):
+        if encoder_type not in {"cnn", "sigreg_cnn", "innovation_cnn"}:
+            raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
+        return network_debug_apply(network_params, obs, return_intermediates=True)
 
     @jax.jit
     def get_action_and_value(
@@ -967,21 +1173,77 @@ if __name__ == "__main__":
         )
         return storage
 
+    
+
     def ppo_loss(
         params,
         x,
+        next_x,
+        next_done,
         a,
         logp,
         mb_advantages,
         mb_returns,
         mb_values,
         aug_key,
+        sigreg_coef_current,
+        innovation_coef_current,
     ):
         """PPO loss function."""
         if args.use_augmentation:
+            aug_key, next_aug_key, aux_key = jax.random.split(aug_key, 3)
             x = random_shift(aug_key, x, pad=args.augment_pad)
+            next_x = random_shift(next_aug_key, next_x, pad=args.augment_pad)
+        else:
+            aux_key = aug_key
 
-        newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
+        sigreg_total = jnp.asarray(0.0, dtype=jnp.float32)
+        sigreg_re = jnp.asarray(0.0, dtype=jnp.float32)
+        sigreg_im = jnp.asarray(0.0, dtype=jnp.float32)
+        innovation_total = jnp.asarray(0.0, dtype=jnp.float32)
+        innovation_re = jnp.asarray(0.0, dtype=jnp.float32)
+        innovation_im = jnp.asarray(0.0, dtype=jnp.float32)
+
+        if encoder_type == "sigreg_cnn":
+            encoder_debug = encode_with_intermediates(params["network"], x)
+            hidden = encoder_debug["hidden"]
+            if sigreg_mode == "projected":
+                sigreg_total, sigreg_re, sigreg_im = sigreg_loss(
+                    encoder_debug["u"],
+                    aux_key,
+                    num_slices=args.sigreg_num_slices,
+                    num_t=args.sigreg_num_t,
+                    t_max=args.sigreg_t_max,
+                )
+        elif encoder_type == "innovation_cnn":
+            encoder_debug = encode_with_intermediates(params["network"], x)
+            hidden = encoder_debug["hidden"]
+            aux_key, innovation_key = jax.random.split(aux_key)
+            next_encoder_debug = encode_with_intermediates(params["network"], next_x)
+            predicted_next_u = innovation_model.apply(
+                params["innovation"],
+                encoder_debug["u"],
+                a,
+            )
+            residual = next_encoder_debug["u"] - predicted_next_u
+            innovation_mask = 1.0 - next_done.astype(jnp.float32)
+            innovation_total, innovation_re, innovation_im = sigreg_loss_masked(
+                residual,
+                innovation_mask,
+                innovation_key,
+                num_slices=args.innovation_num_slices,
+                num_t=args.innovation_num_t,
+                t_max=args.innovation_t_max,
+            )
+        else:
+            hidden = network.apply(params["network"], x)
+
+        actor_mean, actor_logstd = actor.apply(params["actor"], hidden)
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
+        newlogprob = pi.log_prob(a)
+        entropy = pi.entropy()
+        newvalue = critic.apply(params["critic"], hidden).squeeze(-1)
+
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
         approx_kl = ((ratio - 1) - logratio).mean()
@@ -1002,13 +1264,25 @@ if __name__ == "__main__":
             v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
         entropy_loss = entropy.mean()
-        total_loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+        total_loss = (
+            pg_loss
+            - args.ent_coef * entropy_loss
+            + v_loss * args.vf_coef
+            + sigreg_coef_current * sigreg_total
+            + innovation_coef_current * innovation_total
+        )
 
         return total_loss, (
             pg_loss,
             v_loss,
             entropy_loss,
             jax.lax.stop_gradient(approx_kl),
+            jax.lax.stop_gradient(sigreg_total),
+            jax.lax.stop_gradient(sigreg_re),
+            jax.lax.stop_gradient(sigreg_im),
+            jax.lax.stop_gradient(innovation_total),
+            jax.lax.stop_gradient(innovation_re),
+            jax.lax.stop_gradient(innovation_im),
         )
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
@@ -1018,6 +1292,8 @@ if __name__ == "__main__":
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
+        sigreg_coef_current: jnp.ndarray,
+        innovation_coef_current: jnp.ndarray,
     ):
         """PPO update."""
         def update_epoch(carry, unused_inp):
@@ -1034,7 +1310,6 @@ if __name__ == "__main__":
 
             flatten_storage = jax.tree_util.tree_map(flatten, storage)
             shuffled_storage = jax.tree_util.tree_map(convert_data, flatten_storage)
-
             aug_keys = jax.random.split(aug_key, args.num_minibatches)
 
             def update_minibatch(carry, inputs):
@@ -1048,16 +1323,26 @@ if __name__ == "__main__":
                         v_loss,
                         entropy_loss,
                         approx_kl,
+                        sigreg_total,
+                        sigreg_re,
+                        sigreg_im,
+                        innovation_total,
+                        innovation_re,
+                        innovation_im,
                     ),
                 ), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
+                    minibatch.next_obs,
+                    minibatch.next_dones,
                     minibatch.actions,
                     minibatch.logprobs,
                     minibatch.advantages,
                     minibatch.returns,
                     minibatch.values,
                     mb_aug_key,
+                    sigreg_coef_current,
+                    innovation_coef_current,
                 )
 
                 grad_norm = optax.global_norm(grads)
@@ -1069,6 +1354,12 @@ if __name__ == "__main__":
                     v_loss,
                     entropy_loss,
                     approx_kl,
+                    sigreg_total,
+                    sigreg_re,
+                    sigreg_im,
+                    innovation_total,
+                    innovation_re,
+                    innovation_im,
                     grad_norm,
                 )
 
@@ -1080,6 +1371,12 @@ if __name__ == "__main__":
                     v_loss,
                     entropy_loss,
                     approx_kl,
+                    sigreg_total,
+                    sigreg_re,
+                    sigreg_im,
+                    innovation_total,
+                    innovation_re,
+                    innovation_im,
                     grad_norm,
                 ),
             ) = jax.lax.scan(
@@ -1093,6 +1390,12 @@ if __name__ == "__main__":
                 v_loss,
                 entropy_loss,
                 approx_kl,
+                sigreg_total,
+                sigreg_re,
+                sigreg_im,
+                innovation_total,
+                innovation_re,
+                innovation_im,
                 grad_norm,
             )
 
@@ -1105,6 +1408,12 @@ if __name__ == "__main__":
                 v_loss,
                 entropy_loss,
                 approx_kl,
+                sigreg_total,
+                sigreg_re,
+                sigreg_im,
+                innovation_total,
+                innovation_re,
+                innovation_im,
                 grad_norm,
             ),
         ) = jax.lax.scan(
@@ -1120,6 +1429,12 @@ if __name__ == "__main__":
             v_loss,
             entropy_loss,
             approx_kl,
+            sigreg_total,
+            sigreg_re,
+            sigreg_im,
+            innovation_total,
+            innovation_re,
+            innovation_im,
             grad_norm,
             final_grads,
             key,
@@ -1178,9 +1493,11 @@ if __name__ == "__main__":
 
         storage = Storage(
             obs=obs,
+            next_obs=next_obs_local,
             actions=action,
             logprobs=logprob,
             dones=done,
+            next_dones=next_done_local,
             values=value,
             rewards=reward,
             returns=jnp.zeros_like(reward),
@@ -1303,6 +1620,19 @@ if __name__ == "__main__":
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
 
+
+        sigreg_coef_current = sigreg_coef_from_update(
+            args.sigreg_coef,
+            iteration - 1,
+            args.sigreg_warmup_updates,
+            args.sigreg_ramp_updates,
+        )
+        innovation_coef_current = sigreg_coef_from_update(
+            args.innovation_coef,
+            iteration - 1,
+            args.innovation_warmup_updates,
+            args.innovation_ramp_updates,
+        )
         (
             agent_state,
             loss,
@@ -1310,6 +1640,12 @@ if __name__ == "__main__":
             v_loss,
             entropy_loss,
             approx_kl,
+            sigreg_total,
+            sigreg_re,
+            sigreg_im,
+            innovation_total,
+            innovation_re,
+            innovation_im,
             grad_norm,
             final_grads,
             key,
@@ -1317,6 +1653,8 @@ if __name__ == "__main__":
             agent_state,
             storage,
             key,
+            sigreg_coef_current,
+            innovation_coef_current,
         )
 
         # Online linear probe — fire when global_step crosses the next threshold.
@@ -1390,7 +1728,6 @@ if __name__ == "__main__":
                 else:
                     encoder_lr_current = args.encoder_lr
                     heads_adam_lr_current = args.heads_adam_lr
-
                 log_dict = {
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,
@@ -1407,16 +1744,23 @@ if __name__ == "__main__":
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/grad_norm": grad_norm[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
+                    "losses/sigreg_total": sigreg_total[-1, -1].item(),
+                    "losses/sigreg_re": sigreg_re[-1, -1].item(),
+                    "losses/sigreg_im": sigreg_im[-1, -1].item(),
+                    "losses/sigreg_coef": float(sigreg_coef_current),
+                    "losses/innovation_total": innovation_total[-1, -1].item(),
+                    "losses/innovation_re": innovation_re[-1, -1].item(),
+                    "losses/innovation_im": innovation_im[-1, -1].item(),
+                    "losses/innovation_coef": float(innovation_coef_current),
                 }
 
                 # Debug metrics for encoder representations
                 if args.debug_repr:
                     sample_obs = storage.obs[0, :256]
-                    if encoder_type == "cnn":
-                        cnn_debug = network_debug_apply(
+                    if encoder_type in {"cnn", "sigreg_cnn", "innovation_cnn"}:
+                        cnn_debug = encode_with_intermediates(
                             agent_state.params["network"],
                             sample_obs,
-                            return_intermediates=True,
                         )
                         hidden = cnn_debug["hidden"]
                         dense_metrics = cnn_dense_metrics(
@@ -1427,6 +1771,14 @@ if __name__ == "__main__":
                         )
                         for k, v in dense_metrics.items():
                             log_dict[k] = float(v)
+                        if encoder_type == "sigreg_cnn":
+                            proj_metrics = projected_latent_metrics(cnn_debug["u"], prefix="sigreg_proj")
+                            for k, v in proj_metrics.items():
+                                log_dict[k] = float(v)
+                        if encoder_type == "innovation_cnn":
+                            proj_metrics = projected_latent_metrics(cnn_debug["u"], prefix="innovation_proj")
+                            for k, v in proj_metrics.items():
+                                log_dict[k] = float(v)
                     else:
                         hidden = network.apply(agent_state.params["network"], sample_obs)
 
