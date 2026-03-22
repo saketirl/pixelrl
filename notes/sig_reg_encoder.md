@@ -330,3 +330,46 @@ The more precise lesson seems to be:
 2. Does the same pattern appear on Ant?
 3. Does the success depend more on the smaller auxiliary subspace (`64`) or on the stronger coefficient (`1e-3`)?
 4. Does the same innovation auxiliary help when CRATE heads are turned off, or is it mainly useful in combination with `Muon + CRATE`?
+
+## 2026-03-18 21:21:28 UTC
+
+Additional observation from the current innovation-aware runs:
+
+- `repr/active_units_frac` and `repr/unit_std_avg` both stand out as being strongly correlated with returns.
+- Current working hypothesis: this is not just a passive correlation; these metrics may be partially causal, in the sense that keeping more units meaningfully active and maintaining a healthier average unit-scale seems to support better downstream control performance.
+- At minimum, these two metrics now look like high-value diagnostics to watch when evaluating encoder changes.
+
+## 2026-03-18 21:23:49 UTC
+
+Additional geometry observation from the current encoder runs:
+
+- cnn_dense/participation_ratio increases with performance.
+- cnn_dense/stable_rank also increases with performance.
+- cnn_dense/top_eig_fraction decreases with performance.
+- Combined interpretation: stronger runs seem to maintain a broader, more balanced active subspace, with less variance concentrated in a single dominant direction.
+- This points away from a tiny bottleneck target and toward preserving a reasonably high-dimensional, non-collapsed latent geometry.
+
+## 2026-03-18 21:36:09 UTC
+
+Metric glossary for the representation diagnostics we have been watching:
+
+- repr/active_units_frac:
+  fraction of latent coordinates whose batch standard deviation is above a small activity threshold. Higher means more units are actually moving and participating, rather than sitting nearly constant.
+
+- repr/unit_std_avg:
+  average per-coordinate standard deviation across the latent over the current batch. Higher means the typical unit has a healthier dynamic range; very low values usually indicate under-active or partially collapsed features.
+
+- cnn_dense/participation_ratio:
+  effective dimensionality of the covariance spectrum of the CNN Dense representation. If lambda_i are covariance eigenvalues, participation_ratio = (sum lambda_i)^2 / sum(lambda_i^2). Higher means variance is spread across more directions.
+
+- cnn_dense/stable_rank:
+  another effective-rank style statistic, computed here as sum(lambda_i) / max(lambda_i). Higher means the representation is less dominated by its top principal direction.
+
+- cnn_dense/top_eig_fraction:
+  max(lambda_i) / sum(lambda_i). Lower means the top principal direction explains less of the total variance, so the representation is less spiky or one-direction dominated.
+
+How to read them together:
+
+- good geometry is not "all 512 dimensions equally used".
+- good geometry also is not "a tiny bottleneck with most units dead".
+- the better regime seems to be: many active units, healthy average unit scale, reasonably high effective dimensionality, and low dominance by the top eigen-direction.
