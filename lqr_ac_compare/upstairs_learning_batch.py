@@ -1,7 +1,15 @@
 """
 Batch multi-step upstairs actor-critic update with deep linear networks (L=3).
 
-Uses multi-step returns to avoid 1/dt variance blow-up (CT-DDPG style).
+Implements CT-DDPG Martingale Loss (from arXiv 2509.23711):
+  ℒᴹ = (V(o_t) - ∑_{l=0}^{L-1} γ^l [r_{t+l} - q(o_{t+l}, a_{t+l})] dt - γ^L V(o_{t+L}))²
+
+The key is subtracting the advantage rate q from rewards in the integral.
+This maintains the martingale property and keeps variance bounded as dt→0.
+
+Alternative: Generator-based update (use_generator=True):
+  δ_t = r_t - ψ(o_t, a_t) + L^π V(o_t) - β V(o_t)
+  where L^π V(o_t) ≈ (V(o_{t+1}) - V(o_t)) / dt (sample-based estimate)
 
 Architecture (L=3 deep linear networks):
 -----------------------------------------
@@ -30,6 +38,14 @@ def cayley_retract(X: Array, G: Array, eta: float) -> Array:
     I = np.eye(n, dtype=X.dtype)
     A = G @ X.T - X @ G.T  # skew-symmetric
     return np.linalg.solve(I + 0.5 * eta * A, (I - 0.5 * eta * A) @ X)
+
+
+def update_matrix(X: Array, G: Array, eta: float, use_cayley: bool) -> Array:
+    """Update matrix using either Cayley retraction or standard gradient descent."""
+    if use_cayley:
+        return cayley_retract(X, G, eta)
+    else:
+        return X + eta * G
 
 
 # ============================================================
@@ -165,31 +181,142 @@ def upstairs_batch_multistep_update(
     L: int = 10,     # multi-step horizon
     eta_actor: float,
     eta_critic: float,
+    use_generator: bool = False,  # Use generator-based TD error instead of multi-step
+    use_cayley: bool = True,  # Use Cayley retraction (False = standard gradient descent)
 ) -> Dict[str, float]:
     """
     Batch multi-step actor-critic update for upstairs L=3 deep linear networks.
 
     Uses L-step returns to avoid 1/dt variance blow-up.
+
+    If use_generator=True, uses generator-based TD error instead:
+        δ_t = r_t - ψ(o_t, a_t) + (V(o_{t+1}) - V(o_t))/dt - β V(o_t)
     """
     N = len(r_traj)
     d = o_traj.shape[1]
     da = a_traj.shape[1]
-
-    if N < L:
-        L = N
 
     gamma = np.exp(-beta * dt)
 
     # Compute all values
     values = np.array([critic.phi_upstairs(o_traj[i]) for i in range(N + 1)])
 
-    # Compute multi-step targets
+    # ========== GENERATOR-BASED UPDATE ==========
+    if use_generator:
+        weights = np.array([gamma ** t for t in range(N)])
+
+        gU1 = np.zeros_like(critic.U1)
+        gU2 = np.zeros_like(critic.U2)
+        gU3 = np.zeros_like(critic.U3)
+        gUp1 = np.zeros_like(critic.Up1)
+        gUp2 = np.zeros_like(critic.Up2)
+        gc = 0.0
+        gZ1 = np.zeros_like(critic.Z1)
+        gZ2 = np.zeros_like(critic.Z2)
+        gZp2 = np.zeros_like(critic.Zp2)
+        gW1 = np.zeros_like(actor.W1)
+        gW2 = np.zeros_like(actor.W2)
+
+        mse = 0.0
+        for t in range(N):
+            o = o_traj[t]
+            a = a_traj[t]
+            r = r_traj[t]
+            a_pi = actor.act_upstairs(o)
+
+            V_t = values[t]
+            V_next = values[t + 1]
+
+            # Sample-based generator estimate
+            L_V_est = (V_next - V_t) / dt
+
+            # Advantage rate
+            psi = critic.psi_upstairs(o, a, actor)
+
+            # TD error: δ = r - ψ + L^π V - β V
+            delta = r - psi + L_V_est - beta * V_t
+            mse += delta ** 2
+
+            w = weights[t] * dt
+
+            # Critic value gradients
+            dU = grad_phi_U(o, critic.U1, critic.U2, critic.U3)
+            dUp = grad_phi_Up(o, critic.Up1, critic.Up2, critic.Up3)
+            gU1 -= w * delta * dU["U1"]
+            gU2 -= w * delta * dU["U2"]
+            gU3 -= w * delta * dU["U3"]
+            gUp1 -= w * delta * dUp["Up1"]
+            gUp2 -= w * delta * dUp["Up2"]
+            gc -= w * delta
+
+            # Critic advantage gradients
+            dZ_a = grad_Psi_Z(o, a, critic.Z1, critic.Z2, critic.Z3)
+            dZ_pi = grad_Psi_Z(o, a_pi, critic.Z1, critic.Z2, critic.Z3)
+            dZp2_a = grad_Psi_Zp2(a, critic.Zp1, critic.Zp2, critic.Zp3)
+            dZp2_pi = grad_Psi_Zp2(a_pi, critic.Zp1, critic.Zp2, critic.Zp3)
+            gZ1 += w * delta * (dZ_a["Z1"] - dZ_pi["Z1"])
+            gZ2 += w * delta * (dZ_a["Z2"] - dZ_pi["Z2"])
+            gZp2 += w * delta * (dZp2_a - dZp2_pi)
+
+            # Actor gradient (DPG)
+            g_a = grad_a_Psi(o, critic.Z1, critic.Z2, critic.Z3,
+                             critic.Zp1, critic.Zp2, critic.Zp3)
+            dW = grad_actor_W(o, g_a, actor.W1, actor.W2, actor.W3)
+            gW1 += w * dW["W1"]
+            gW2 += w * dW["W2"]
+
+        # Normalize
+        total_weight = float(np.sum(weights * dt))
+        gU1 /= total_weight
+        gU2 /= total_weight
+        gU3 /= total_weight
+        gUp1 /= total_weight
+        gUp2 /= total_weight
+        gc /= total_weight
+        gZ1 /= total_weight
+        gZ2 /= total_weight
+        gZp2 /= total_weight
+        gW1 /= total_weight
+        gW2 /= total_weight
+        mse /= N
+
+        # Apply updates
+        critic.U1 = update_matrix(critic.U1, gU1, eta_critic, use_cayley)
+        critic.U2 = update_matrix(critic.U2, gU2, eta_critic, use_cayley)
+        critic.U3 = update_matrix(critic.U3, gU3, eta_critic, use_cayley)
+        critic.Up1 = update_matrix(critic.Up1, gUp1, eta_critic, use_cayley)
+        critic.Up2 = update_matrix(critic.Up2, gUp2, eta_critic, use_cayley)
+        critic.c = critic.c + eta_critic * gc
+        critic.Z1 = update_matrix(critic.Z1, gZ1, eta_critic, use_cayley)
+        critic.Z2 = update_matrix(critic.Z2, gZ2, eta_critic, use_cayley)
+        critic.Zp2 = update_matrix(critic.Zp2, gZp2, eta_critic, use_cayley)
+        actor.W1 = update_matrix(actor.W1, gW1, eta_actor, use_cayley)
+        actor.W2 = update_matrix(actor.W2, gW2, eta_actor, use_cayley)
+
+        return {
+            "mse": float(mse),
+            "ortho_err_W1": float(np.linalg.norm(actor.W1.T @ actor.W1 - np.eye(d))),
+            "ortho_err_U1": float(np.linalg.norm(critic.U1.T @ critic.U1 - np.eye(d))),
+            "G_W1_norm": float(np.linalg.norm(gW1)),
+            "G_U1_norm": float(np.linalg.norm(gU1)),
+        }
+
+    # ========== MULTI-STEP UPDATE (DEFAULT) ==========
+    if N < L:
+        L = N
+
+    # Compute multi-step TD targets with CT-DDPG [r - q] formulation
+    # G_t = sum_{l=0}^{L-1} gamma^l [r_{t+l} - q(o_{t+l}, a_{t+l})] * dt + gamma^L V(o_{t+L})
     n_samples = N - L + 1
     targets = np.zeros(n_samples)
     for t in range(n_samples):
         G = 0.0
         for l in range(L):
-            G += (gamma ** l) * r_traj[t + l] * dt
+            o_l = o_traj[t + l]
+            a_l = a_traj[t + l]
+            # q(o, a) is the advantage rate at the trajectory action
+            q_l = critic.psi_upstairs(o_l, a_l, actor)
+            G += (gamma ** l) * (r_traj[t + l] - q_l) * dt
         G += (gamma ** L) * values[t + L]
         targets[t] = G
 
@@ -258,17 +385,17 @@ def upstairs_batch_multistep_update(
     gZp2 /= n_samples
     mse /= n_samples
 
-    # Apply critic updates with Cayley retraction
-    critic.U1 = cayley_retract(critic.U1, gU1, eta_critic)
-    critic.U2 = cayley_retract(critic.U2, gU2, eta_critic)
-    critic.U3 = cayley_retract(critic.U3, gU3, eta_critic)
-    critic.Up1 = cayley_retract(critic.Up1, gUp1, eta_critic)
-    critic.Up2 = cayley_retract(critic.Up2, gUp2, eta_critic)
+    # Apply critic updates
+    critic.U1 = update_matrix(critic.U1, gU1, eta_critic, use_cayley)
+    critic.U2 = update_matrix(critic.U2, gU2, eta_critic, use_cayley)
+    critic.U3 = update_matrix(critic.U3, gU3, eta_critic, use_cayley)
+    critic.Up1 = update_matrix(critic.Up1, gUp1, eta_critic, use_cayley)
+    critic.Up2 = update_matrix(critic.Up2, gUp2, eta_critic, use_cayley)
     critic.c = critic.c + eta_critic * gc
 
-    critic.Z1 = cayley_retract(critic.Z1, gZ1, eta_critic)
-    critic.Z2 = cayley_retract(critic.Z2, gZ2, eta_critic)
-    critic.Zp2 = cayley_retract(critic.Zp2, gZp2, eta_critic)
+    critic.Z1 = update_matrix(critic.Z1, gZ1, eta_critic, use_cayley)
+    critic.Z2 = update_matrix(critic.Z2, gZ2, eta_critic, use_cayley)
+    critic.Zp2 = update_matrix(critic.Zp2, gZp2, eta_critic, use_cayley)
 
     # ==================== Actor Update ====================
     # DPG: maximize E[Ψ(o, π(o))] by following ∂Ψ/∂a
@@ -291,8 +418,8 @@ def upstairs_batch_multistep_update(
     gW2 /= n_samples
 
     # Apply actor updates (gradient ASCENT for maximizing return)
-    actor.W1 = cayley_retract(actor.W1, gW1, eta_actor)
-    actor.W2 = cayley_retract(actor.W2, gW2, eta_actor)
+    actor.W1 = update_matrix(actor.W1, gW1, eta_actor, use_cayley)
+    actor.W2 = update_matrix(actor.W2, gW2, eta_actor, use_cayley)
 
     # Diagnostics
     ortho_W1 = float(np.linalg.norm(actor.W1.T @ actor.W1 - np.eye(d)))
