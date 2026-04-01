@@ -74,7 +74,10 @@ class FrameStack:
 def _make_encode_fn(network):
     @jax.jit
     def _encode(params, obs):
-        return jax.lax.stop_gradient(network.apply(params, obs))
+        features = network.apply(params, obs)
+        if isinstance(features, tuple):
+            features = features[0]
+        return jax.lax.stop_gradient(features)
     return _encode
 
 

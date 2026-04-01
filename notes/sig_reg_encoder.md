@@ -373,3 +373,121 @@ How to read them together:
 - good geometry is not "all 512 dimensions equally used".
 - good geometry also is not "a tiny bottleneck with most units dead".
 - the better regime seems to be: many active units, healthy average unit scale, reasonably high effective dimensionality, and low dominance by the top eigen-direction.
+
+
+## 2026-03-22 UTC
+
+Ant update from the new 1M diagnosis runs (`cnn + CRATE heads`, innovation off, anneal off, small VICReg variance-floor auxiliary):
+
+- The key new ant insight is that the winning/losing split shows up earliest in the `cnn_dense/*` metrics, before return gives any useful signal.
+- In the successful seed, `cnn_dense/feature_var_max` is already materially larger than the losing seeds very early:
+  - more than `2x` all other seeds by `3840` steps
+  - more than `5x` by `6400`
+  - more than `10x` by `20480`
+  - more than `50x` by `34560`
+- `cnn_dense/feature_var_ratio` also separates early, though slightly later than `feature_var_max`.
+- The visible encoder "rescue" happens later, around `40960-42240` steps:
+  - `repr/unit_std_avg` jumps up
+  - `repr/dead_units_frac` drops sharply
+  - `policy/obs_to_noise_ratio` becomes nontrivial
+  - `cnn_dense/pre_ln_std` falls instead of continuing to blow up
+  - `losses/vicreg_var_total` drops below its saturated value
+- The losing ant seeds never make that transition. They keep:
+  - near-zero `repr/unit_std_avg`
+  - `repr/dead_units_frac = 1`
+  - near-zero `policy/obs_to_noise_ratio`
+  - much larger `cnn_dense/pre_ln_std`
+  - saturated `losses/vicreg_var_total`
+
+Updated ant hypothesis:
+
+- The earliest branching event is probably in the CNN dense bottleneck, not in the policy head and not in episodic return.
+- Current candidate causal chain:
+  - early preservation of variance in at least one dense-layer direction (`cnn_dense/feature_var_max`, `cnn_dense/feature_var_ratio`)
+  - then encoder rescue around `~40k`
+  - then a genuinely observation-conditioned policy
+  - then the later performance phase change around `~550k-650k`
+- So for ant, `cnn_dense/feature_var_max`, `cnn_dense/feature_var_ratio`, and `cnn_dense/pre_ln_std` currently look like the earliest high-value branch predictors. `repr/*` and `policy/*` still matter, but they appear to be later confirmations of a split that has already started inside the CNN dense bottleneck.
+
+One caution:
+
+- The variance-floor VICReg term did not reliably prevent collapse by itself; `3/4` seeds still collapsed. So the ant result is better read as a diagnosis of where branching happens than as strong evidence that VICReg is the fix.
+
+
+## 2026-03-23 UTC
+
+Matched ant baseline update (`cnn + CRATE heads`, innovation off, anneal off, `vicreg_var_coef=0`):
+
+- The matched `vicreg=0` sweep reproduced the same qualitative result as the previous `vicreg=1e-3` sweep.
+- In both sweeps:
+  - one seed entered the alive / strong branch and finished around `900+` return by `1M`
+  - three seeds collapsed early and still reached only the moderate-return local-minimum gait branch (`~480-510` return)
+- So the good ant behavior is not being caused by the VICReg variance-floor term.
+- The strong result is coming from the base configuration change:
+  - plain `cnn`
+  - `CRATE` heads on
+  - innovation off
+  - LR annealing off
+
+Important confirmation from the matched baseline:
+
+- The same early branch structure appears with `vicreg=0`:
+  - good seed has healthy `repr/unit_std_avg`, low `dead_units_frac`, nontrivial `policy/obs_to_noise_ratio`, and much broader `cnn_dense` geometry
+  - bad seeds still show collapsed `repr/*`, near-zero `policy/*`, exploding `cnn_dense/pre_ln_std`, and near-zero `cnn_dense/participation_ratio`
+- This confirms that the earlier ant diagnosis was real and not an artifact of the auxiliary VICReg term.
+
+Updated ant conclusion:
+
+- For ant, the key problem is still the early CNN dense bottleneck branch.
+- VICReg, as implemented here, did not materially change the branch probabilities.
+- The next intervention should therefore target the early dense bottleneck dynamics directly rather than relying on the current variance-floor auxiliary.
+
+
+## 2026-03-24 UTC
+
+Ant follow-up from the `cnn + CRATE heads`, innovation-off, anneal-off sweeps after splitting `init_seed` and `data_seed`:
+
+- Both initialization randomness and data / rollout randomness can flip the run into the good or bad branch.
+- With fixed init and varying data randomness, one seed still became strong while the others stayed in the weaker branch.
+- With fixed data randomness and varying init, some inits became strong while others did not.
+- So the ant inconsistency is not "just an init issue" and not "just a rollout noise issue". It is better understood as an early instability that is sensitive to both.
+
+Encoder-final-Muon update:
+
+- Applying manifold Muon only to the final CNN bottleneck matrix appears to remove the catastrophic encoder-collapse branch.
+- Across the factorized sweeps, all runs kept healthy representation statistics:
+  - nontrivial `repr/unit_std_avg`
+  - `repr/dead_units_frac` near zero
+  - controlled `cnn_dense/pre_ln_std`
+  - healthy `cnn_dense/participation_ratio`
+- But this did not solve ant end-to-end. Returns still ranged from poor to strong, so the remaining problem is not simply encoder death.
+- Updated interpretation:
+  - encoder collapse was a real bottleneck
+  - encoder-final Muon largely fixes that bottleneck
+  - the remaining failure mode is policy-side: healthy latent, but still getting stuck in a bad control regime
+
+Actor-conditionality update (`encoder_final_muon` baseline plus early actor conditionality floor):
+
+- The actor-side conditionality regularizer substantially improved the floor of performance.
+- Compared to the encoder-final-Muon baseline, the very poor runs disappeared:
+  - before actor conditionality: returns included about `-135`, `-117`, `-111`, and `15`
+  - with actor conditionality: all 8 runs finished positive, roughly `263-838`
+- Aggregate shift:
+  - mean return improved from about `234` to `518`
+  - median improved from about `212` to `467`
+  - worst-case return improved from about `-135` to `263`
+- Representation health stayed strong, so this gain is not from further encoder stabilization.
+- The main policy-side shift is that the weak low-conditionality / high-noise regime was reduced:
+  - bad encoder-final-Muon runs had very low `policy/mean_action_obs_std_avg`, very high `policy/action_noise_std_avg`, and tiny `policy/obs_to_noise_ratio`
+  - actor conditionality raises the effective state dependence of the actor and removes the catastrophic low-return branch
+
+Updated ant conclusion:
+
+- There now seem to be at least three qualitatively different ant regimes:
+  - dead encoder / collapsed branch
+  - alive encoder but weakly state-conditioned middling branch
+  - alive encoder and strong branch
+- Encoder-final Muon appears to remove the first regime.
+- Early actor conditionality appears to remove most of the catastrophic policy-side failures and lift the floor into the middling regime.
+- The remaining open problem is the second phase change:
+  - how to move reliably from a healthy encoder plus middling policy into the strong ant regime.

@@ -82,7 +82,11 @@ class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 0
-    """seed of the experiment"""
+    """legacy seed used when init_seed/data_seed are not set explicitly"""
+    init_seed: int = -1
+    """parameter-initialization seed (-1 means use seed)"""
+    data_seed: int = -1
+    """environment/rollout/minibatch seed (-1 means use seed)"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "benchmark"
@@ -199,7 +203,7 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn', 'sigreg_cnn', 'innovation_cnn', or 'mlp'"""
+    """encoder architecture to use: 'cnn', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_warmup_updates: int = 0
@@ -243,6 +247,54 @@ class Args:
     innovation_ramp_updates: int = 0
     """Number of PPO updates used to ramp innovation-aware regularization to its full coefficient."""
 
+    # VICReg variance regularization
+    vicreg_var_coef: float = 0.0
+    """Maximum coefficient for the VICReg variance-floor loss on the shared hidden representation."""
+    vicreg_var_target: float = 0.1
+    """Target minimum per-feature standard deviation for the shared hidden representation."""
+    vicreg_var_warmup_updates: int = 0
+    """Number of PPO updates before enabling the VICReg variance loss."""
+    vicreg_var_ramp_updates: int = 0
+    """Number of PPO updates used to ramp VICReg variance regularization to its full coefficient."""
+
+    # Early bottleneck stabilization
+    bottleneck_var_coef: float = 0.0
+    """Coefficient for an early lower-tail variance floor on the shared hidden representation."""
+    bottleneck_var_target: float = 0.05
+    """Target minimum std for the lowest-variance hidden features during early training."""
+    bottleneck_var_bottom_frac: float = 0.25
+    """Fraction of lowest-variance hidden features to penalize."""
+    bottleneck_pre_ln_coef: float = 0.0
+    """Coefficient for an early one-sided cap on encoder dense pre-LayerNorm scale."""
+    bottleneck_pre_ln_max_std: float = 12.0
+    """Maximum allowed std of encoder dense pre-LayerNorm activations before penalty."""
+    bottleneck_reg_stop_updates: int = 0
+    """Number of PPO updates for which bottleneck stabilization remains active (0 disables)."""
+
+    # Early actor conditionality regularization
+    actor_cond_coef: float = 0.0
+    """Coefficient for an early actor-side conditionality floor on action means."""
+    actor_cond_target: float = 0.05
+    """Target minimum advantage-weighted std of actor means across a minibatch."""
+    actor_cond_stop_updates: int = 0
+    """Number of PPO updates for which actor conditionality regularization remains active (0 disables)."""
+    actor_noise_coef: float = 0.0
+    """Coefficient for an early one-sided cap on average actor action-noise std."""
+    actor_noise_max_std: float = 0.25
+    """Maximum desired average action-noise std during the early training window."""
+    actor_noise_stop_updates: int = 0
+    """Number of PPO updates for which actor noise regularization remains active (0 disables)."""
+
+    # Policy std parameterization
+    state_dependent_std: bool = False
+    """If true, predict log-std from state instead of using a global per-action parameter."""
+    state_std_tanh_scale: float = 0.5
+    """Maximum per-state log-std deviation from the global bias when using state-dependent std."""
+    actor_logstd_min: float = -5.0
+    """Minimum log-std clamp for the actor policy."""
+    actor_logstd_max: float = 2.0
+    """Maximum log-std clamp for the actor policy."""
+
     # CRATE head architecture
     use_crate_head: bool = False
     """If true, use CRATE-style FeedForward as final hidden layer in actor/critic."""
@@ -272,6 +324,10 @@ class Critic(nn.Module):
 class Actor(nn.Module):
     """Continuous action actor with 2 hidden layers using Swish activation."""
     action_dim: int
+    state_dependent_std: bool = False
+    state_std_tanh_scale: float = 0.5
+    logstd_min: float = -5.0
+    logstd_max: float = 2.0
 
     @nn.compact
     def __call__(self, x):
@@ -284,11 +340,26 @@ class Actor(nn.Module):
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
         )(x)
-        actor_logstd = self.param(
-            "log_std",
-            nn.initializers.zeros,
-            (self.action_dim,)
-        )
+        if self.state_dependent_std:
+            log_std_bias = self.param(
+                "log_std_bias",
+                nn.initializers.zeros,
+                (self.action_dim,)
+            )
+            log_std_delta = nn.Dense(
+                self.action_dim,
+                kernel_init=constant(0.0),
+                bias_init=constant(0.0),
+                name="log_std_head",
+            )(x)
+            actor_logstd = log_std_bias + self.state_std_tanh_scale * jnp.tanh(log_std_delta)
+            actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
+        else:
+            actor_logstd = self.param(
+                "log_std",
+                nn.initializers.zeros,
+                (self.action_dim,)
+            )
         return actor_mean, actor_logstd
 
 
@@ -308,6 +379,10 @@ class CRATEActor(nn.Module):
     """Continuous action actor with CRATE FeedForward as final hidden layer."""
     action_dim: int
     crate_step_size: float = 0.1
+    state_dependent_std: bool = False
+    state_std_tanh_scale: float = 0.5
+    logstd_min: float = -5.0
+    logstd_max: float = 2.0
 
     @nn.compact
     def __call__(self, x):
@@ -319,11 +394,26 @@ class CRATEActor(nn.Module):
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
         )(x)
-        actor_logstd = self.param(
-            "log_std",
-            nn.initializers.zeros,
-            (self.action_dim,)
-        )
+        if self.state_dependent_std:
+            log_std_bias = self.param(
+                "log_std_bias",
+                nn.initializers.zeros,
+                (self.action_dim,)
+            )
+            log_std_delta = nn.Dense(
+                self.action_dim,
+                kernel_init=constant(0.0),
+                bias_init=constant(0.0),
+                name="log_std_head",
+            )(x)
+            actor_logstd = log_std_bias + self.state_std_tanh_scale * jnp.tanh(log_std_delta)
+            actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
+        else:
+            actor_logstd = self.param(
+                "log_std",
+                nn.initializers.zeros,
+                (self.action_dim,)
+            )
         return actor_mean, actor_logstd
 
 
@@ -333,7 +423,7 @@ class InnovationDynamics(nn.Module):
     proj_dim: int
 
     @nn.compact
-    def __call__(self, u_t, action):
+    def __call__(self, u_t, action, return_intermediates: bool = False):
         state_term = nn.Dense(
             self.proj_dim,
             use_bias=False,
@@ -346,7 +436,14 @@ class InnovationDynamics(nn.Module):
             kernel_init=orthogonal(1.0),
             name="action_transition",
         )(action)
-        return state_term + action_term
+        predicted_next_u = state_term + action_term
+        if return_intermediates:
+            return {
+                "state_term": state_term,
+                "action_term": action_term,
+                "predicted_next_u": predicted_next_u,
+            }
+        return predicted_next_u
 
 
 @flax.struct.dataclass
@@ -542,34 +639,35 @@ def encoder_repr_metrics(hidden: jnp.ndarray) -> dict:
 def cnn_dense_metrics(
     dense_pre_ln: jnp.ndarray,
     hidden: jnp.ndarray,
-    network_params: dict,
-    network_grads: dict,
+    dense_kernel: jnp.ndarray,
+    dense_kernel_grad: jnp.ndarray,
+    prefix: str = "cnn_dense",
 ) -> dict:
-    """Compute scalar debug metrics for the CNN encoder's final Dense layer."""
+    """Compute scalar debug metrics for a CNN encoder bottleneck."""
     eps = 1e-8
     metrics = {}
 
-    metrics["cnn_dense/pre_ln_mean"] = jnp.mean(dense_pre_ln)
-    metrics["cnn_dense/pre_ln_std"] = jnp.std(dense_pre_ln)
-    metrics["cnn_dense/pre_ln_abs_mean"] = jnp.mean(jnp.abs(dense_pre_ln))
-    metrics["cnn_dense/pre_ln_max_abs"] = jnp.max(jnp.abs(dense_pre_ln))
-    metrics["cnn_dense/pre_ln_l2_mean"] = jnp.mean(jnp.linalg.norm(dense_pre_ln, axis=-1))
+    metrics[f"{prefix}/pre_ln_mean"] = jnp.mean(dense_pre_ln)
+    metrics[f"{prefix}/pre_ln_std"] = jnp.std(dense_pre_ln)
+    metrics[f"{prefix}/pre_ln_abs_mean"] = jnp.mean(jnp.abs(dense_pre_ln))
+    metrics[f"{prefix}/pre_ln_max_abs"] = jnp.max(jnp.abs(dense_pre_ln))
+    metrics[f"{prefix}/pre_ln_l2_mean"] = jnp.mean(jnp.linalg.norm(dense_pre_ln, axis=-1))
 
-    metrics["cnn_dense/tanh_sat_frac_0.95"] = jnp.mean(jnp.abs(hidden) > 0.95)
-    metrics["cnn_dense/tanh_sat_frac_0.99"] = jnp.mean(jnp.abs(hidden) > 0.99)
+    metrics[f"{prefix}/tanh_sat_frac_0.95"] = jnp.mean(jnp.abs(hidden) > 0.95)
+    metrics[f"{prefix}/tanh_sat_frac_0.99"] = jnp.mean(jnp.abs(hidden) > 0.99)
 
     hidden_centered = hidden - jnp.mean(hidden, axis=0, keepdims=True)
     feature_var = jnp.var(hidden_centered, axis=0)
-    metrics["cnn_dense/feature_var_min"] = jnp.min(feature_var)
-    metrics["cnn_dense/feature_var_max"] = jnp.max(feature_var)
-    metrics["cnn_dense/feature_var_ratio"] = jnp.max(feature_var) / (jnp.min(feature_var) + eps)
+    metrics[f"{prefix}/feature_var_min"] = jnp.min(feature_var)
+    metrics[f"{prefix}/feature_var_max"] = jnp.max(feature_var)
+    metrics[f"{prefix}/feature_var_ratio"] = jnp.max(feature_var) / (jnp.min(feature_var) + eps)
 
     batch_denom = float(max(hidden.shape[0] - 1, 1))
     cov = (hidden_centered.T @ hidden_centered) / batch_denom
     feature_std = jnp.sqrt(feature_var + eps)
     corr = cov / (feature_std[:, None] * feature_std[None, :] + eps)
     corr_mask = 1.0 - jnp.eye(corr.shape[0], dtype=corr.dtype)
-    metrics["cnn_dense/mean_abs_corr"] = (
+    metrics[f"{prefix}/mean_abs_corr"] = (
         jnp.sum(jnp.abs(corr) * corr_mask) / (jnp.sum(corr_mask) + eps)
     )
 
@@ -577,21 +675,19 @@ def cnn_dense_metrics(
     eig_sum = jnp.sum(eigvals)
     eig_sq_sum = jnp.sum(jnp.square(eigvals))
     top_eig = jnp.max(eigvals)
-    metrics["cnn_dense/participation_ratio"] = (eig_sum ** 2) / (eig_sq_sum + eps)
-    metrics["cnn_dense/top_eig_fraction"] = top_eig / (eig_sum + eps)
-    metrics["cnn_dense/stable_rank"] = eig_sum / (top_eig + eps)
+    metrics[f"{prefix}/participation_ratio"] = (eig_sum ** 2) / (eig_sq_sum + eps)
+    metrics[f"{prefix}/top_eig_fraction"] = top_eig / (eig_sum + eps)
+    metrics[f"{prefix}/stable_rank"] = eig_sum / (top_eig + eps)
 
-    dense_kernel = network_params["params"]["Dense_0"]["kernel"]
-    dense_kernel_grad = network_grads["params"]["Dense_0"]["kernel"]
     singular_values = jnp.linalg.svd(dense_kernel, compute_uv=False)
     sigma_max = jnp.max(singular_values)
-    metrics["cnn_dense/weight_mean"] = jnp.mean(dense_kernel)
-    metrics["cnn_dense/weight_std"] = jnp.std(dense_kernel)
-    metrics["cnn_dense/weight_spectral_norm"] = sigma_max
-    metrics["cnn_dense/weight_stable_rank"] = (
+    metrics[f"{prefix}/weight_mean"] = jnp.mean(dense_kernel)
+    metrics[f"{prefix}/weight_std"] = jnp.std(dense_kernel)
+    metrics[f"{prefix}/weight_spectral_norm"] = sigma_max
+    metrics[f"{prefix}/weight_stable_rank"] = (
         jnp.sum(jnp.square(singular_values)) / (jnp.square(sigma_max) + eps)
     )
-    metrics["cnn_dense/weight_grad_norm"] = jnp.linalg.norm(dense_kernel_grad)
+    metrics[f"{prefix}/weight_grad_norm"] = jnp.linalg.norm(dense_kernel_grad)
 
     return metrics
 
@@ -617,6 +713,194 @@ def projected_latent_metrics(projected: jnp.ndarray, prefix: str = "sigreg_proj"
     metrics[f"{prefix}/top_eig_fraction"] = top_eig / (eig_sum + eps)
     metrics[f"{prefix}/participation_ratio"] = (eig_sum ** 2) / (eig_sq_sum + eps)
     metrics[f"{prefix}/stable_rank"] = eig_sum / (top_eig + eps)
+    return metrics
+
+
+def split_actor_critic_hiddens(encoded):
+    """Return actor/critic hiddens from a shared or split encoder output."""
+    if isinstance(encoded, tuple):
+        return encoded
+    return encoded, encoded
+
+
+def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...], ...]:
+    """Parameter paths that should receive encoder-final Muon."""
+    if encoder_type.lower() == "split_cnn":
+        return (
+            ("network", "params", "actor_dense", "kernel"),
+            ("network", "params", "critic_dense", "kernel"),
+        )
+    if encoder_type.lower() == "innovation_direct_cnn":
+        return (("network", "params", "innovation_projector", "kernel"),)
+    return (("network", "params", "Dense_0", "kernel"),)
+
+
+def policy_output_metrics(
+    actor_mean: jnp.ndarray,
+    actor_logstd: jnp.ndarray,
+    values: jnp.ndarray,
+) -> dict:
+    """Measure how observation-conditioned the current policy/value outputs are."""
+    eps = 1e-8
+    metrics = {}
+
+    action_mean_std = jnp.std(actor_mean, axis=0)
+    action_noise_std = jnp.exp(actor_logstd)
+
+    metrics["policy/mean_action_obs_std_avg"] = jnp.mean(action_mean_std)
+    metrics["policy/mean_action_obs_std_min"] = jnp.min(action_mean_std)
+    metrics["policy/mean_action_obs_std_max"] = jnp.max(action_mean_std)
+    metrics["policy/action_noise_std_avg"] = jnp.mean(action_noise_std)
+    metrics["policy/action_noise_std_min"] = jnp.min(action_noise_std)
+    metrics["policy/action_noise_std_max"] = jnp.max(action_noise_std)
+    metrics["policy/obs_to_noise_ratio"] = (
+        jnp.mean(action_mean_std) / (jnp.mean(action_noise_std) + eps)
+    )
+    metrics["policy/mean_action_norm_mean"] = jnp.mean(jnp.linalg.norm(actor_mean, axis=-1))
+    metrics["policy/mean_action_norm_std"] = jnp.std(jnp.linalg.norm(actor_mean, axis=-1))
+    metrics["policy/logstd_mean"] = jnp.mean(actor_logstd)
+    metrics["policy/logstd_std"] = jnp.std(actor_logstd)
+    metrics["value/obs_std"] = jnp.std(values)
+    metrics["value/obs_range"] = jnp.max(values) - jnp.min(values)
+
+    return metrics
+
+
+def vicreg_variance_penalty(
+    hidden: jnp.ndarray,
+    target: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """VICReg variance term on the shared hidden representation."""
+    eps = 1e-4
+    target = jnp.asarray(target, dtype=hidden.dtype)
+    unit_std = jnp.sqrt(jnp.var(hidden, axis=0) + eps)
+    gap = jax.nn.relu(target - unit_std)
+    return jnp.mean(gap), jnp.mean(unit_std), jnp.mean(unit_std < target)
+
+
+
+def lower_tail_variance_floor_penalty(
+    hidden: jnp.ndarray,
+    target: float,
+    bottom_frac: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Encourage the weakest hidden directions to keep nontrivial variance."""
+    eps = 1e-8
+    target = jnp.asarray(target, dtype=hidden.dtype)
+    unit_std = jnp.sqrt(jnp.var(hidden, axis=0) + eps)
+    frac = float(np.clip(bottom_frac, 0.0, 1.0))
+    bottom_k = max(1, int(np.ceil(hidden.shape[-1] * frac)))
+    bottom_std = jnp.sort(unit_std)[:bottom_k]
+    gap = jax.nn.relu(target - bottom_std)
+    return (
+        jnp.mean(jnp.square(gap)),
+        jnp.mean(bottom_std),
+        jnp.mean(bottom_std < target),
+    )
+
+
+
+def pre_ln_std_cap_penalty(
+    dense_pre_ln: jnp.ndarray,
+    max_std: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """One-sided cap on encoder dense pre-LayerNorm scale."""
+    max_std = jnp.asarray(max_std, dtype=dense_pre_ln.dtype)
+    pre_ln_std = jnp.std(dense_pre_ln)
+    gap = jax.nn.relu(pre_ln_std - max_std)
+    return jnp.square(gap), pre_ln_std
+
+
+
+def actor_conditionality_penalty(
+    actor_mean: jnp.ndarray,
+    advantages: jnp.ndarray,
+    target: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Encourage the actor mean to vary across important minibatch states."""
+    eps = 1e-8
+    target = jnp.asarray(target, dtype=actor_mean.dtype)
+    weights = jax.lax.stop_gradient(jnp.abs(advantages)) + eps
+    weights = weights / jnp.sum(weights)
+    weighted_mean = jnp.sum(weights[:, None] * actor_mean, axis=0)
+    centered = actor_mean - weighted_mean
+    weighted_var = jnp.sum(weights[:, None] * jnp.square(centered), axis=0)
+    mu_std = jnp.mean(jnp.sqrt(weighted_var + eps))
+    gap = jax.nn.relu(target - mu_std)
+    return jnp.square(gap), mu_std
+
+
+
+def actor_noise_std_cap_penalty(
+    actor_logstd: jnp.ndarray,
+    max_std: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Discourage excessive action noise during the early training window."""
+    action_noise_std = jnp.exp(actor_logstd)
+    noise_std_avg = jnp.mean(action_noise_std)
+    max_std = jnp.asarray(max_std, dtype=noise_std_avg.dtype)
+    gap = jax.nn.relu(noise_std_avg - max_std)
+    return jnp.square(gap), noise_std_avg
+
+
+
+def innovation_dynamics_metrics(
+    u_t: jnp.ndarray,
+    next_u: jnp.ndarray,
+    predicted_next_u: jnp.ndarray,
+    state_term: jnp.ndarray,
+    action_term: jnp.ndarray,
+    next_done: jnp.ndarray,
+) -> dict:
+    """Summarize fit quality and state/action balance for the innovation model."""
+    eps = 1e-8
+    metrics = {}
+
+    mask = (1.0 - next_done.astype(jnp.float32)).reshape((-1, 1))
+    valid_count = jnp.maximum(jnp.sum(mask), 1.0)
+
+    residual = next_u - predicted_next_u
+    masked_next_u = next_u * mask
+    masked_predicted = predicted_next_u * mask
+    masked_residual = residual * mask
+
+    next_u_mean = jnp.sum(masked_next_u, axis=0, keepdims=True) / valid_count
+    centered_next_u = (next_u - next_u_mean) * mask
+
+    residual_ss = jnp.sum(jnp.square(masked_residual))
+    target_ss = jnp.sum(jnp.square(centered_next_u))
+
+    residual_norms = jnp.linalg.norm(masked_residual, axis=-1)
+    target_norms = jnp.linalg.norm(masked_next_u, axis=-1)
+    state_term_norms = jnp.linalg.norm(state_term, axis=-1)
+    action_term_norms = jnp.linalg.norm(action_term, axis=-1)
+
+    cosine = jnp.sum(masked_predicted * masked_next_u, axis=-1) / (
+        jnp.linalg.norm(masked_predicted, axis=-1) * target_norms + eps
+    )
+    valid_rows = jnp.squeeze(mask) > 0
+
+    metrics["innovation_debug/target_norm_mean"] = jnp.sum(target_norms) / valid_count
+    metrics["innovation_debug/pred_norm_mean"] = (
+        jnp.sum(jnp.linalg.norm(masked_predicted, axis=-1)) / valid_count
+    )
+    metrics["innovation_debug/residual_norm_mean"] = jnp.sum(residual_norms) / valid_count
+    metrics["innovation_debug/residual_to_target_ratio"] = (
+        jnp.sum(residual_norms) / (jnp.sum(target_norms) + eps)
+    )
+    metrics["innovation_debug/residual_r2"] = 1.0 - residual_ss / (target_ss + eps)
+    metrics["innovation_debug/cosine_pred_target_mean"] = jnp.mean(
+        jnp.where(valid_rows, cosine, 0.0)
+    )
+    metrics["innovation_debug/state_term_norm_mean"] = jnp.mean(state_term_norms)
+    metrics["innovation_debug/action_term_norm_mean"] = jnp.mean(action_term_norms)
+    metrics["innovation_debug/action_to_state_norm_ratio"] = (
+        jnp.mean(action_term_norms) / (jnp.mean(state_term_norms) + eps)
+    )
+    metrics["innovation_debug/u_std_avg"] = jnp.mean(jnp.std(u_t, axis=0))
+    metrics["innovation_debug/next_u_std_avg"] = jnp.mean(jnp.std(next_u, axis=0))
+    metrics["innovation_debug/residual_std_avg"] = jnp.mean(jnp.std(masked_residual, axis=0))
+
     return metrics
 
 
@@ -657,6 +941,7 @@ def create_optimizer(
     weight_decay: float = 0.0,
     use_heads_muon: bool = True,
     use_encoder_final_muon: bool = False,
+    encoder_final_muon_paths: tuple[tuple[str, ...], ...] = (("network", "params", "Dense_0", "kernel"),),
 ):
     """
     Create optimizer that uses:
@@ -737,12 +1022,14 @@ def create_optimizer(
         'heads_adam': heads_adam_tx,
     }
 
+    encoder_final_muon_paths = set(encoder_final_muon_paths)
+
     # Label function
     def label_fn(params):
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
-                is_encoder_final_dense_kernel = path == ('network', 'params', 'Dense_0', 'kernel')
+                is_encoder_final_dense_kernel = path in encoder_final_muon_paths
                 if use_encoder_final_muon and is_encoder_final_dense_kernel:
                     return 'encoder_final_muon'
                 return 'encoder'
@@ -774,7 +1061,7 @@ def make_pixelbrax_envs(args):
         backend=args.backend,
         env_name=args.env_name,
         n_envs=args.n_envs,
-        seed=args.seed,
+        seed=args.data_seed,
         hw=args.hw,
         distractor=None,
         video_path="datasets/DAVIS",
@@ -809,10 +1096,19 @@ def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.n
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
+    if args.init_seed < 0:
+        args.init_seed = args.seed
+    if args.data_seed < 0:
+        args.data_seed = args.seed
+
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    if args.init_seed == args.seed and args.data_seed == args.seed:
+        run_seed_tag = f"{args.seed}"
+    else:
+        run_seed_tag = f"s{args.seed}_i{args.init_seed}_d{args.data_seed}"
+    run_name = f"{args.env_name}__{args.exp_name}__{run_seed_tag}__{int(time.time())}"
 
     if args.track:
         import wandb
@@ -826,10 +1122,11 @@ if __name__ == "__main__":
         )
 
     # Seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    key = jax.random.PRNGKey(args.seed)
-    key, network_key, innovation_key, actor_key, critic_key = jax.random.split(key, 5)
+    random.seed(args.data_seed)
+    np.random.seed(args.data_seed)
+    key = jax.random.PRNGKey(args.data_seed)
+    init_key = jax.random.PRNGKey(args.init_seed)
+    network_key, innovation_key, actor_key, critic_key = jax.random.split(init_key, 4)
 
     # Environment setup
     print("=" * 60)
@@ -841,6 +1138,8 @@ if __name__ == "__main__":
     print(f"num steps per rollout: {args.num_steps}")
     print(f"num envs: {args.n_envs}")
     print(f"seed: {args.seed}")
+    print(f"init_seed: {args.init_seed}")
+    print(f"data_seed: {args.data_seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
 
@@ -882,9 +1181,9 @@ if __name__ == "__main__":
     print("=" * 60)
 
     encoder_type = args.encoder_type.lower()
-    if encoder_type not in {"cnn", "sigreg_cnn", "innovation_cnn", "mlp"}:
+    if encoder_type not in {"cnn", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
         raise ValueError(
-            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['cnn', 'sigreg_cnn', 'innovation_cnn', 'mlp']"
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['cnn', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
         )
 
     sigreg_mode = args.sigreg_mode.lower()
@@ -894,14 +1193,14 @@ if __name__ == "__main__":
         )
     if sigreg_mode == "projected" and encoder_type != "sigreg_cnn":
         raise ValueError("Projected SIGReg requires encoder_type='sigreg_cnn'.")
-    if args.innovation_coef > 0 and encoder_type != "innovation_cnn":
-        raise ValueError("Innovation-aware regularization requires encoder_type='innovation_cnn'.")
+    if args.innovation_coef > 0 and encoder_type not in {"innovation_cnn", "innovation_direct_cnn"}:
+        raise ValueError("Innovation-aware regularization requires encoder_type in {'innovation_cnn', 'innovation_direct_cnn'}.")
 
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
 
     # Get observation shape
-    reset_rng = jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs)
+    reset_rng = jax.random.split(jax.random.PRNGKey(args.data_seed), args.n_envs)
     init_env_state = envs.reset(reset_rng)
     raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
     obs_shape = (raw_obs_shape[0], raw_obs_shape[1], raw_obs_shape[2] * args.frame_stack)
@@ -927,22 +1226,38 @@ if __name__ == "__main__":
         crate_step_size=args.encoder_crate_step_size,
     )
     if args.use_crate_head:
-        actor = CRATEActor(action_dim=action_dim, crate_step_size=args.crate_step_size)
+        actor = CRATEActor(
+            action_dim=action_dim,
+            crate_step_size=args.crate_step_size,
+            state_dependent_std=args.state_dependent_std,
+            state_std_tanh_scale=args.state_std_tanh_scale,
+            logstd_min=args.actor_logstd_min,
+            logstd_max=args.actor_logstd_max,
+        )
         critic = CRATECritic(crate_step_size=args.crate_step_size)
         print(f"Using CRATE heads with step_size={args.crate_step_size}")
     else:
-        actor = Actor(action_dim=action_dim)
+        actor = Actor(
+            action_dim=action_dim,
+            state_dependent_std=args.state_dependent_std,
+            state_std_tanh_scale=args.state_std_tanh_scale,
+            logstd_min=args.actor_logstd_min,
+            logstd_max=args.actor_logstd_max,
+        )
         critic = Critic()
 
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
     innovation_model = None
-    dummy_hidden = network.apply(network_params, dummy_obs)
+    dummy_actor_hidden, dummy_critic_hidden = split_actor_critic_hiddens(
+        network.apply(network_params, dummy_obs)
+    )
+    encoder_muon_paths = encoder_final_muon_kernel_paths(encoder_type)
 
     params_dict = {
         "network": network_params,
     }
-    if encoder_type == "innovation_cnn":
+    if encoder_type in {"innovation_cnn", "innovation_direct_cnn"}:
         innovation_model = InnovationDynamics(
             action_dim=action_dim,
             proj_dim=args.innovation_proj_dim,
@@ -953,8 +1268,8 @@ if __name__ == "__main__":
             dummy_debug["u"],
             jnp.zeros((1, action_dim), dtype=jnp.float32),
         )
-    params_dict["actor"] = actor.init(actor_key, dummy_hidden)
-    params_dict["critic"] = critic.init(critic_key, dummy_hidden)
+    params_dict["actor"] = actor.init(actor_key, dummy_actor_hidden)
+    params_dict["critic"] = critic.init(critic_key, dummy_critic_hidden)
 
     all_params = flax.core.freeze(params_dict)
 
@@ -982,10 +1297,12 @@ if __name__ == "__main__":
     critic_muon, critic_adam = count_by_type(all_params, "critic")
     encoder_final_muon_params = 0
     if args.use_encoder_final_muon:
-        try:
-            encoder_final_muon_params = all_params["network"]["params"]["Dense_0"]["kernel"].size
-        except KeyError:
-            encoder_final_muon_params = 0
+        flat_all_params = flax.traverse_util.flatten_dict(all_params)
+        encoder_final_muon_params = sum(
+            flat_all_params[path].size
+            for path in encoder_muon_paths
+            if path in flat_all_params
+        )
     encoder_adam_params = encoder_params - encoder_final_muon_params
 
     print(f"\nParameter breakdown:")
@@ -1043,6 +1360,18 @@ if __name__ == "__main__":
         ramp_progress = jnp.clip((update_idx - warmup + 1.0) / jnp.maximum(1.0, ramp), 0.0, 1.0)
         return jnp.where(update_idx < warmup, 0.0, base_coef * ramp_progress)
 
+    def early_window_coef(
+        base_coef: float,
+        update_idx: int,
+        stop_updates: int = 0,
+    ):
+        """Keep a coefficient on only during the initial PPO update window."""
+        if base_coef <= 0 or stop_updates <= 0:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        update_idx = jnp.asarray(update_idx, dtype=jnp.float32)
+        stop = float(max(0, stop_updates))
+        return jnp.where(update_idx < stop, base_coef, 0.0)
+
     if args.anneal_lr:
         encoder_lr = make_linear_schedule(args.encoder_lr, args.encoder_warmup_updates)
         heads_adam_lr = make_linear_schedule(args.heads_adam_lr, warmup_updates=0)
@@ -1075,6 +1404,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         use_heads_muon=args.use_heads_muon,
         use_encoder_final_muon=args.use_encoder_final_muon,
+        encoder_final_muon_paths=encoder_muon_paths,
     )
 
     agent_state = TrainState.create(
@@ -1087,14 +1417,29 @@ if __name__ == "__main__":
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
+    innovation_debug_apply = None
     if innovation_model is not None:
+        innovation_debug_apply = jax.jit(
+            innovation_model.apply,
+            static_argnames=("return_intermediates",),
+        )
         innovation_model.apply = jax.jit(innovation_model.apply)
 
 
     def encode_with_intermediates(network_params, obs):
-        if encoder_type not in {"cnn", "sigreg_cnn", "innovation_cnn"}:
+        if encoder_type not in {"cnn", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
             raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
         return network_debug_apply(network_params, obs, return_intermediates=True)
+
+    def innovation_with_intermediates(innovation_params, u_t, action):
+        if innovation_debug_apply is None:
+            raise ValueError("innovation intermediates requested without innovation model")
+        return innovation_debug_apply(
+            innovation_params,
+            u_t,
+            action,
+            return_intermediates=True,
+        )
 
     @jax.jit
     def get_action_and_value(
@@ -1103,15 +1448,17 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """Sample action, calculate value, logprob, and return updated key."""
-        hidden = network.apply(agent_state.params["network"], next_obs)
-        actor_mean, actor_logstd = actor.apply(agent_state.params["actor"], hidden)
+        actor_hidden, critic_hidden = split_actor_critic_hiddens(
+            network.apply(agent_state.params["network"], next_obs)
+        )
+        actor_mean, actor_logstd = actor.apply(agent_state.params["actor"], actor_hidden)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         key, subkey = jax.random.split(key)
         action = pi.sample(seed=subkey)
         logprob = pi.log_prob(action)
-        value = critic.apply(agent_state.params["critic"], hidden)
+        value = critic.apply(agent_state.params["critic"], critic_hidden)
 
         action = jnp.clip(action, -args.max_action, args.max_action)
 
@@ -1124,14 +1471,16 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """Calculate value, logprob of supplied action, and entropy."""
-        hidden = network.apply(params["network"], x)
-        actor_mean, actor_logstd = actor.apply(params["actor"], hidden)
+        actor_hidden, critic_hidden = split_actor_critic_hiddens(
+            network.apply(params["network"], x)
+        )
+        actor_mean, actor_logstd = actor.apply(params["actor"], actor_hidden)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
-        value = critic.apply(params["critic"], hidden).squeeze(-1)
+        value = critic.apply(params["critic"], critic_hidden).squeeze(-1)
 
         return logprob, entropy, value
 
@@ -1155,7 +1504,9 @@ if __name__ == "__main__":
     ):
         next_value = critic.apply(
             agent_state.params["critic"],
-            network.apply(agent_state.params["network"], next_obs),
+            split_actor_critic_hiddens(
+                network.apply(agent_state.params["network"], next_obs)
+            )[1],
         ).squeeze(-1)
 
         advantages = jnp.zeros((args.n_envs,))
@@ -1188,6 +1539,11 @@ if __name__ == "__main__":
         aug_key,
         sigreg_coef_current,
         innovation_coef_current,
+        vicreg_var_coef_current,
+        bottleneck_var_coef_current,
+        bottleneck_pre_ln_coef_current,
+        actor_cond_coef_current,
+        actor_noise_coef_current,
     ):
         """PPO loss function."""
         if args.use_augmentation:
@@ -1203,10 +1559,29 @@ if __name__ == "__main__":
         innovation_total = jnp.asarray(0.0, dtype=jnp.float32)
         innovation_re = jnp.asarray(0.0, dtype=jnp.float32)
         innovation_im = jnp.asarray(0.0, dtype=jnp.float32)
+        vicreg_var_total = jnp.asarray(0.0, dtype=jnp.float32)
+        vicreg_var_unit_std_avg = jnp.asarray(0.0, dtype=jnp.float32)
+        vicreg_var_below_target_frac = jnp.asarray(0.0, dtype=jnp.float32)
+        bottleneck_var_total = jnp.asarray(0.0, dtype=jnp.float32)
+        bottleneck_bottom_std_avg = jnp.asarray(0.0, dtype=jnp.float32)
+        bottleneck_bottom_below_target_frac = jnp.asarray(0.0, dtype=jnp.float32)
+        bottleneck_pre_ln_total = jnp.asarray(0.0, dtype=jnp.float32)
+        bottleneck_pre_ln_std = jnp.asarray(0.0, dtype=jnp.float32)
+        actor_cond_total = jnp.asarray(0.0, dtype=jnp.float32)
+        actor_cond_mu_std = jnp.asarray(0.0, dtype=jnp.float32)
+        actor_noise_total = jnp.asarray(0.0, dtype=jnp.float32)
+        actor_noise_std_avg = jnp.asarray(0.0, dtype=jnp.float32)
+        dense_pre_ln = None
+        actor_hidden = None
+        critic_hidden = None
+        actor_dense_pre_ln = None
+        critic_dense_pre_ln = None
 
         if encoder_type == "sigreg_cnn":
             encoder_debug = encode_with_intermediates(params["network"], x)
-            hidden = encoder_debug["hidden"]
+            actor_hidden = encoder_debug["hidden"]
+            critic_hidden = actor_hidden
+            dense_pre_ln = encoder_debug["dense_pre_ln"]
             if sigreg_mode == "projected":
                 sigreg_total, sigreg_re, sigreg_im = sigreg_loss(
                     encoder_debug["u"],
@@ -1215,9 +1590,11 @@ if __name__ == "__main__":
                     num_t=args.sigreg_num_t,
                     t_max=args.sigreg_t_max,
                 )
-        elif encoder_type == "innovation_cnn":
+        elif encoder_type in {"innovation_cnn", "innovation_direct_cnn"}:
             encoder_debug = encode_with_intermediates(params["network"], x)
-            hidden = encoder_debug["hidden"]
+            actor_hidden = encoder_debug["policy_hidden"]
+            critic_hidden = actor_hidden
+            dense_pre_ln = encoder_debug["dense_pre_ln"]
             aux_key, innovation_key = jax.random.split(aux_key)
             next_encoder_debug = encode_with_intermediates(params["network"], next_x)
             predicted_next_u = innovation_model.apply(
@@ -1235,14 +1612,128 @@ if __name__ == "__main__":
                 num_t=args.innovation_num_t,
                 t_max=args.innovation_t_max,
             )
+        elif encoder_type == "split_cnn":
+            if args.bottleneck_pre_ln_coef > 0.0:
+                encoder_debug = encode_with_intermediates(params["network"], x)
+                actor_hidden = encoder_debug["actor_hidden"]
+                critic_hidden = encoder_debug["critic_hidden"]
+                actor_dense_pre_ln = encoder_debug["actor_dense_pre_ln"]
+                critic_dense_pre_ln = encoder_debug["critic_dense_pre_ln"]
+            else:
+                actor_hidden, critic_hidden = split_actor_critic_hiddens(
+                    network.apply(params["network"], x)
+                )
+        elif encoder_type == "cnn" and args.bottleneck_pre_ln_coef > 0.0:
+            encoder_debug = encode_with_intermediates(params["network"], x)
+            actor_hidden = encoder_debug["hidden"]
+            critic_hidden = actor_hidden
+            dense_pre_ln = encoder_debug["dense_pre_ln"]
         else:
-            hidden = network.apply(params["network"], x)
+            actor_hidden, critic_hidden = split_actor_critic_hiddens(
+                network.apply(params["network"], x)
+            )
 
-        actor_mean, actor_logstd = actor.apply(params["actor"], hidden)
+        if encoder_type == "split_cnn":
+            (
+                actor_vicreg_total,
+                actor_vicreg_unit_std_avg,
+                actor_vicreg_below_target_frac,
+            ) = vicreg_variance_penalty(actor_hidden, args.vicreg_var_target)
+            (
+                critic_vicreg_total,
+                critic_vicreg_unit_std_avg,
+                critic_vicreg_below_target_frac,
+            ) = vicreg_variance_penalty(critic_hidden, args.vicreg_var_target)
+            vicreg_var_total = 0.5 * (actor_vicreg_total + critic_vicreg_total)
+            vicreg_var_unit_std_avg = 0.5 * (
+                actor_vicreg_unit_std_avg + critic_vicreg_unit_std_avg
+            )
+            vicreg_var_below_target_frac = 0.5 * (
+                actor_vicreg_below_target_frac + critic_vicreg_below_target_frac
+            )
+
+            (
+                actor_bottleneck_var_total,
+                actor_bottom_std_avg,
+                actor_bottom_below_target_frac,
+            ) = lower_tail_variance_floor_penalty(
+                actor_hidden,
+                args.bottleneck_var_target,
+                args.bottleneck_var_bottom_frac,
+            )
+            (
+                critic_bottleneck_var_total,
+                critic_bottom_std_avg,
+                critic_bottom_below_target_frac,
+            ) = lower_tail_variance_floor_penalty(
+                critic_hidden,
+                args.bottleneck_var_target,
+                args.bottleneck_var_bottom_frac,
+            )
+            bottleneck_var_total = 0.5 * (
+                actor_bottleneck_var_total + critic_bottleneck_var_total
+            )
+            bottleneck_bottom_std_avg = 0.5 * (
+                actor_bottom_std_avg + critic_bottom_std_avg
+            )
+            bottleneck_bottom_below_target_frac = 0.5 * (
+                actor_bottom_below_target_frac + critic_bottom_below_target_frac
+            )
+            if actor_dense_pre_ln is not None and critic_dense_pre_ln is not None:
+                actor_pre_ln_total, actor_pre_ln_std = pre_ln_std_cap_penalty(
+                    actor_dense_pre_ln,
+                    args.bottleneck_pre_ln_max_std,
+                )
+                critic_pre_ln_total, critic_pre_ln_std = pre_ln_std_cap_penalty(
+                    critic_dense_pre_ln,
+                    args.bottleneck_pre_ln_max_std,
+                )
+                bottleneck_pre_ln_total = 0.5 * (
+                    actor_pre_ln_total + critic_pre_ln_total
+                )
+                bottleneck_pre_ln_std = 0.5 * (
+                    actor_pre_ln_std + critic_pre_ln_std
+                )
+        else:
+            (
+                vicreg_var_total,
+                vicreg_var_unit_std_avg,
+                vicreg_var_below_target_frac,
+            ) = vicreg_variance_penalty(actor_hidden, args.vicreg_var_target)
+            (
+                bottleneck_var_total,
+                bottleneck_bottom_std_avg,
+                bottleneck_bottom_below_target_frac,
+            ) = lower_tail_variance_floor_penalty(
+                actor_hidden,
+                args.bottleneck_var_target,
+                args.bottleneck_var_bottom_frac,
+            )
+            if dense_pre_ln is not None:
+                bottleneck_pre_ln_total, bottleneck_pre_ln_std = pre_ln_std_cap_penalty(
+                    dense_pre_ln,
+                    args.bottleneck_pre_ln_max_std,
+                )
+
+        actor_cond_mean, _ = actor.apply(
+            params["actor"],
+            jax.lax.stop_gradient(actor_hidden),
+        )
+        actor_cond_total, actor_cond_mu_std = actor_conditionality_penalty(
+            actor_cond_mean,
+            mb_advantages,
+            args.actor_cond_target,
+        )
+
+        actor_mean, actor_logstd = actor.apply(params["actor"], actor_hidden)
+        actor_noise_total, actor_noise_std_avg = actor_noise_std_cap_penalty(
+            actor_logstd,
+            args.actor_noise_max_std,
+        )
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
         newlogprob = pi.log_prob(a)
         entropy = pi.entropy()
-        newvalue = critic.apply(params["critic"], hidden).squeeze(-1)
+        newvalue = critic.apply(params["critic"], critic_hidden).squeeze(-1)
 
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
@@ -1270,6 +1761,11 @@ if __name__ == "__main__":
             + v_loss * args.vf_coef
             + sigreg_coef_current * sigreg_total
             + innovation_coef_current * innovation_total
+            + vicreg_var_coef_current * vicreg_var_total
+            + bottleneck_var_coef_current * bottleneck_var_total
+            + bottleneck_pre_ln_coef_current * bottleneck_pre_ln_total
+            + actor_cond_coef_current * actor_cond_total
+            + actor_noise_coef_current * actor_noise_total
         )
 
         return total_loss, (
@@ -1283,6 +1779,18 @@ if __name__ == "__main__":
             jax.lax.stop_gradient(innovation_total),
             jax.lax.stop_gradient(innovation_re),
             jax.lax.stop_gradient(innovation_im),
+            jax.lax.stop_gradient(vicreg_var_total),
+            jax.lax.stop_gradient(vicreg_var_unit_std_avg),
+            jax.lax.stop_gradient(vicreg_var_below_target_frac),
+            jax.lax.stop_gradient(bottleneck_var_total),
+            jax.lax.stop_gradient(bottleneck_bottom_std_avg),
+            jax.lax.stop_gradient(bottleneck_bottom_below_target_frac),
+            jax.lax.stop_gradient(bottleneck_pre_ln_total),
+            jax.lax.stop_gradient(bottleneck_pre_ln_std),
+            jax.lax.stop_gradient(actor_cond_total),
+            jax.lax.stop_gradient(actor_cond_mu_std),
+            jax.lax.stop_gradient(actor_noise_total),
+            jax.lax.stop_gradient(actor_noise_std_avg),
         )
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
@@ -1294,6 +1802,11 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
         sigreg_coef_current: jnp.ndarray,
         innovation_coef_current: jnp.ndarray,
+        vicreg_var_coef_current: jnp.ndarray,
+        bottleneck_var_coef_current: jnp.ndarray,
+        bottleneck_pre_ln_coef_current: jnp.ndarray,
+        actor_cond_coef_current: jnp.ndarray,
+        actor_noise_coef_current: jnp.ndarray,
     ):
         """PPO update."""
         def update_epoch(carry, unused_inp):
@@ -1329,6 +1842,18 @@ if __name__ == "__main__":
                         innovation_total,
                         innovation_re,
                         innovation_im,
+                        vicreg_var_total,
+                        vicreg_var_unit_std_avg,
+                        vicreg_var_below_target_frac,
+                        bottleneck_var_total,
+                        bottleneck_bottom_std_avg,
+                        bottleneck_bottom_below_target_frac,
+                        bottleneck_pre_ln_total,
+                        bottleneck_pre_ln_std,
+                        actor_cond_total,
+                        actor_cond_mu_std,
+                        actor_noise_total,
+                        actor_noise_std_avg,
                     ),
                 ), grads = ppo_loss_grad_fn(
                     agent_state.params,
@@ -1343,6 +1868,11 @@ if __name__ == "__main__":
                     mb_aug_key,
                     sigreg_coef_current,
                     innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
                 )
 
                 grad_norm = optax.global_norm(grads)
@@ -1360,6 +1890,18 @@ if __name__ == "__main__":
                     innovation_total,
                     innovation_re,
                     innovation_im,
+                    vicreg_var_total,
+                    vicreg_var_unit_std_avg,
+                    vicreg_var_below_target_frac,
+                    bottleneck_var_total,
+                    bottleneck_bottom_std_avg,
+                    bottleneck_bottom_below_target_frac,
+                    bottleneck_pre_ln_total,
+                    bottleneck_pre_ln_std,
+                    actor_cond_total,
+                    actor_cond_mu_std,
+                    actor_noise_total,
+                    actor_noise_std_avg,
                     grad_norm,
                 )
 
@@ -1377,6 +1919,18 @@ if __name__ == "__main__":
                     innovation_total,
                     innovation_re,
                     innovation_im,
+                    vicreg_var_total,
+                    vicreg_var_unit_std_avg,
+                    vicreg_var_below_target_frac,
+                    bottleneck_var_total,
+                    bottleneck_bottom_std_avg,
+                    bottleneck_bottom_below_target_frac,
+                    bottleneck_pre_ln_total,
+                    bottleneck_pre_ln_std,
+                    actor_cond_total,
+                    actor_cond_mu_std,
+                    actor_noise_total,
+                    actor_noise_std_avg,
                     grad_norm,
                 ),
             ) = jax.lax.scan(
@@ -1396,6 +1950,18 @@ if __name__ == "__main__":
                 innovation_total,
                 innovation_re,
                 innovation_im,
+                vicreg_var_total,
+                vicreg_var_unit_std_avg,
+                vicreg_var_below_target_frac,
+                bottleneck_var_total,
+                bottleneck_bottom_std_avg,
+                bottleneck_bottom_below_target_frac,
+                bottleneck_pre_ln_total,
+                bottleneck_pre_ln_std,
+                actor_cond_total,
+                actor_cond_mu_std,
+                actor_noise_total,
+                actor_noise_std_avg,
                 grad_norm,
             )
 
@@ -1414,6 +1980,18 @@ if __name__ == "__main__":
                 innovation_total,
                 innovation_re,
                 innovation_im,
+                vicreg_var_total,
+                vicreg_var_unit_std_avg,
+                vicreg_var_below_target_frac,
+                bottleneck_var_total,
+                bottleneck_bottom_std_avg,
+                bottleneck_bottom_below_target_frac,
+                bottleneck_pre_ln_total,
+                bottleneck_pre_ln_std,
+                actor_cond_total,
+                actor_cond_mu_std,
+                actor_noise_total,
+                actor_noise_std_avg,
                 grad_norm,
             ),
         ) = jax.lax.scan(
@@ -1435,6 +2013,18 @@ if __name__ == "__main__":
             innovation_total,
             innovation_re,
             innovation_im,
+            vicreg_var_total,
+            vicreg_var_unit_std_avg,
+            vicreg_var_below_target_frac,
+            bottleneck_var_total,
+            bottleneck_bottom_std_avg,
+            bottleneck_bottom_below_target_frac,
+            bottleneck_pre_ln_total,
+            bottleneck_pre_ln_std,
+            actor_cond_total,
+            actor_cond_mu_std,
+            actor_noise_total,
+            actor_noise_std_avg,
             grad_norm,
             final_grads,
             key,
@@ -1578,7 +2168,7 @@ if __name__ == "__main__":
             args_dict=vars(args),
             n_eval_envs=args.n_envs,
             n_eval_steps=args.probe_n_eval_steps,
-            seed=args.seed,
+            seed=args.data_seed,
             output_dir=probe_init_output if args.probe_save_plots else None,
         )
         print(f"[probe] step=0 (init) metrics={probe_init_metrics}")
@@ -1633,6 +2223,32 @@ if __name__ == "__main__":
             args.innovation_warmup_updates,
             args.innovation_ramp_updates,
         )
+        vicreg_var_coef_current = sigreg_coef_from_update(
+            args.vicreg_var_coef,
+            iteration - 1,
+            args.vicreg_var_warmup_updates,
+            args.vicreg_var_ramp_updates,
+        )
+        bottleneck_var_coef_current = early_window_coef(
+            args.bottleneck_var_coef,
+            iteration - 1,
+            args.bottleneck_reg_stop_updates,
+        )
+        bottleneck_pre_ln_coef_current = early_window_coef(
+            args.bottleneck_pre_ln_coef,
+            iteration - 1,
+            args.bottleneck_reg_stop_updates,
+        )
+        actor_cond_coef_current = early_window_coef(
+            args.actor_cond_coef,
+            iteration - 1,
+            args.actor_cond_stop_updates,
+        )
+        actor_noise_coef_current = early_window_coef(
+            args.actor_noise_coef,
+            iteration - 1,
+            args.actor_noise_stop_updates,
+        )
         (
             agent_state,
             loss,
@@ -1646,6 +2262,18 @@ if __name__ == "__main__":
             innovation_total,
             innovation_re,
             innovation_im,
+            vicreg_var_total,
+            vicreg_var_unit_std_avg,
+            vicreg_var_below_target_frac,
+            bottleneck_var_total,
+            bottleneck_bottom_std_avg,
+            bottleneck_bottom_below_target_frac,
+            bottleneck_pre_ln_total,
+            bottleneck_pre_ln_std,
+            actor_cond_total,
+            actor_cond_mu_std,
+            actor_noise_total,
+            actor_noise_std_avg,
             grad_norm,
             final_grads,
             key,
@@ -1655,6 +2283,11 @@ if __name__ == "__main__":
             key,
             sigreg_coef_current,
             innovation_coef_current,
+            vicreg_var_coef_current,
+            bottleneck_var_coef_current,
+            bottleneck_pre_ln_coef_current,
+            actor_cond_coef_current,
+            actor_noise_coef_current,
         )
 
         # Online linear probe — fire when global_step crosses the next threshold.
@@ -1670,7 +2303,7 @@ if __name__ == "__main__":
                 args_dict=vars(args),
                 n_eval_envs=args.n_envs,
                 n_eval_steps=args.probe_n_eval_steps,
-                seed=args.seed + iteration,
+                seed=args.data_seed + iteration,
                 output_dir=probe_output if args.probe_save_plots else None,
             )
             print(f"[probe] step={global_step} metrics={probe_metrics}")
@@ -1752,38 +2385,153 @@ if __name__ == "__main__":
                     "losses/innovation_re": innovation_re[-1, -1].item(),
                     "losses/innovation_im": innovation_im[-1, -1].item(),
                     "losses/innovation_coef": float(innovation_coef_current),
+                    "losses/vicreg_var_total": vicreg_var_total[-1, -1].item(),
+                    "losses/vicreg_var_coef": float(vicreg_var_coef_current),
+                    "vicreg_var/unit_std_avg": vicreg_var_unit_std_avg[-1, -1].item(),
+                    "vicreg_var/below_target_frac": vicreg_var_below_target_frac[-1, -1].item(),
+                    "vicreg_var/target": args.vicreg_var_target,
+                    "losses/bottleneck_var_total": bottleneck_var_total[-1, -1].item(),
+                    "losses/bottleneck_var_coef": float(bottleneck_var_coef_current),
+                    "losses/bottleneck_pre_ln_total": bottleneck_pre_ln_total[-1, -1].item(),
+                    "losses/bottleneck_pre_ln_coef": float(bottleneck_pre_ln_coef_current),
+                    "bottleneck/bottom_std_avg": bottleneck_bottom_std_avg[-1, -1].item(),
+                    "bottleneck/bottom_below_target_frac": bottleneck_bottom_below_target_frac[-1, -1].item(),
+                    "bottleneck/var_target": args.bottleneck_var_target,
+                    "bottleneck/var_bottom_frac": args.bottleneck_var_bottom_frac,
+                    "bottleneck/pre_ln_std_train": bottleneck_pre_ln_std[-1, -1].item(),
+                    "bottleneck/pre_ln_max_std": args.bottleneck_pre_ln_max_std,
+                    "bottleneck/reg_stop_updates": args.bottleneck_reg_stop_updates,
+                    "losses/actor_cond_total": actor_cond_total[-1, -1].item(),
+                    "losses/actor_cond_coef": float(actor_cond_coef_current),
+                    "actor_cond/mu_std_advw": actor_cond_mu_std[-1, -1].item(),
+                    "actor_cond/target": args.actor_cond_target,
+                    "actor_cond/stop_updates": args.actor_cond_stop_updates,
+                    "losses/actor_noise_total": actor_noise_total[-1, -1].item(),
+                    "losses/actor_noise_coef": float(actor_noise_coef_current),
+                    "actor_noise/std_avg": actor_noise_std_avg[-1, -1].item(),
+                    "actor_noise/max_std": args.actor_noise_max_std,
+                    "actor_noise/stop_updates": args.actor_noise_stop_updates,
                 }
 
                 # Debug metrics for encoder representations
                 if args.debug_repr:
                     sample_obs = storage.obs[0, :256]
-                    if encoder_type in {"cnn", "sigreg_cnn", "innovation_cnn"}:
+                    sample_next_obs = storage.next_obs[0, :256]
+                    sample_actions = storage.actions[0, :256]
+                    sample_next_done = storage.next_dones[0, :256]
+                    if encoder_type in {"cnn", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
                         cnn_debug = encode_with_intermediates(
                             agent_state.params["network"],
                             sample_obs,
                         )
-                        hidden = cnn_debug["hidden"]
-                        dense_metrics = cnn_dense_metrics(
-                            cnn_debug["dense_pre_ln"],
-                            hidden,
-                            agent_state.params["network"],
-                            final_grads["network"],
-                        )
-                        for k, v in dense_metrics.items():
-                            log_dict[k] = float(v)
+                        if encoder_type == "split_cnn":
+                            hidden = cnn_debug["actor_hidden"]
+                            critic_hidden_debug = cnn_debug["critic_hidden"]
+                            actor_mean_debug, actor_logstd_debug = actor.apply(
+                                agent_state.params["actor"],
+                                hidden,
+                            )
+                            values_debug = critic.apply(
+                                agent_state.params["critic"],
+                                critic_hidden_debug,
+                            ).squeeze(-1)
+                            dense_metrics = cnn_dense_metrics(
+                                cnn_debug["actor_dense_pre_ln"],
+                                hidden,
+                                agent_state.params["network"]["params"]["actor_dense"]["kernel"],
+                                final_grads["network"]["params"]["actor_dense"]["kernel"],
+                            )
+                            for k, v in dense_metrics.items():
+                                log_dict[k] = float(v)
+                            critic_dense_metrics = cnn_dense_metrics(
+                                cnn_debug["critic_dense_pre_ln"],
+                                critic_hidden_debug,
+                                agent_state.params["network"]["params"]["critic_dense"]["kernel"],
+                                final_grads["network"]["params"]["critic_dense"]["kernel"],
+                                prefix="critic_cnn_dense",
+                            )
+                            for k, v in critic_dense_metrics.items():
+                                log_dict[k] = float(v)
+                            critic_repr_metrics = encoder_repr_metrics(critic_hidden_debug)
+                            for k, v in critic_repr_metrics.items():
+                                log_dict[k.replace("repr/", "critic_repr/")] = float(v)
+                        else:
+                            policy_hidden_debug = cnn_debug.get("policy_hidden", cnn_debug["hidden"])
+                            hidden = policy_hidden_debug
+                            actor_mean_debug, actor_logstd_debug = actor.apply(
+                                agent_state.params["actor"],
+                                policy_hidden_debug,
+                            )
+                            values_debug = critic.apply(
+                                agent_state.params["critic"],
+                                policy_hidden_debug,
+                            ).squeeze(-1)
+                            if encoder_type == "innovation_direct_cnn":
+                                dense_metrics = cnn_dense_metrics(
+                                    cnn_debug["projector_pre_ln"],
+                                    policy_hidden_debug,
+                                    agent_state.params["network"]["params"]["innovation_projector"]["kernel"],
+                                    final_grads["network"]["params"]["innovation_projector"]["kernel"],
+                                )
+                            else:
+                                dense_metrics = cnn_dense_metrics(
+                                    cnn_debug["dense_pre_ln"],
+                                    cnn_debug["hidden"],
+                                    agent_state.params["network"]["params"]["Dense_0"]["kernel"],
+                                    final_grads["network"]["params"]["Dense_0"]["kernel"],
+                                )
+                            for k, v in dense_metrics.items():
+                                log_dict[k] = float(v)
                         if encoder_type == "sigreg_cnn":
                             proj_metrics = projected_latent_metrics(cnn_debug["u"], prefix="sigreg_proj")
                             for k, v in proj_metrics.items():
                                 log_dict[k] = float(v)
-                        if encoder_type == "innovation_cnn":
+                        if encoder_type in {"innovation_cnn", "innovation_direct_cnn"}:
                             proj_metrics = projected_latent_metrics(cnn_debug["u"], prefix="innovation_proj")
                             for k, v in proj_metrics.items():
                                 log_dict[k] = float(v)
+                            next_cnn_debug = encode_with_intermediates(
+                                agent_state.params["network"],
+                                sample_next_obs,
+                            )
+                            innovation_debug = innovation_with_intermediates(
+                                agent_state.params["innovation"],
+                                cnn_debug["u"],
+                                sample_actions,
+                            )
+                            innovation_metrics = innovation_dynamics_metrics(
+                                cnn_debug["u"],
+                                next_cnn_debug["u"],
+                                innovation_debug["predicted_next_u"],
+                                innovation_debug["state_term"],
+                                innovation_debug["action_term"],
+                                sample_next_done,
+                            )
+                            for k, v in innovation_metrics.items():
+                                log_dict[k] = float(v)
                     else:
-                        hidden = network.apply(agent_state.params["network"], sample_obs)
+                        hidden, critic_hidden_debug = split_actor_critic_hiddens(
+                            network.apply(agent_state.params["network"], sample_obs)
+                        )
+                        actor_mean_debug, actor_logstd_debug = actor.apply(
+                            agent_state.params["actor"],
+                            hidden,
+                        )
+                        values_debug = critic.apply(
+                            agent_state.params["critic"],
+                            critic_hidden_debug,
+                        ).squeeze(-1)
 
                     repr_metrics = encoder_repr_metrics(hidden)
                     for k, v in repr_metrics.items():
+                        log_dict[k] = float(v)
+
+                    policy_metrics = policy_output_metrics(
+                        actor_mean_debug,
+                        actor_logstd_debug,
+                        values_debug,
+                    )
+                    for k, v in policy_metrics.items():
                         log_dict[k] = float(v)
 
                     grad_metrics = compute_grad_norms(final_grads)

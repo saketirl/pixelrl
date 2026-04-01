@@ -493,6 +493,80 @@ class CNNEncoder(nn.Module):
 
 
 
+class SplitActorCriticCNNEncoder(nn.Module):
+    """CNN encoder with a shared trunk and separate actor/critic bottlenecks."""
+
+    tanh_scale: float = 0.5
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+
+        actor_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="actor_dense",
+        )(x)
+        actor_hidden = nn.LayerNorm(name="actor_ln")(actor_dense_pre_ln)
+        actor_hidden = nn.tanh(self.tanh_scale * actor_hidden)
+
+        critic_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense",
+        )(x)
+        critic_hidden = nn.LayerNorm(name="critic_ln")(critic_dense_pre_ln)
+        critic_hidden = nn.tanh(self.tanh_scale * critic_hidden)
+
+        if return_intermediates:
+            return {
+                "hidden": actor_hidden,
+                "dense_pre_ln": actor_dense_pre_ln,
+                "actor_hidden": actor_hidden,
+                "critic_hidden": critic_hidden,
+                "actor_dense_pre_ln": actor_dense_pre_ln,
+                "critic_dense_pre_ln": critic_dense_pre_ln,
+            }
+        return actor_hidden, critic_hidden
+
+
 class CRATEFeedForward(nn.Module):
     """CRATE-style FeedForward layer implementing an ISTA step."""
 
@@ -592,10 +666,11 @@ class ProjectedSIGRegCNNEncoder(nn.Module):
 
 
 class InnovationCNNEncoder(nn.Module):
-    """Default CNN encoder with an auxiliary innovation projector branch."""
+    """CNN encoder with an auxiliary innovation projector branch."""
 
     tanh_scale: float = 0.5
     innovation_proj_dim: int = 64
+    policy_on_projected: bool = False
 
     @nn.compact
     def __call__(self, x, return_intermediates: bool = False):
@@ -650,15 +725,17 @@ class InnovationCNNEncoder(nn.Module):
             name="innovation_projector",
         )(hidden)
         u = nn.LayerNorm(name="innovation_projector_ln")(projector_pre_ln)
+        policy_hidden = u if self.policy_on_projected else hidden
 
         if return_intermediates:
             return {
                 "hidden": hidden,
+                "policy_hidden": policy_hidden,
                 "dense_pre_ln": dense_pre_ln,
                 "u": u,
                 "projector_pre_ln": projector_pre_ln,
             }
-        return hidden
+        return policy_hidden
 
 
 class MLPEncoder(nn.Module):
@@ -696,6 +773,8 @@ def build_encoder(
     kind = encoder_type.lower()
     if kind == "cnn":
         return CNNEncoder(tanh_scale=tanh_scale)
+    if kind == "split_cnn":
+        return SplitActorCriticCNNEncoder(tanh_scale=tanh_scale)
     if kind == "sigreg_cnn":
         return ProjectedSIGRegCNNEncoder(
             tanh_scale=tanh_scale,
@@ -707,6 +786,13 @@ def build_encoder(
         return InnovationCNNEncoder(
             tanh_scale=tanh_scale,
             innovation_proj_dim=innovation_proj_dim,
+            policy_on_projected=False,
+        )
+    if kind == "innovation_direct_cnn":
+        return InnovationCNNEncoder(
+            tanh_scale=tanh_scale,
+            innovation_proj_dim=innovation_proj_dim,
+            policy_on_projected=True,
         )
     if kind == "mlp":
         return MLPEncoder(tanh_scale=tanh_scale)
@@ -760,5 +846,5 @@ def build_encoder(
             apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'sigreg_cnn', 'innovation_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )
