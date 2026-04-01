@@ -720,11 +720,11 @@ class InnovationCNNEncoder(nn.Module):
 
         projector_pre_ln = nn.Dense(
             self.innovation_proj_dim,
-            kernel_init=orthogonal(np.sqrt(2)),
+            kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="innovation_projector",
         )(hidden)
-        u = nn.LayerNorm(name="innovation_projector_ln")(projector_pre_ln)
+        u = projector_pre_ln
         policy_hidden = u if self.policy_on_projected else hidden
 
         if return_intermediates:

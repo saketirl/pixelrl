@@ -18,6 +18,9 @@ FACTOR_MODE="${4:-fixed_init}"
 FIXED_SEED="${5:-0}"
 ENCODER_MUON_LR="${6:-0.001}"
 ENCODER_MUON_MAX_GRAD_NORM="${7:-1.0}"
+INNOVATION_PROJ_DIM="${8:-64}"
+INNOVATION_WARMUP_UPDATES="${9:-500}"
+INNOVATION_RAMP_UPDATES="${10:-500}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,12 +73,12 @@ esac
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
 GROUP_NAME="diagnose_ant_phase_change_innovationdirect_seedfactor_${FACTOR_TAG}_fix${FIXED_SEED}_${GROUP_ID}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="ant_phase_change,diagnosis,env_ant,backend_${BACKEND},seedfactor,${FACTOR_TAG},fixed_seed_${FIXED_SEED},varied_seed_${VARIED_SEED},init_seed_${INIT_SEED},data_seed_${DATA_SEED},headopt_muon,headarch_crate,encoder_innovation_direct,encoder_final_muon,innovation_on,lr_anneal_off,probe_off,1m_steps"
+export WANDB_TAGS="ant_phase_change,diagnosis,env_ant,backend_${BACKEND},seedfactor,${FACTOR_TAG},fixed_seed_${FIXED_SEED},varied_seed_${VARIED_SEED},init_seed_${INIT_SEED},data_seed_${DATA_SEED},headopt_muon,headarch_crate,encoder_innovation_direct,encoder_final_muon,innovation_on,innovation_projdim_${INNOVATION_PROJ_DIM},innovation_warmup_${INNOVATION_WARMUP_UPDATES},innovation_ramp_${INNOVATION_RAMP_UPDATES},lr_anneal_off,probe_off,1m_steps"
 
-EXP_NAME="ppo_muon_ant_phasechange_diag_innovationdirect_seedfactor_${FACTOR_TAG}_fix${FIXED_SEED}_i${INIT_SEED}_d${DATA_SEED}_t${TASK_ID}"
+EXP_NAME="ppo_muon_ant_phasechange_diag_innovationdirect_seedfactor_${FACTOR_TAG}_fix${FIXED_SEED}_i${INIT_SEED}_d${DATA_SEED}_p${INNOVATION_PROJ_DIM}_w${INNOVATION_WARMUP_UPDATES}_r${INNOVATION_RAMP_UPDATES}_t${TASK_ID}"
 
 echo "Running TASK_ID=${TASK_ID}/${#SEEDS[@]} group=${GROUP_NAME}"
-echo "Config: env=ant backend=${BACKEND} factor_mode=${FACTOR_MODE} fixed_seed=${FIXED_SEED} varied_seed=${VARIED_SEED} init_seed=${INIT_SEED} data_seed=${DATA_SEED} encoder=innovation_direct_cnn crate_head=true anneal_lr=false encoder_final_muon=true innovation_on=true encoder_muon_lr=${ENCODER_MUON_LR} encoder_muon_max_grad_norm=${ENCODER_MUON_MAX_GRAD_NORM} probe_interval=0"
+echo "Config: env=ant backend=${BACKEND} factor_mode=${FACTOR_MODE} fixed_seed=${FIXED_SEED} varied_seed=${VARIED_SEED} init_seed=${INIT_SEED} data_seed=${DATA_SEED} encoder=innovation_direct_cnn crate_head=true anneal_lr=false encoder_final_muon=true innovation_on=true innovation_proj_dim=${INNOVATION_PROJ_DIM} innovation_warmup_updates=${INNOVATION_WARMUP_UPDATES} innovation_ramp_updates=${INNOVATION_RAMP_UPDATES} encoder_muon_lr=${ENCODER_MUON_LR} encoder_muon_max_grad_norm=${ENCODER_MUON_MAX_GRAD_NORM} probe_interval=0"
 echo "Exp: ${EXP_NAME}"
 
 COMMON_ARGS=(
@@ -104,12 +107,12 @@ COMMON_ARGS=(
   --encoder-type innovation_direct_cnn
   --sigreg-mode off
   --innovation-coef 1e-3
-  --innovation-proj-dim 64
+  --innovation-proj-dim "${INNOVATION_PROJ_DIM}"
   --innovation-num-slices 16
   --innovation-num-t 8
   --innovation-t-max 5.0
-  --innovation-warmup-updates 500
-  --innovation-ramp-updates 500
+  --innovation-warmup-updates "${INNOVATION_WARMUP_UPDATES}"
+  --innovation-ramp-updates "${INNOVATION_RAMP_UPDATES}"
   --vicreg-var-coef 0.0
   --encoder-lr 3e-4
   --heads-adam-lr 3e-4
