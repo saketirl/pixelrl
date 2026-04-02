@@ -491,3 +491,328 @@ Updated ant conclusion:
 - Early actor conditionality appears to remove most of the catastrophic policy-side failures and lift the floor into the middling regime.
 - The remaining open problem is the second phase change:
   - how to move reliably from a healthy encoder plus middling policy into the strong ant regime.
+
+
+## 2026-04-01 UTC
+
+Ant innovation-direct update:
+
+- Revisited the innovation encoder family with a new `innovation_direct_cnn` variant.
+- The old `innovation_cnn` structure was:
+  - CNN trunk -> `hidden` (`512`-d)
+  - PPO actor/critic read `hidden`
+  - separate projector produced `u` (`innovation_proj_dim`, typically `64`)
+  - innovation auxiliary modeled `u_{t+1}` from `(u_t, a_t)` and regularized the residual `u_{t+1} - \hat{u}_{t+1}`
+- The key issue with that design is that the innovation branch was indirect:
+  - PPO optimized `hidden`
+  - the innovation objective optimized `u`
+  - so the auxiliary could shape the encoder, but the policy did not directly act on the innovation bottleneck
+
+What changed in `innovation_direct_cnn`:
+
+- The encoder still builds the same CNN trunk and `hidden` representation.
+- It still projects to `u` through `innovation_projector`.
+- But PPO now reads `u` directly instead of `hidden`.
+- So the new structure is effectively:
+  - pixels -> CNN trunk -> `hidden` -> `innovation_projector` -> `u`
+  - actor / critic read `u`
+  - innovation dynamics also operate on `u`
+
+Why this is more principled:
+
+- The policy and the innovation auxiliary now act on the same bottleneck.
+- This removes the mismatch in the old design where the innovation latent was only a side objective.
+- If the innovation objective helps, it now helps the actual control representation directly.
+
+Additional implementation detail:
+
+- Encoder-final Muon is routed to the `innovation_projector` kernel for `innovation_direct_cnn`.
+- That means Muon now acts on the actual policy bottleneck for this encoder, rather than on the upstream `512`-d dense layer.
+
+Experiment setup:
+
+- Added a dedicated ant 1M seed-factorization launcher using:
+  - `innovation_direct_cnn`
+  - `CRATE` heads
+  - innovation on (`coef=1e-3`, `proj_dim=64`, warmup/ramp `500/500`)
+  - no LR anneal
+  - encoder-final Muon on the projector / policy bottleneck
+  - same `fixed_init` / `fixed_data` 8-seed layout as the recent ant diagnostics
+
+Current status:
+
+- The direct innovation ant sweep was launched from this new baseline for comparison against the earlier `encoder_final_muon`, `actor_cond`, and split-encoder experiments.
+
+
+Innovation-direct results:
+
+- The direct innovation sweep was the strongest ant result so far in terms of mean / median performance.
+- Aggregate comparison against recent ant baselines:
+  - `encoder_final_muon`: mean about `234`, median about `212`
+  - `actor_cond`: mean about `518`, median about `467`
+  - `innovation_direct_cnn`: mean about `669`, median about `864`
+- Final returns for `innovation_direct_cnn`:
+  - fixed init (`init_seed=0`, vary data): `937.8`, `892.9`, `914.0`, `835.0`
+  - fixed data (`data_seed=0`, vary init): `457.3`, `-80.5`, `911.4`, `483.9`
+
+Most important qualitative observation:
+
+- This is the first ant setup where a good initialization appears robust across data randomness.
+- With fixed good init and varying data randomness, all `4/4` runs became strong.
+- So compared with the earlier seed-factorized sweeps, `innovation_direct_cnn` appears to widen the good basin substantially along the data / rollout axis.
+
+But the init dependence is not gone:
+
+- With fixed data randomness and varying init, only `1/4` inits became strong.
+- Two inits fell into the moderate-return local-minimum gait branch (`~457` and `~484`).
+- One init still failed badly (`~-81`).
+- So the remaining instability now looks much more init-dominated than before.
+
+Representation / policy signature of the two branches:
+
+- Strong runs have a healthy direct policy bottleneck:
+  - `repr/unit_std_avg` on the projected policy latent around `0.19-0.24`
+  - `repr/dead_units_frac = 0`
+  - `policy/obs_to_noise_ratio` around `0.57-0.86`
+  - `policy/action_noise_std_avg` around `0.11-0.16`
+- Failed or moderate runs collapse the projected bottleneck:
+  - `repr/unit_std_avg` around `1e-5`
+  - `repr/dead_units_frac = 1`
+  - near-zero `policy/obs_to_noise_ratio`
+  - moderate action noise (`~0.31-0.43`) for the local-minimum branch, or somewhat larger for the worst failed run
+  - effectively zero `cnn_dense/participation_ratio` on the projected bottleneck
+
+Updated ant interpretation:
+
+- Making the innovation latent the actual policy latent was a meaningful architectural improvement.
+- It appears to convert the ant problem from "both init and data randomness strongly matter" into something closer to "good init is robust, but bad init still collapses".
+- That is a real step forward, even though it is not yet a full solution to the init sensitivity.
+
+## 2026-04-01 UTC - Ant direct innovation projector variant and two-regime picture
+
+Current best direct-innovation ant setup to keep in mind:
+- `innovation_direct_cnn`
+- `innovation_proj_dim=64`
+- `innovation_coef=1e-3`
+- `innovation_warmup_updates=500`, `innovation_ramp_updates=500`
+- `innovation_num_slices=16`, `innovation_num_t=8`, `innovation_t_max=5.0`
+- `encoder_final_muon` on `innovation_projector` (`encoder_muon_lr=1e-3`, `encoder_muon_max_grad_norm=1.0`)
+- `CRATE` heads on actor/critic
+- no LR anneal
+- projector variant from the latest sweep: remove post-projector `LayerNorm`, use `orthogonal(1.0)` on `innovation_projector`
+- other important run settings stayed as in the recent ant diagnostics: `backend=spring`, `frame_stack=4`, `action_repeat=4`, `n_envs=128`, `num_steps=10`, `num_minibatches=32`, `update_epochs=4`, `encoder_lr=3e-4`, `heads_adam_lr=3e-4`, `heads_muon_lr=1e-3`, `ent_coef=0.0`
+
+The recent 2M ant sweep with that projector variant clarified the branch structure. There are two clear regimes:
+
+1. Good-representation regime
+- `cnn_dense/participation_ratio` becomes large
+- projected latent `u` rescues early (`repr/unit_std_avg` rises, `dead_units_frac -> 0`)
+- `policy/obs_to_noise_ratio` rises later
+- these runs become the strong ant policies by 2M (`~900-1085`)
+
+2. Bad-representation but serviceable-policy regime
+- projected latent stays effectively dead
+- `cnn_dense/participation_ratio` stays near zero
+- `repr/unit_std_avg` stays near zero and `dead_units_frac = 1`
+- `policy/obs_to_noise_ratio` stays near zero
+- PPO still finds a serviceable local-minimum gait, ending around `~500` return
+
+So the current direct-innovation ant problem still looks representation-gated, not primarily policy-gated. The key open question is how to reliably push runs into the high-participation-ratio / rescued-latent regime early.
+
+## 2026-04-01 UTC - Ant direct innovation instrumented hidden-vs-projector result
+
+To answer whether the bad branch is upstream encoder collapse or projector-only collapse, I added separate pre-projector metrics on `hidden` alongside the existing post-projector metrics on `u`.
+
+Setup:
+- same direct-innovation ant baseline as above
+- `innovation_direct_cnn`, `proj_dim=64`, warmup/ramp `500/500`
+- no projector `LayerNorm`, `orthogonal(1.0)` projector init
+- `encoder_final_muon`, `CRATE` heads, no LR anneal
+- new logs:
+  - `encoder_hidden/*`
+  - `encoder_hidden_repr/*`
+  - existing `repr/*`, `cnn_dense/*`, and `innovation_proj/*` remain on projected policy latent `u`
+
+Main finding:
+- catastrophic collapse is primarily upstream of the projector.
+- In the instrumented 8-seed sweep:
+  - `3/8` runs had dead `hidden` and dead `u`
+  - `5/8` runs rescued `hidden` and `u`
+  - `0/8` runs showed healthy `hidden` with dead `u`
+- Rescue times for `hidden` and `u` matched almost exactly in the successful runs, e.g. `30,720`, `44,800`, `61,440`, `120,320`, and `~292k`.
+
+Interpretation:
+- The projector is not the main source of the catastrophic branch.
+- When the direct-innovation ant run dies, the upstream encoder bottleneck `hidden` is already collapsed.
+- The projected policy latent `u` mostly mirrors that upstream branch.
+
+Important nuance:
+- Healthy representation is still not sufficient for a top run.
+- In the same sweep, one run had healthy `hidden` and healthy `u` but only reached a middling return (`~410`), so there is still a second policy-quality stage after representation rescue.
+
+Updated conclusion:
+- If the goal is to stop the catastrophic branch, the intervention should target the upstream encoder bottleneck, not just the projector.
+- The current ant picture is now:
+  1. upstream encoder `hidden` either rescues or collapses
+  2. if it rescues, policy quality can still vary from middling to strong
+
+## 2026-04-02 UTC - Ant direct innovation with upstream + projector Muon
+
+I tested a variant of the direct-innovation ant setup that applies encoder MUON to both:
+- upstream encoder bottleneck `Dense_0`
+- projected policy bottleneck `innovation_projector`
+
+Setup:
+- `innovation_direct_cnn`
+- `innovation_proj_dim=64`
+- `innovation_warmup_updates=500`, `innovation_ramp_updates=500`
+- no projector `LayerNorm`, projector init `orthogonal(1.0)`
+- `CRATE` heads
+- no LR anneal
+- same instrumented logs on:
+  - `encoder_hidden/*`, `encoder_hidden_repr/*`
+  - `repr/*`, `cnn_dense/*`, `innovation_proj/*`
+
+Main result:
+- This was not a performance win.
+- 2M final returns:
+  - `-138`, `922`, `552`, `-166`, `-135`, `775`, `-136`, `-133`
+- mean / median about `193 / -134`, much worse than the earlier 2M direct baseline (`~796 / 916`).
+
+What improved:
+- Hard upstream encoder collapse was largely removed.
+- All 8 runs rescued both `hidden` and `u` early, roughly in the `5k-45k` step range for `hidden`, and `32k-45k` for `u` in most runs.
+- So applying MUON to `Dense_0` does directly attack the stage-1 collapse issue.
+
+What failed:
+- The bad branch changed rather than disappeared.
+- Failed runs no longer had dead representations; instead they had weak, low-dimensional latents plus very poor policy commitment.
+- Bad-run signature at 2M:
+  - `encoder_hidden_repr/unit_std_avg ~ 0.042-0.058`
+  - `encoder_hidden/participation_ratio ~ 3.7-6.8`
+  - `repr/unit_std_avg ~ 0.059-0.102`
+  - `cnn_dense/participation_ratio ~ 2.1-3.6`
+  - `policy/obs_to_noise_ratio ~ 0.003-0.010`
+  - `policy/action_noise_std_avg ~ 1.3-5.8`
+- So upstream MUON prevented catastrophic collapse, but often left the actor with a weak latent and a very noisy / undercommitted policy.
+
+Interpretation:
+- Stage 1 and stage 2 are now clearly separable.
+- Upstream MUON helps stage 1 (prevent hard encoder death), but in this form it harms stage 2 enough that overall performance gets worse.
+- So this variant should not replace the current direct baseline.
+
+Updated ant read:
+- The plain direct baseline still looks better overall.
+- If the next intervention targets upstream encoder collapse, it should probably be gentler than full-strength MUON on `Dense_0`.
+
+
+
+## 2026-04-02 UTC - Ant direct innovation partial 2M rerun with trajectory metrics
+
+I reran the current best direct-innovation ant baseline with the new `traj/*` rollout logging enabled. The jobs were cancelled early, but they still reached about `0.79M-0.82M` env steps, which was enough to diagnose the branch.
+
+Setup:
+- same current best direct baseline:
+  - `innovation_direct_cnn`
+  - `innovation_proj_dim=64`
+  - `innovation_coef=1e-3`
+  - `innovation_warmup_updates=500`, `innovation_ramp_updates=500`
+  - projector variant: no post-projector `LayerNorm`, `orthogonal(1.0)` init
+  - `encoder_final_muon` on `innovation_projector`
+  - `CRATE` heads
+  - no LR anneal
+- new trajectory logs:
+  - `traj/action_*`
+  - `traj/reward_*`, `traj/raw_reward_*`
+  - `traj/done_frac`, `traj/env_done_frac`
+  - `traj/frame_delta_*`, `traj/frame_var_*`
+
+Main result:
+- The same two-regime split is already obvious by about `800k` steps.
+- `5/8` runs rescued upstream `hidden` and projected `u`.
+- `3/8` runs stayed fully collapsed.
+- Again there were `0/8` runs with healthy `hidden` but dead `u`.
+
+Returns at cancellation:
+- rescued branch: about `866.6`, `854.4`, `743.5`, `732.3`, and one late-rescue run at `246.9`
+- collapsed branch: about `-145.6`, `-121.3`, `-114.7`
+
+Trajectory metrics now separate the branches as well.
+
+Rescued runs had:
+- `traj/action_dim_std_avg ~ 0.18-0.31`
+- `traj/done_frac ~ 0.004-0.007`
+- `traj/raw_reward_mean ~ 1.27-3.51`
+- `traj/frame_delta_l2_mean ~ 56.4-60.0`
+
+Collapsed runs had:
+- `traj/action_dim_std_avg ~ 0.49-0.55`
+- `traj/done_frac ~ 0.024-0.038`
+- `traj/raw_reward_mean ~ -4.63 to -3.38`
+- `traj/frame_delta_l2_mean ~ 63.1-64.3`
+
+Interpretation:
+- The bad branch is not just an isolated encoder failure.
+- It is already paired with a different early trajectory distribution: noisier actions, more episode termination, worse rewards, and larger frame-to-frame changes.
+- This supports the current view that the ant issue is an exploration-coupled representation problem rather than a purely static representation problem.
+
+One useful nuance from this partial rerun:
+- rescue timing still matters even within the rescued branch.
+- The weakest rescued run (`~246.9`) only rescued `hidden` at about `186,880` steps, much later than the stronger rescued runs (`32k`, `39.7k`, `79.4k`, `181.8k`).
+- So late rescue appears materially weaker than early rescue.
+
+Updated takeaway:
+- early upstream `hidden` rescue is still the main gate
+- but the trajectory metrics suggest that the gate is coupled to the rollout distribution from the very beginning
+- the next diagnostics should compare early rollout statistics of future-rescued vs future-collapsed runs, not just encoder geometry alone
+
+
+## 2026-04-02 UTC - Ant direct innovation with upstream SiLU bottleneck
+
+I replaced the upstream innovation-encoder bottleneck activation with `SiLU` while keeping the current best direct baseline otherwise unchanged.
+
+Setup:
+- `innovation_direct_cnn`
+- upstream bottleneck changed from `LayerNorm -> tanh(scale * ·)` to `LayerNorm -> SiLU`
+- `innovation_proj_dim=64`
+- `innovation_coef=1e-3`
+- `innovation_warmup_updates=500`, `innovation_ramp_updates=500`
+- no post-projector `LayerNorm`
+- projector init `orthogonal(1.0)`
+- `encoder_final_muon` on `innovation_projector`
+- `CRATE` heads
+- no LR anneal
+- 2M seed-factorized ant sweep
+
+Main result:
+- This is the strongest ant result so far.
+- Final returns at 2M:
+  - `1149`, `1105`, `1093`, `917`, `914`, `883`, `510`, `493`
+- mean / median about `882.8 / 915.2`
+
+Most important structural finding:
+- the catastrophic dead-representation branch disappeared.
+- All `8/8` runs rescued upstream `hidden`.
+- Rescue happened early in every run, roughly `23k-65k` steps.
+- So the stage-1 representation lottery appears to be largely solved by replacing the upstream `tanh` bottleneck with `SiLU`.
+
+Seed-factorized breakdown:
+- `fixed_init` with `init_seed=0`, varying data: `4/4` strong
+  - `1105`, `1093`, `917`, `914`
+- `fixed_data` with `data_seed=0`, varying init: `2/4` strong, `2/4` middling
+  - `1149`, `883`, `510`, `493`
+
+Interpretation:
+- We no longer see the old pattern of some runs having dead `hidden` and dead `u`.
+- What remains is a policy-quality split on top of healthy representations.
+- The two middling runs still had healthy `hidden` and `u`, but much weaker policy commitment:
+  - `policy/obs_to_noise_ratio ~ 0.51`
+  - `policy/action_noise_std_avg ~ 0.30`
+- The strong runs had much stronger commitment:
+  - `obs_to_noise_ratio ~ 1.48-2.98`
+  - `action_noise_std_avg ~ 0.058-0.065`
+
+Updated takeaway:
+- `LayerNorm -> SiLU` is a much better upstream bottleneck than `LayerNorm -> tanh` in this ant direct-innovation line.
+- This appears to solve stage 1 (representation rescue) much more reliably.
+- The remaining inconsistency is now mostly stage 2: policy commitment / policy quality on top of a healthy latent.

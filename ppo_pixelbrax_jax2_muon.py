@@ -156,6 +156,10 @@ class Args:
     """if True, use manifold MUON for actor/critic weight matrices; if False, use Adam for all head params"""
     use_encoder_final_muon: bool = False
     """if True, use manifold MUON for the encoder's final Dense kernel only"""
+    encoder_muon_include_upstream: bool = False
+    """If true for innovation_direct_cnn, also apply encoder-final MUON to the upstream Dense_0 bottleneck."""
+    encoder_upstream_muon_lr: float = -1.0
+    """Learning rate for the upstream Dense_0 MUON branch; if negative, reuse encoder_muon_lr."""
     encoder_muon_lr: float = 0.02
     """learning rate for the encoder's final Dense kernel when using MUON"""
     encoder_muon_max_grad_norm: float = 1.0
@@ -206,6 +210,8 @@ class Args:
     """encoder architecture to use: 'cnn', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
+    encoder_hidden_activation: str = "tanh"
+    """Hidden bottleneck activation for innovation encoders: 'tanh' or 'silu'."""
     encoder_warmup_updates: int = 0
     """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
     encoder_use_crate_block: bool = False
@@ -458,6 +464,7 @@ class Storage:
     advantages: jnp.array
     returns: jnp.array
     rewards: jnp.array
+    raw_rewards: jnp.array
 
 
 @flax.struct.dataclass
@@ -716,6 +723,60 @@ def projected_latent_metrics(projected: jnp.ndarray, prefix: str = "sigreg_proj"
     return metrics
 
 
+def rollout_trajectory_metrics(
+    storage: Storage,
+    frame_stack: int,
+    obs_channels: int,
+    max_action: float,
+    prefix: str = "traj",
+) -> dict:
+    """Compute rollout-level trajectory diversity metrics from the collected batch."""
+    eps = 1e-8
+    metrics = {}
+
+    actions = storage.actions.reshape((-1, storage.actions.shape[-1])).astype(jnp.float32)
+    rewards = storage.rewards.reshape((-1,)).astype(jnp.float32)
+    raw_rewards = storage.raw_rewards.reshape((-1,)).astype(jnp.float32)
+    dones = storage.next_dones.reshape((-1,)).astype(jnp.float32)
+
+    action_norms = jnp.linalg.norm(actions, axis=-1)
+    action_dim_std = jnp.std(actions, axis=0)
+    metrics[f"{prefix}/action_abs_mean"] = jnp.mean(jnp.abs(actions))
+    metrics[f"{prefix}/action_l2_mean"] = jnp.mean(action_norms)
+    metrics[f"{prefix}/action_l2_std"] = jnp.std(action_norms)
+    metrics[f"{prefix}/action_dim_std_avg"] = jnp.mean(action_dim_std)
+    metrics[f"{prefix}/action_clip_frac"] = jnp.mean(jnp.abs(actions) >= (max_action - 1e-6))
+
+    metrics[f"{prefix}/reward_mean"] = jnp.mean(rewards)
+    metrics[f"{prefix}/reward_std"] = jnp.std(rewards)
+    metrics[f"{prefix}/raw_reward_mean"] = jnp.mean(raw_rewards)
+    metrics[f"{prefix}/raw_reward_std"] = jnp.std(raw_rewards)
+    metrics[f"{prefix}/done_frac"] = jnp.mean(dones)
+    metrics[f"{prefix}/env_done_frac"] = jnp.mean(jnp.any(storage.next_dones, axis=0))
+
+    obs_shape = storage.obs.shape
+    curr_last = storage.obs.reshape(obs_shape[:-1] + (frame_stack, obs_channels))[..., -1, :]
+    next_last = storage.next_obs.reshape(obs_shape[:-1] + (frame_stack, obs_channels))[..., -1, :]
+    curr_last = curr_last.astype(jnp.float32) / 255.0
+    next_last = next_last.astype(jnp.float32) / 255.0
+
+    frame_delta = next_last - curr_last
+    frame_delta_abs = jnp.abs(frame_delta)
+    frame_delta_flat = frame_delta.reshape((frame_delta.shape[0] * frame_delta.shape[1], -1))
+    curr_last_flat = curr_last.reshape((curr_last.shape[0] * curr_last.shape[1], -1))
+    frame_delta_norms = jnp.linalg.norm(frame_delta_flat, axis=-1)
+    frame_var = jnp.var(curr_last_flat, axis=0)
+
+    metrics[f"{prefix}/frame_delta_abs_mean"] = jnp.mean(frame_delta_abs)
+    metrics[f"{prefix}/frame_delta_l2_mean"] = jnp.mean(frame_delta_norms)
+    metrics[f"{prefix}/frame_delta_l2_std"] = jnp.std(frame_delta_norms)
+    metrics[f"{prefix}/frame_delta_gt_0p05_frac"] = jnp.mean(frame_delta_abs > 0.05)
+    metrics[f"{prefix}/frame_var_mean"] = jnp.mean(frame_var)
+    metrics[f"{prefix}/frame_var_max"] = jnp.max(frame_var)
+    metrics[f"{prefix}/frame_var_min"] = jnp.min(frame_var)
+    return metrics
+
+
 def split_actor_critic_hiddens(encoded):
     """Return actor/critic hiddens from a shared or split encoder output."""
     if isinstance(encoded, tuple):
@@ -724,7 +785,7 @@ def split_actor_critic_hiddens(encoded):
 
 
 def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...], ...]:
-    """Parameter paths that should receive encoder-final Muon."""
+    """Parameter paths that should receive the main encoder-final Muon branch."""
     if encoder_type.lower() == "split_cnn":
         return (
             ("network", "params", "actor_dense", "kernel"),
@@ -733,6 +794,16 @@ def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...],
     if encoder_type.lower() == "innovation_direct_cnn":
         return (("network", "params", "innovation_projector", "kernel"),)
     return (("network", "params", "Dense_0", "kernel"),)
+
+
+def encoder_upstream_muon_kernel_paths(
+    encoder_type: str,
+    include_upstream_for_innovation_direct: bool = False,
+) -> tuple[tuple[str, ...], ...]:
+    """Optional upstream encoder paths that should receive a separate Muon branch."""
+    if encoder_type.lower() == "innovation_direct_cnn" and include_upstream_for_innovation_direct:
+        return (("network", "params", "Dense_0", "kernel"),)
+    return ()
 
 
 def policy_output_metrics(
@@ -937,11 +1008,13 @@ def create_optimizer(
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
     encoder_muon_lr: float = 0.02,
+    encoder_upstream_muon_lr: float = -1.0,
     encoder_muon_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
     use_heads_muon: bool = True,
     use_encoder_final_muon: bool = False,
     encoder_final_muon_paths: tuple[tuple[str, ...], ...] = (("network", "params", "Dense_0", "kernel"),),
+    encoder_upstream_muon_paths: tuple[tuple[str, ...], ...] = (),
 ):
     """
     Create optimizer that uses:
@@ -988,6 +1061,18 @@ def create_optimizer(
         ),
     )
 
+    upstream_muon_lr = encoder_muon_lr if encoder_upstream_muon_lr < 0 else encoder_upstream_muon_lr
+    encoder_upstream_muon_tx = optax.chain(
+        optax.clip_by_global_norm(encoder_muon_max_grad_norm),
+        manifold_muon(
+            learning_rate=upstream_muon_lr,
+            dual_lr=muon_dual_lr,
+            dual_steps=muon_dual_steps,
+            msign_steps=muon_msign_steps,
+            min_ndim=2,
+        ),
+    )
+
     # MUON for actor head matrices (with separate grad clipping)
     actor_muon_tx = optax.chain(
         optax.clip_by_global_norm(actor_muon_max_grad_norm),
@@ -1016,6 +1101,7 @@ def create_optimizer(
     # critic_muon (matrices), heads_adam (actor/critic vectors/scalars)
     transforms = {
         'encoder': encoder_tx,
+        'encoder_upstream_muon': encoder_upstream_muon_tx,
         'encoder_final_muon': encoder_final_muon_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
@@ -1023,13 +1109,17 @@ def create_optimizer(
     }
 
     encoder_final_muon_paths = set(encoder_final_muon_paths)
+    encoder_upstream_muon_paths = set(encoder_upstream_muon_paths)
 
     # Label function
     def label_fn(params):
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
+                is_encoder_upstream_dense_kernel = path in encoder_upstream_muon_paths
                 is_encoder_final_dense_kernel = path in encoder_final_muon_paths
+                if use_encoder_final_muon and is_encoder_upstream_dense_kernel:
+                    return 'encoder_upstream_muon'
                 if use_encoder_final_muon and is_encoder_final_dense_kernel:
                     return 'encoder_final_muon'
                 return 'encoder'
@@ -1149,6 +1239,8 @@ if __name__ == "__main__":
     print(f"  heads_muon_lr (MUON for actor/critic matrices): {args.heads_muon_lr}")
     print(f"  heads_adam_lr ({adam_type} for actor/critic vectors): {args.heads_adam_lr}")
     print(f"  use_encoder_final_muon: {args.use_encoder_final_muon}")
+    print(f"  encoder_muon_include_upstream: {args.encoder_muon_include_upstream}")
+    print(f"  encoder_upstream_muon_lr: {args.encoder_upstream_muon_lr}")
     print(f"  encoder_muon_lr: {args.encoder_muon_lr}")
     print(f"  encoder_muon_max_grad_norm: {args.encoder_muon_max_grad_norm}")
     print(f"  weight_decay: {args.weight_decay}")
@@ -1159,6 +1251,7 @@ if __name__ == "__main__":
     print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
+    print(f"  encoder_hidden_activation: {args.encoder_hidden_activation}")
     print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
     print(f"  encoder_use_crate_block: {args.encoder_use_crate_block}")
     print(f"  encoder_crate_step_size: {args.encoder_crate_step_size}")
@@ -1195,6 +1288,11 @@ if __name__ == "__main__":
         raise ValueError("Projected SIGReg requires encoder_type='sigreg_cnn'.")
     if args.innovation_coef > 0 and encoder_type not in {"innovation_cnn", "innovation_direct_cnn"}:
         raise ValueError("Innovation-aware regularization requires encoder_type in {'innovation_cnn', 'innovation_direct_cnn'}.")
+    encoder_hidden_activation = args.encoder_hidden_activation.lower()
+    if encoder_hidden_activation not in {"tanh", "silu"}:
+        raise ValueError(
+            f"Unsupported encoder_hidden_activation='{args.encoder_hidden_activation}'. Expected one of: ['tanh', 'silu']"
+        )
 
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
@@ -1224,6 +1322,7 @@ if __name__ == "__main__":
         innovation_proj_dim=args.innovation_proj_dim,
         use_crate_block=args.encoder_use_crate_block,
         crate_step_size=args.encoder_crate_step_size,
+        innovation_hidden_activation=encoder_hidden_activation,
     )
     if args.use_crate_head:
         actor = CRATEActor(
@@ -1253,6 +1352,10 @@ if __name__ == "__main__":
         network.apply(network_params, dummy_obs)
     )
     encoder_muon_paths = encoder_final_muon_kernel_paths(encoder_type)
+    encoder_upstream_muon_paths = encoder_upstream_muon_kernel_paths(
+        encoder_type,
+        include_upstream_for_innovation_direct=args.encoder_muon_include_upstream,
+    )
 
     params_dict = {
         "network": network_params,
@@ -1296,6 +1399,7 @@ if __name__ == "__main__":
     actor_muon, actor_adam = count_by_type(all_params, "actor")
     critic_muon, critic_adam = count_by_type(all_params, "critic")
     encoder_final_muon_params = 0
+    encoder_upstream_muon_params = 0
     if args.use_encoder_final_muon:
         flat_all_params = flax.traverse_util.flatten_dict(all_params)
         encoder_final_muon_params = sum(
@@ -1303,12 +1407,17 @@ if __name__ == "__main__":
             for path in encoder_muon_paths
             if path in flat_all_params
         )
-    encoder_adam_params = encoder_params - encoder_final_muon_params
+        encoder_upstream_muon_params = sum(
+            flat_all_params[path].size
+            for path in encoder_upstream_muon_paths
+            if path in flat_all_params
+        )
+    encoder_adam_params = encoder_params - encoder_final_muon_params - encoder_upstream_muon_params
 
     print(f"\nParameter breakdown:")
     print(
         f"  Encoder total: {encoder_params:,} "
-        f"(MUON final dense: {encoder_final_muon_params:,}, Adam rest: {encoder_adam_params:,})"
+        f"(MUON upstream: {encoder_upstream_muon_params:,}, MUON final dense: {encoder_final_muon_params:,}, Adam rest: {encoder_adam_params:,})"
     )
     if innovation_params > 0:
         print(f"  Innovation dynamics (Adam): {innovation_params:,}")
@@ -1400,11 +1509,13 @@ if __name__ == "__main__":
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
         encoder_muon_lr=args.encoder_muon_lr,
+        encoder_upstream_muon_lr=args.encoder_upstream_muon_lr,
         encoder_muon_max_grad_norm=args.encoder_muon_max_grad_norm,
         weight_decay=args.weight_decay,
         use_heads_muon=args.use_heads_muon,
         use_encoder_final_muon=args.use_encoder_final_muon,
         encoder_final_muon_paths=encoder_muon_paths,
+        encoder_upstream_muon_paths=encoder_upstream_muon_paths,
     )
 
     agent_state = TrainState.create(
@@ -2090,6 +2201,7 @@ if __name__ == "__main__":
             next_dones=next_done_local,
             values=value,
             rewards=reward,
+            raw_rewards=raw_reward,
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
@@ -2413,6 +2525,15 @@ if __name__ == "__main__":
                     "actor_noise/stop_updates": args.actor_noise_stop_updates,
                 }
 
+                traj_metrics = rollout_trajectory_metrics(
+                    storage,
+                    frame_stack=args.frame_stack,
+                    obs_channels=raw_obs_shape[2],
+                    max_action=args.max_action,
+                )
+                for k, v in traj_metrics.items():
+                    log_dict[k] = float(v)
+
                 # Debug metrics for encoder representations
                 if args.debug_repr:
                     sample_obs = storage.obs[0, :256]
@@ -2473,6 +2594,18 @@ if __name__ == "__main__":
                                     agent_state.params["network"]["params"]["innovation_projector"]["kernel"],
                                     final_grads["network"]["params"]["innovation_projector"]["kernel"],
                                 )
+                                preproj_dense_metrics = cnn_dense_metrics(
+                                    cnn_debug["dense_pre_ln"],
+                                    cnn_debug["hidden"],
+                                    agent_state.params["network"]["params"]["Dense_0"]["kernel"],
+                                    final_grads["network"]["params"]["Dense_0"]["kernel"],
+                                    prefix="encoder_hidden",
+                                )
+                                for k, v in preproj_dense_metrics.items():
+                                    log_dict[k] = float(v)
+                                preproj_repr_metrics = encoder_repr_metrics(cnn_debug["hidden"])
+                                for k, v in preproj_repr_metrics.items():
+                                    log_dict[k.replace("repr/", "encoder_hidden_repr/")] = float(v)
                             else:
                                 dense_metrics = cnn_dense_metrics(
                                     cnn_debug["dense_pre_ln"],

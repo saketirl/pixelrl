@@ -483,7 +483,13 @@ class CNNEncoder(nn.Module):
             bias_init=constant(0.0),
         )(x)
         hidden = nn.LayerNorm()(dense_pre_ln)
-        hidden = nn.tanh(self.tanh_scale * hidden)
+        hidden_activation = self.hidden_activation.lower()
+        if hidden_activation == "tanh":
+            hidden = nn.tanh(self.tanh_scale * hidden)
+        elif hidden_activation == "silu":
+            hidden = nn.silu(hidden)
+        else:
+            raise ValueError(f"Unsupported hidden_activation={self.hidden_activation!r}. Expected 'tanh' or 'silu'.")
         if return_intermediates:
             return {
                 "hidden": hidden,
@@ -670,7 +676,10 @@ class InnovationCNNEncoder(nn.Module):
 
     tanh_scale: float = 0.5
     innovation_proj_dim: int = 64
+    use_crate_block: bool = False
+    crate_step_size: float = 0.1
     policy_on_projected: bool = False
+    hidden_activation: str = "tanh"
 
     @nn.compact
     def __call__(self, x, return_intermediates: bool = False):
@@ -716,20 +725,35 @@ class InnovationCNNEncoder(nn.Module):
             bias_init=constant(0.0),
         )(x)
         hidden = nn.LayerNorm()(dense_pre_ln)
-        hidden = nn.tanh(self.tanh_scale * hidden)
+        hidden_activation = self.hidden_activation.lower()
+        if hidden_activation == "tanh":
+            hidden = nn.tanh(self.tanh_scale * hidden)
+        elif hidden_activation == "silu":
+            hidden = nn.silu(hidden)
+        else:
+            raise ValueError(f"Unsupported hidden_activation={self.hidden_activation!r}. Expected 'tanh' or 'silu'.")
+
+        structured_hidden = hidden
+        if self.use_crate_block:
+            structured_hidden = CRATEFeedForward(
+                dim=512,
+                step_size=self.crate_step_size,
+                name="crate_block",
+            )(structured_hidden)
 
         projector_pre_ln = nn.Dense(
             self.innovation_proj_dim,
             kernel_init=orthogonal(1.0),
             bias_init=constant(0.0),
             name="innovation_projector",
-        )(hidden)
+        )(structured_hidden)
         u = projector_pre_ln
         policy_hidden = u if self.policy_on_projected else hidden
 
         if return_intermediates:
             return {
                 "hidden": hidden,
+                "structured_hidden": structured_hidden,
                 "policy_hidden": policy_hidden,
                 "dense_pre_ln": dense_pre_ln,
                 "u": u,
@@ -768,6 +792,7 @@ def build_encoder(
     innovation_proj_dim: int = 64,
     use_crate_block: bool = False,
     crate_step_size: float = 0.1,
+    innovation_hidden_activation: str = "tanh",
 ) -> nn.Module:
     """Build an encoder module by name."""
     kind = encoder_type.lower()
@@ -786,13 +811,19 @@ def build_encoder(
         return InnovationCNNEncoder(
             tanh_scale=tanh_scale,
             innovation_proj_dim=innovation_proj_dim,
+            use_crate_block=use_crate_block,
+            crate_step_size=crate_step_size,
             policy_on_projected=False,
+            hidden_activation=innovation_hidden_activation,
         )
     if kind == "innovation_direct_cnn":
         return InnovationCNNEncoder(
             tanh_scale=tanh_scale,
             innovation_proj_dim=innovation_proj_dim,
+            use_crate_block=use_crate_block,
+            crate_step_size=crate_step_size,
             policy_on_projected=True,
+            hidden_activation=innovation_hidden_activation,
         )
     if kind == "mlp":
         return MLPEncoder(tanh_scale=tanh_scale)
