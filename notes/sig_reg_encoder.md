@@ -816,3 +816,508 @@ Updated takeaway:
 - `LayerNorm -> SiLU` is a much better upstream bottleneck than `LayerNorm -> tanh` in this ant direct-innovation line.
 - This appears to solve stage 1 (representation rescue) much more reliably.
 - The remaining inconsistency is now mostly stage 2: policy commitment / policy quality on top of a healthy latent.
+
+
+## 2026-04-02 UTC - Ant direct innovation with upstream SiLU bottleneck, long-horizon result
+
+The partial `10M` rerun of the upstream-`SiLU` direct-innovation ant setup is the clearest win in this line so far.
+
+Important caveat:
+- the jobs were manually cancelled at about `6.57M-6.64M` env steps rather than finishing the full `10M`
+- but by that point the outcome was already clear
+
+### Exact config
+
+This is the current best ant config in this line:
+- environment: `ant`
+- backend: `spring`
+- encoder: `innovation_direct_cnn`
+- upstream bottleneck activation: `SiLU`
+- upstream bottleneck width: `512`
+- projected policy latent width: `64`
+- innovation auxiliary on: `innovation_coef=1e-3`
+- innovation residual SIGReg settings: `innovation_num_slices=16`, `innovation_num_t=8`, `innovation_t_max=5.0`
+- innovation schedule: `innovation_warmup_updates=500`, `innovation_ramp_updates=500`
+- projector variant: no post-projector `LayerNorm`
+- projector init: `orthogonal(1.0)`
+- encoder MUON: on `innovation_projector` only
+  - `encoder_muon_lr=1e-3`
+  - `encoder_muon_max_grad_norm=1.0`
+- head architecture: `CRATE` actor/critic heads
+- head optimizers:
+  - `heads_adam_lr=3e-4`
+  - `heads_muon_lr=1e-3`
+  - `actor_muon_max_grad_norm=100`
+  - `critic_muon_max_grad_norm=1`
+- encoder Adam LR: `3e-4`
+- no LR anneal
+- `ent_coef=0.0`
+- rollout geometry:
+  - `n_envs=128`
+  - `num_steps=10`
+  - `num_minibatches=32`
+  - `update_epochs=4`
+- observation setup:
+  - `frame_stack=4`
+  - `action_repeat=4`
+- PPO settings:
+  - `gamma=0.99`
+  - `gae_lambda=0.95`
+  - `clip_eps=0.1`
+  - `vf_coef=0.5`
+- misc:
+  - `max_grad_norm=0.05`
+  - `muon_dual_lr=0.01`
+  - `muon_dual_steps=5`
+  - `debug_repr=true`
+  - `probe_interval=0`
+
+### Network diagram
+
+```text
+stacked pixels (4 x 84 x 84 x C)
+    |
+    v
+Conv(32, 8x8, stride 4) -> LayerNorm -> ReLU
+    |
+    v
+Conv(64, 4x4, stride 2) -> LayerNorm -> ReLU
+    |
+    v
+Conv(64, 3x3, stride 1) -> LayerNorm -> ReLU
+    |
+    v
+flatten
+    |
+    v
+Dense(512) -> dense_pre_ln
+    |
+    v
+LayerNorm
+    |
+    v
+SiLU
+    |
+    +--> hidden  (upstream encoder bottleneck)
+           |
+           v
+      Dense(64, orthogonal(1.0))  [innovation_projector, MUON]
+           |
+           v
+      u  (projected policy latent; no post-projector LayerNorm)
+           |
+           +--> CRATE actor
+           |
+           +--> CRATE critic
+           |
+           +--> innovation dynamics model: (u_t, a_t) -> \hat{u}_{t+1}
+
+innovation residual:
+    r_t = u_{t+1} - \hat{u}_{t+1}
+
+training objective:
+    PPO loss on policy/value heads consuming u
+    + innovation residual SIGReg auxiliary on r_t
+```
+
+### Main result
+
+At about `6.58M-6.63M` env steps, all `8/8` runs were already strong:
+- `1696`, `1667`, `1609`, `1499`, `1354`, `1249`, `949`, `881`
+- mean / median about `1363 / 1426`
+
+By comparison, the previous best `tanh`-bottleneck baseline at `10M` had:
+- strong branch: `1779.9`, `1166.5`, `920.1`, `905.7`, `885.1`
+- bad branch: `597.1`, `547.5`, `535.0`
+- mean / median about `917 / 895`
+
+So the `SiLU` bottleneck is not just shifting a few runs upward. It appears to remove the catastrophic branch entirely.
+
+### Structural finding
+
+The key result is not just the returns. It is the branch structure:
+- all `8/8` runs rescued upstream `hidden`
+- all `8/8` runs rescued projected `u`
+- rescue happened early in every run, roughly `26.9k-42.2k` steps
+- there was no dead-representation branch at all
+
+At the partial `10M` endpoint:
+- `repr/dead_units_frac = 0` for `u` in all runs
+- `encoder_hidden_repr/dead_units_frac` stayed far below the old catastrophic `1.0` regime
+- all runs had low action noise and high `obs_to_noise_ratio`
+
+### Fixed-init / fixed-data breakdown
+
+The result is robust across both randomness sources.
+
+`fixed_init` (`init_seed=0`, vary data):
+- `1667`, `1609`, `1249`, `949`
+- mean about `1369`
+
+`fixed_data` (`data_seed=0`, vary init):
+- `1696`, `1499`, `1354`, `881`
+- mean about `1357`
+
+So unlike the earlier direct-innovation runs, neither init nor data randomness now creates a catastrophic failure mode.
+
+### Updated interpretation
+
+This is the first ant result where the original reliability problem really appears solved.
+
+What changed:
+- with the old upstream `tanh` bottleneck, ant had an early representation-rescue lottery
+- with the upstream `SiLU` bottleneck, that stage-1 lottery appears to disappear
+- what remains is only a quality spread inside the good branch
+
+So the current best reading is:
+- `LayerNorm -> SiLU` in the upstream innovation encoder bottleneck is the key architectural fix
+- it makes early upstream `hidden` rescue reliable
+- once that happens, the direct-innovation + projector-MUON + CRATE setup can consistently produce strong ant policies
+
+### Current best ant summary
+
+If we need one sentence to remember the outcome:
+
+**For ant, the winning change was replacing the upstream encoder bottleneck `tanh` with `SiLU` inside the `innovation_direct_cnn` architecture; that appears to remove the catastrophic early representation-collapse branch.**
+
+## 2026-04-02 UTC - Ant direct innovation + upstream Swish, innovation-off ablation
+
+We ran the current best ant architecture with the active innovation loss disabled:
+- same `innovation_direct_cnn`
+- same upstream `swish` bottleneck
+- same projected policy latent `u` (`proj_dim=64`)
+- same projector Muon, `CRATE` heads, no projector `LayerNorm`, no LR anneal
+- only change: `innovation_coef=0.0`
+
+This was a partial run, manually stopped around `1.75M` steps.
+
+Final returns at cancellation:
+- `1301`, `1243`, `1162`, `1001`, `949`, `935`, `507`, `458`
+- mean `945.7`, median `976.0`
+
+Most important structural result:
+- all `8/8` runs rescued upstream `hidden`
+- all `8/8` runs had alive projected latent `u`
+- hidden rescue steps were early in every run: `23k-84k`, mostly `23k-36k`
+- there was no catastrophic dead-representation branch
+
+So disabling the active innovation loss did **not** bring back the old stage-1 encoder-collapse failure.
+
+However, this was not clearly better than the full swish + innovation setup.
+- the same kind of middling `~500` runs remained
+- compared with the stronger long-horizon swish run, the ceiling still looked lower
+
+Current interpretation:
+- upstream `swish` appears to be the main fix for stage-1 representation rescue
+- active innovation is probably **not** the thing that makes `hidden` rescue
+- but active innovation may still help stage 2, i.e. later policy quality / final ceiling once the representation is already alive
+
+So the updated ant story is:
+- stage 1 (representation rescue): primarily architectural, coming from the upstream Swish bottleneck
+- stage 2 (policy quality after rescue): likely still helped by the innovation objective
+
+## 2026-04-07 UTC - Simple CNN bottleneck activations diverge between ant and humanoid
+
+We compared the simple `cnn + CRATE + heads_muon + anneal_lr` path across several bottleneck activations:
+- `cnn` (original `tanh` bottleneck)
+- `cnn_swish`
+- `cnn_swish_ta`
+- `cnn_swish_tc`
+
+### Humanoid
+
+The original `tanh` CNN is clearly best in this simple encoder family.
+
+Matched 10M tanh run:
+- returns: `1648`, `411`, `990`, `1145`
+- mean about `1048`
+- three seeds entered a broad, low-noise committed policy regime
+
+By contrast, the swish-family runs all failed in the same basic way:
+- representation stayed alive enough, but too narrow
+- `cnn_dense/participation_ratio` stayed low
+- `cnn_dense/top_eig_fraction` stayed high
+- policy noise exploded
+- `policy/obs_to_noise_ratio` collapsed to near zero
+
+Representative means:
+- `cnn_swish`: mean about `473`
+- `cnn_swish_ta` (partial ~3.8M): mean about `462`
+- `cnn_swish_tc` (partial ~4.5M): mean about `310`
+
+So for humanoid, the bounded `tanh` bottleneck seems to be providing an important policy-stabilizing effect that the swish-family variants lose.
+
+### Ant
+
+For the simple CNN path, the swish-family does not solve the problem robustly, but the story is still different from humanoid.
+
+- `cnn_swish` at 10M: two alive seeds, two dead/local-minimum seeds
+- `cnn_swish_ta` (partial ~3.9M): one strong-ish seed, two middling alive seeds, one dead seed
+- `cnn_swish_tc` (partial ~4.7M): two alive middling seeds, two dead seeds
+
+So in the simple CNN family, none of the swish variants fully solved ant either. However, in the direct-innovation ant line, upstream `swish` was the key change that removed the catastrophic early representation-collapse lottery.
+
+### Current interpretation
+
+The reversal across environments now looks meaningful:
+- ant's dominant bottleneck was early encoder rescue / anti-collapse, where `swish` helped
+- humanoid's dominant bottleneck in the simple CNN path is policy-facing latent stability, where `tanh` helps
+
+So the activation is not globally good or bad. It is interacting with the environment's dominant failure mode:
+- `swish` helps when the main issue is encoder optimization / representation rescue
+- `tanh` helps when the main issue is stabilizing the policy-facing latent and preventing runaway high-noise behavior
+
+
+## 2026-04-09 UTC - Plain `cnn_swish_tanh` is mildly promising on humanoid, not enough on ant
+
+Tested the simple encoder-only hybrid:
+- `encoder_type=cnn_swish_tanh`
+- bottleneck: `Dense -> LayerNorm -> swish -> Dense -> LayerNorm -> tanh`
+- `CRATE` heads
+- `use_heads_muon`
+- `anneal_lr`
+- no innovation
+- no encoder-final Muon
+
+This was a mixed result, but worth keeping in mind as a positive direction for humanoid.
+
+Partial results around `4.6M` steps from jobs `63596` (ant) and `63597` (humanoid):
+- humanoid: about `1253`, `358`, `934`, `1110`
+- ant: about `539`, `536`, `2041`, `516`
+
+Interpretation:
+- Humanoid looked materially better than plain `cnn_swish`, and was much closer to the strong plain-`cnn`/tanh regime.
+- Ant did not become robust in the simple CNN path. It looked like one strong run plus three runs still stuck in the usual mediocre basin.
+- So `swish -> tanh` does not look like a universal fix, but it is more promising than pure swish for simple humanoid CNN.
+- This supports the earlier hypothesis that a non-saturating stage may help feature formation, while a final tanh stage is still useful for policy-facing latent stability.
+
+## 2026-04-10 UTC - `cnn_swish_tanh` diagnosis: ant fails in stage 1, humanoid mostly fails at final tanh
+
+Added explicit stage-1 logging for the plain shared candidate:
+- stage 1 swish block:
+  - `encoder_stage1_repr/*`
+  - `encoder_stage1/*`
+- final tanh bottleneck:
+  - `repr/*`
+  - `cnn_dense/*`
+
+Diagnostic runs:
+- ant: `63864`
+- humanoid: `63865`
+
+Config:
+- `encoder_type=cnn_swish_tanh`
+- bottleneck: `Dense -> LayerNorm -> swish -> Dense -> LayerNorm -> tanh`
+- `CRATE` heads
+- `use_heads_muon`
+- `anneal_lr`
+- no innovation
+- no encoder-final Muon
+
+Final returns at `2M`:
+- ant: `1197`, `612`, `566`, `511`
+- humanoid: `460`, `418`, `403`, `381`
+
+### Ant
+
+The ant branch starts in stage 1.
+
+Two ant runs were already dead in the swish stage:
+- `encoder_stage1_repr/unit_std_avg ~ 7e-6 to 1e-5`
+- `encoder_stage1_repr/dead_units_frac = 1`
+- `encoder_stage1/participation_ratio ~ 1e-7 to 1e-6`
+
+Those same runs were also dead at the final tanh bottleneck and ended around:
+- `511`
+- `566`
+
+The alive ant runs already had healthy stage-1 geometry:
+- `stage1 participation_ratio ~ 13.3` and `28.0`
+- `stage1 dead_units_frac = 0`
+
+Then they diverged again at the final bottleneck:
+- stronger run:
+  - final `participation_ratio ~ 8.2`
+  - `obs_to_noise_ratio ~ 0.83`
+  - return `1197`
+- middling alive run:
+  - final `participation_ratio ~ 4.9`
+  - return `612`
+
+So for ant:
+- catastrophic failure begins in the stage-1 swish block
+- the final tanh stage still affects quality among the alive runs
+
+### Humanoid
+
+Humanoid is different. Stage 1 is usually not the main bottleneck.
+
+Three of four runs had reasonably alive stage-1 geometry:
+- `stage1 unit_std_avg ~ 0.23-0.27`
+- `stage1 dead_units_frac ~ 0-0.002`
+- `stage1 participation_ratio ~ 3.7-5.3`
+
+But after the final tanh bottleneck they became noticeably narrower:
+- final `unit_std_avg ~ 0.106-0.118`
+- final `participation_ratio ~ 2.2-3.0`
+- `top_eig_fraction ~ 0.53-0.63`
+- `obs_to_noise_ratio ~ 0.03-0.05`
+- noise stayed high
+
+One humanoid run was already weak in stage 1:
+- `stage1 participation_ratio ~ 1.95`
+- `stage1 dead_units_frac ~ 0.20`
+
+and got even worse after the final bottleneck:
+- final `dead_units_frac ~ 0.51`
+
+So for humanoid:
+- stage 1 is often acceptable
+- the final tanh bottleneck is the stronger choke point in this encoder
+- that is where the latent narrows and policy conditionality stays weak
+
+### Current interpretation
+
+`cnn_swish_tanh` is not failing in one shared place.
+
+- ant needs more reliable stage-1 rescue
+- humanoid needs a less destructive final bottleneck
+
+So the next shared encoder change should preserve stage-1 swish rescue while making the final tanh stage less lossy.
+
+## 2026-04-10 UTC - Residual `cnn_swish_tanh` is helpful for humanoid diagnosis, not a shared fix
+
+Tested a residual version of the plain shared candidate:
+- `encoder_type=cnn_swish_tanh_resid`
+- bottleneck:
+  - `stage1 = swish(LN(Dense1(x)))`
+  - `stage2 = tanh(scale * LN(Dense2(stage1)))`
+  - `hidden = (stage1 + stage2) / sqrt(2)`
+- `CRATE` heads
+- `use_heads_muon`
+- `anneal_lr`
+- no innovation
+- no encoder-final Muon
+
+Runs:
+- humanoid: `63872`
+- ant: `63873`
+
+Partial results at about `1.65M-1.75M` steps:
+- ant: `478`, `543`, `526`, `538`
+- humanoid: `625`, `459`, `535`, `747`
+
+### Humanoid
+
+This mostly confirms the earlier diagnosis.
+
+Stage 1 and final bottleneck geometry now almost match in every seed:
+- weak seeds:
+  - stage-1 `participation_ratio ~ 3.7-5.5`
+  - final `participation_ratio ~ 3.6-5.5`
+- strongest seed:
+  - stage-1 `participation_ratio ~ 12.1`
+  - final `participation_ratio ~ 12.0`
+
+So the final tanh stage is no longer the main choke point.
+
+However:
+- only `1/4` seeds is clearly healthy so far
+- the other `3/4` still have weak stage-1 geometry and high policy noise
+
+So this is directionally helpful for humanoid, but not yet robust.
+
+### Ant
+
+This is not a good ant result so far.
+
+One seed is still fully dead already in stage 1 and final:
+- `encoder_stage1_repr/dead_units_frac = 1`
+- `repr/dead_units_frac = 1`
+
+The other `3/4` seeds are alive and broad:
+- stage-1 `participation_ratio ~ 27-31`
+- final `participation_ratio ~ 23-27`
+
+But they all sit in the same moderate regime:
+- `obs_to_noise_ratio ~ 0.43-0.48`
+- `action_noise_std_avg ~ 0.30`
+- returns only `478-543`
+
+So for ant, the residual mix seems to preserve representation but damp the strong branch.
+
+### Current interpretation
+
+This residual encoder is humanoid-leaning, not a shared fix.
+
+- It validates that humanoid really was being choked by the final tanh bottleneck.
+- But it does not solve the earlier ant problem, which still depends on stronger stage-1 rescue and/or a better transition from alive representation to strong policy.
+
+## 2026-04-10 UTC - `cnn_swish_tanh` + stage1-only Muon is the strongest shared-direction result so far
+
+Tested the plain shared encoder candidate again, but with Muon only on the stage-1 swish bottleneck:
+
+- `encoder_type=cnn_swish_tanh`
+- `CRATE` heads
+- `use_heads_muon`
+- `anneal_lr`
+- no innovation
+- no encoder-final Muon
+- upstream Muon only on `dense_stage1`
+- `encoder_upstream_muon_lr = 3e-4`
+
+Runs:
+- ant: `63920`
+- humanoid: `63921`
+
+Final returns at `10M`:
+- ant: `604`, `665`, `554`, `783`
+- humanoid: `295`, `780`, `1065`, `971`
+
+### Ant
+
+This is real progress for ant.
+
+All `4/4` ant runs kept stage 1 alive:
+- `encoder_stage1_repr/dead_units_frac = 0`
+- `encoder_stage1/participation_ratio ~ 50-56`
+
+So the old ant failure mode changed:
+- before: some runs died in stage 1
+- now: stage-1 collapse is gone
+
+What remains is a ceiling problem rather than a rescue problem.
+The final tanh bottleneck still compresses noticeably:
+- final `cnn_dense/participation_ratio ~ 8.7-19.0`
+- `obs_to_noise_ratio ~ 0.63-1.41`
+- `action_noise_std_avg ~ 0.17-0.23`
+
+So for this specific run, ant became consistently decent but not strong.
+
+### Humanoid
+
+This also helped humanoid a lot, but did not fully solve it.
+
+Three runs were clearly good:
+- `780`, `1065`, `971`
+
+Those runs had healthy stage-1 and final geometry:
+- stage-1 `participation_ratio ~ 10.5-40.1`
+- final `participation_ratio ~ 9.2-19.7`
+
+But one run still failed in the way the earlier diagnosis predicted:
+- stage 1 remained alive enough
+- the final tanh bottleneck collapsed (`final participation_ratio ~ 1.9`, `dead_units_frac ~ 0.27`)
+- policy noise exploded
+- return stayed low (`295`)
+
+### Current interpretation
+
+This is probably the strongest shared-direction result we have had so far.
+
+- For ant, stage1-only Muon fixes the stage-1 rescue problem.
+- For humanoid, the remaining failure is still the final tanh bottleneck.
+
+So the shared line is now much narrower:
+- ant's remaining issue here is ceiling, not collapse
+- humanoid's remaining issue is final-bottleneck reliability

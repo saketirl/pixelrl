@@ -156,6 +156,8 @@ class Args:
     """if True, use manifold MUON for actor/critic weight matrices; if False, use Adam for all head params"""
     use_encoder_final_muon: bool = False
     """if True, use manifold MUON for the encoder's final Dense kernel only"""
+    use_encoder_upstream_muon: bool = False
+    """if True, use manifold MUON for the encoder's upstream Dense bottleneck only"""
     encoder_muon_include_upstream: bool = False
     """If true for innovation_direct_cnn, also apply encoder-final MUON to the upstream Dense_0 bottleneck."""
     encoder_upstream_muon_lr: float = -1.0
@@ -207,11 +209,11 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'cnn', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
+    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_hidden_activation: str = "tanh"
-    """Hidden bottleneck activation for innovation encoders: 'tanh' or 'silu'."""
+    """Hidden bottleneck activation for innovation encoders: 'tanh' or 'swish' ('silu' accepted as alias)."""
     encoder_warmup_updates: int = 0
     """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
     encoder_use_crate_block: bool = False
@@ -786,13 +788,16 @@ def split_actor_critic_hiddens(encoded):
 
 def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...], ...]:
     """Parameter paths that should receive the main encoder-final Muon branch."""
-    if encoder_type.lower() == "split_cnn":
+    kind = encoder_type.lower()
+    if kind == "split_cnn":
         return (
             ("network", "params", "actor_dense", "kernel"),
             ("network", "params", "critic_dense", "kernel"),
         )
-    if encoder_type.lower() == "innovation_direct_cnn":
+    if kind == "innovation_direct_cnn":
         return (("network", "params", "innovation_projector", "kernel"),)
+    if kind in {"cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned"}:
+        return (("network", "params", "dense_stage2", "kernel"),)
     return (("network", "params", "Dense_0", "kernel"),)
 
 
@@ -801,8 +806,11 @@ def encoder_upstream_muon_kernel_paths(
     include_upstream_for_innovation_direct: bool = False,
 ) -> tuple[tuple[str, ...], ...]:
     """Optional upstream encoder paths that should receive a separate Muon branch."""
-    if encoder_type.lower() == "innovation_direct_cnn" and include_upstream_for_innovation_direct:
+    kind = encoder_type.lower()
+    if kind == "innovation_direct_cnn" and include_upstream_for_innovation_direct:
         return (("network", "params", "Dense_0", "kernel"),)
+    if kind in {"cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned"}:
+        return (("network", "params", "dense_stage1", "kernel"),)
     return ()
 
 
@@ -1013,6 +1021,7 @@ def create_optimizer(
     weight_decay: float = 0.0,
     use_heads_muon: bool = True,
     use_encoder_final_muon: bool = False,
+    use_encoder_upstream_muon: bool = False,
     encoder_final_muon_paths: tuple[tuple[str, ...], ...] = (("network", "params", "Dense_0", "kernel"),),
     encoder_upstream_muon_paths: tuple[tuple[str, ...], ...] = (),
 ):
@@ -1118,7 +1127,7 @@ def create_optimizer(
             if path[0] == 'network':
                 is_encoder_upstream_dense_kernel = path in encoder_upstream_muon_paths
                 is_encoder_final_dense_kernel = path in encoder_final_muon_paths
-                if use_encoder_final_muon and is_encoder_upstream_dense_kernel:
+                if use_encoder_upstream_muon and is_encoder_upstream_dense_kernel:
                     return 'encoder_upstream_muon'
                 if use_encoder_final_muon and is_encoder_final_dense_kernel:
                     return 'encoder_final_muon'
@@ -1234,11 +1243,15 @@ if __name__ == "__main__":
     print(f"minibatch_size: {args.minibatch_size}")
 
     adam_type = "AdamW" if args.weight_decay > 0 else "Adam"
+    use_encoder_upstream_muon = args.use_encoder_upstream_muon or (
+        args.use_encoder_final_muon and args.encoder_muon_include_upstream
+    )
     print(f"\nOptimizer config:")
     print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
     print(f"  heads_muon_lr (MUON for actor/critic matrices): {args.heads_muon_lr}")
     print(f"  heads_adam_lr ({adam_type} for actor/critic vectors): {args.heads_adam_lr}")
     print(f"  use_encoder_final_muon: {args.use_encoder_final_muon}")
+    print(f"  use_encoder_upstream_muon: {use_encoder_upstream_muon}")
     print(f"  encoder_muon_include_upstream: {args.encoder_muon_include_upstream}")
     print(f"  encoder_upstream_muon_lr: {args.encoder_upstream_muon_lr}")
     print(f"  encoder_muon_lr: {args.encoder_muon_lr}")
@@ -1274,9 +1287,9 @@ if __name__ == "__main__":
     print("=" * 60)
 
     encoder_type = args.encoder_type.lower()
-    if encoder_type not in {"cnn", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
+    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
         raise ValueError(
-            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['cnn', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
         )
 
     sigreg_mode = args.sigreg_mode.lower()
@@ -1289,9 +1302,9 @@ if __name__ == "__main__":
     if args.innovation_coef > 0 and encoder_type not in {"innovation_cnn", "innovation_direct_cnn"}:
         raise ValueError("Innovation-aware regularization requires encoder_type in {'innovation_cnn', 'innovation_direct_cnn'}.")
     encoder_hidden_activation = args.encoder_hidden_activation.lower()
-    if encoder_hidden_activation not in {"tanh", "silu"}:
+    if encoder_hidden_activation not in {"tanh", "swish", "silu", "swish_tanh", "swish_ta", "swish_tb", "swish_tc"}:
         raise ValueError(
-            f"Unsupported encoder_hidden_activation='{args.encoder_hidden_activation}'. Expected one of: ['tanh', 'silu']"
+            f"Unsupported encoder_hidden_activation='{args.encoder_hidden_activation}'. Expected one of: ['tanh', 'swish', 'silu', 'swish_tanh', 'swish_ta', 'swish_tb', 'swish_tc']"
         )
 
     envs, action_dim = make_pixelbrax_envs(args)
@@ -1400,18 +1413,20 @@ if __name__ == "__main__":
     critic_muon, critic_adam = count_by_type(all_params, "critic")
     encoder_final_muon_params = 0
     encoder_upstream_muon_params = 0
-    if args.use_encoder_final_muon:
+    if args.use_encoder_final_muon or use_encoder_upstream_muon:
         flat_all_params = flax.traverse_util.flatten_dict(all_params)
-        encoder_final_muon_params = sum(
-            flat_all_params[path].size
-            for path in encoder_muon_paths
-            if path in flat_all_params
-        )
-        encoder_upstream_muon_params = sum(
-            flat_all_params[path].size
-            for path in encoder_upstream_muon_paths
-            if path in flat_all_params
-        )
+        if args.use_encoder_final_muon:
+            encoder_final_muon_params = sum(
+                flat_all_params[path].size
+                for path in encoder_muon_paths
+                if path in flat_all_params
+            )
+        if use_encoder_upstream_muon:
+            encoder_upstream_muon_params = sum(
+                flat_all_params[path].size
+                for path in encoder_upstream_muon_paths
+                if path in flat_all_params
+            )
     encoder_adam_params = encoder_params - encoder_final_muon_params - encoder_upstream_muon_params
 
     print(f"\nParameter breakdown:")
@@ -1514,6 +1529,7 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         use_heads_muon=args.use_heads_muon,
         use_encoder_final_muon=args.use_encoder_final_muon,
+        use_encoder_upstream_muon=use_encoder_upstream_muon,
         encoder_final_muon_paths=encoder_muon_paths,
         encoder_upstream_muon_paths=encoder_upstream_muon_paths,
     )
@@ -1538,7 +1554,7 @@ if __name__ == "__main__":
 
 
     def encode_with_intermediates(network_params, obs):
-        if encoder_type not in {"cnn", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
             raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
         return network_debug_apply(network_params, obs, return_intermediates=True)
 
@@ -1734,7 +1750,7 @@ if __name__ == "__main__":
                 actor_hidden, critic_hidden = split_actor_critic_hiddens(
                     network.apply(params["network"], x)
                 )
-        elif encoder_type == "cnn" and args.bottleneck_pre_ln_coef > 0.0:
+        elif encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc"} and args.bottleneck_pre_ln_coef > 0.0:
             encoder_debug = encode_with_intermediates(params["network"], x)
             actor_hidden = encoder_debug["hidden"]
             critic_hidden = actor_hidden
@@ -2540,7 +2556,7 @@ if __name__ == "__main__":
                     sample_next_obs = storage.next_obs[0, :256]
                     sample_actions = storage.actions[0, :256]
                     sample_next_done = storage.next_dones[0, :256]
-                    if encoder_type in {"cnn", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
                         cnn_debug = encode_with_intermediates(
                             agent_state.params["network"],
                             sample_obs,
@@ -2607,12 +2623,28 @@ if __name__ == "__main__":
                                 for k, v in preproj_repr_metrics.items():
                                     log_dict[k.replace("repr/", "encoder_hidden_repr/")] = float(v)
                             else:
+                                dense_kernel_name = "dense_stage2" if encoder_type in {"cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned"} else "Dense_0"
                                 dense_metrics = cnn_dense_metrics(
                                     cnn_debug["dense_pre_ln"],
                                     cnn_debug["hidden"],
-                                    agent_state.params["network"]["params"]["Dense_0"]["kernel"],
-                                    final_grads["network"]["params"]["Dense_0"]["kernel"],
+                                    agent_state.params["network"]["params"][dense_kernel_name]["kernel"],
+                                    final_grads["network"]["params"][dense_kernel_name]["kernel"],
                                 )
+                                if encoder_type in {"cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned"}:
+                                    stage1_dense_metrics = cnn_dense_metrics(
+                                        cnn_debug["stage1_dense_pre_ln"],
+                                        cnn_debug["stage1_hidden"],
+                                        agent_state.params["network"]["params"]["dense_stage1"]["kernel"],
+                                        final_grads["network"]["params"]["dense_stage1"]["kernel"],
+                                        prefix="encoder_stage1",
+                                    )
+                                    for k, v in stage1_dense_metrics.items():
+                                        log_dict[k] = float(v)
+                                    stage1_repr_metrics = encoder_repr_metrics(cnn_debug["stage1_hidden"])
+                                    for k, v in stage1_repr_metrics.items():
+                                        log_dict[k.replace("repr/", "encoder_stage1_repr/")] = float(v)
+                                    if "residual_gate" in cnn_debug:
+                                        log_dict["encoder/residual_gate"] = float(cnn_debug["residual_gate"])
                             for k, v in dense_metrics.items():
                                 log_dict[k] = float(v)
                         if encoder_type == "sigreg_cnn":
