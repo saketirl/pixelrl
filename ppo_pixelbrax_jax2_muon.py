@@ -209,7 +209,7 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
+    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_hidden_activation: str = "tanh"
@@ -223,7 +223,7 @@ class Args:
 
     # SIGReg regularization
     sigreg_mode: str = "off"
-    """SIGReg mode to use: 'off' or 'projected'."""
+    """SIGReg mode to use: 'off', 'projected', or 'shared_hidden'."""
     sigreg_coef: float = 0.0
     """Maximum coefficient for the SIGReg auxiliary loss."""
     sigreg_proj_dim: int = 64
@@ -1287,15 +1287,15 @@ if __name__ == "__main__":
     print("=" * 60)
 
     encoder_type = args.encoder_type.lower()
-    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
+    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
         raise ValueError(
-            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
         )
 
     sigreg_mode = args.sigreg_mode.lower()
-    if sigreg_mode not in {"off", "projected"}:
+    if sigreg_mode not in {"off", "projected", "shared_hidden"}:
         raise ValueError(
-            f"Unsupported sigreg_mode='{args.sigreg_mode}'. Expected one of: ['off', 'projected']"
+            f"Unsupported sigreg_mode='{args.sigreg_mode}'. Expected one of: ['off', 'projected', 'shared_hidden']"
         )
     if sigreg_mode == "projected" and encoder_type != "sigreg_cnn":
         raise ValueError("Projected SIGReg requires encoder_type='sigreg_cnn'.")
@@ -1554,7 +1554,7 @@ if __name__ == "__main__":
 
 
     def encode_with_intermediates(network_params, obs):
-        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
             raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
         return network_debug_apply(network_params, obs, return_intermediates=True)
 
@@ -1566,6 +1566,37 @@ if __name__ == "__main__":
             u_t,
             action,
             return_intermediates=True,
+        )
+
+    def shared_hidden_sigreg(actor_hidden, critic_hidden, rng):
+        """Apply SIGReg to the latent(s) consumed by the actor/critic heads."""
+        if encoder_type == "split_cnn":
+            actor_key, critic_key = jax.random.split(rng)
+            actor_total, actor_re, actor_im = sigreg_loss(
+                actor_hidden,
+                actor_key,
+                num_slices=args.sigreg_num_slices,
+                num_t=args.sigreg_num_t,
+                t_max=args.sigreg_t_max,
+            )
+            critic_total, critic_re, critic_im = sigreg_loss(
+                critic_hidden,
+                critic_key,
+                num_slices=args.sigreg_num_slices,
+                num_t=args.sigreg_num_t,
+                t_max=args.sigreg_t_max,
+            )
+            return (
+                0.5 * (actor_total + critic_total),
+                0.5 * (actor_re + critic_re),
+                0.5 * (actor_im + critic_im),
+            )
+        return sigreg_loss(
+            actor_hidden,
+            rng,
+            num_slices=args.sigreg_num_slices,
+            num_t=args.sigreg_num_t,
+            t_max=args.sigreg_t_max,
         )
 
     @jax.jit
@@ -1710,9 +1741,10 @@ if __name__ == "__main__":
             critic_hidden = actor_hidden
             dense_pre_ln = encoder_debug["dense_pre_ln"]
             if sigreg_mode == "projected":
+                aux_key, sigreg_key = jax.random.split(aux_key)
                 sigreg_total, sigreg_re, sigreg_im = sigreg_loss(
                     encoder_debug["u"],
-                    aux_key,
+                    sigreg_key,
                     num_slices=args.sigreg_num_slices,
                     num_t=args.sigreg_num_t,
                     t_max=args.sigreg_t_max,
@@ -1750,7 +1782,7 @@ if __name__ == "__main__":
                 actor_hidden, critic_hidden = split_actor_critic_hiddens(
                     network.apply(params["network"], x)
                 )
-        elif encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc"} and args.bottleneck_pre_ln_coef > 0.0:
+        elif encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh"} and args.bottleneck_pre_ln_coef > 0.0:
             encoder_debug = encode_with_intermediates(params["network"], x)
             actor_hidden = encoder_debug["hidden"]
             critic_hidden = actor_hidden
@@ -1758,6 +1790,14 @@ if __name__ == "__main__":
         else:
             actor_hidden, critic_hidden = split_actor_critic_hiddens(
                 network.apply(params["network"], x)
+            )
+
+        if sigreg_mode == "shared_hidden":
+            aux_key, sigreg_key = jax.random.split(aux_key)
+            sigreg_total, sigreg_re, sigreg_im = shared_hidden_sigreg(
+                actor_hidden,
+                critic_hidden,
+                sigreg_key,
             )
 
         if encoder_type == "split_cnn":
@@ -2556,7 +2596,7 @@ if __name__ == "__main__":
                     sample_next_obs = storage.next_obs[0, :256]
                     sample_actions = storage.actions[0, :256]
                     sample_next_done = storage.next_dones[0, :256]
-                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
                         cnn_debug = encode_with_intermediates(
                             agent_state.params["network"],
                             sample_obs,

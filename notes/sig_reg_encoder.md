@@ -1321,3 +1321,86 @@ This is probably the strongest shared-direction result we have had so far.
 So the shared line is now much narrower:
 - ant's remaining issue here is ceiling, not collapse
 - humanoid's remaining issue is final-bottleneck reliability
+
+## 2026-04-10 UTC - `crate_cnn` strongly helps ant but fails humanoid through policy-noise blowup
+
+Tested a compact CRATECNN encoder:
+- `encoder_type=crate_cnn`
+- encoder path: `Conv(64, 4x4, stride 2) -> LN -> ReLU -> Conv(64, 3x3, stride 1) -> LN -> ReLU -> flatten -> Dense(512) -> LN -> CRATEFeedForward(512)`
+- `encoder_crate_step_size=0.1`
+- `CRATE` actor/critic heads
+- `use_heads_muon`
+- `anneal_lr`
+- no SIGReg
+- no innovation
+
+Runs:
+- job: `64350`
+- humanoid seeds `4,5`
+- ant seeds `4,5`
+
+Interim results around `2.5M-2.65M` env steps:
+- humanoid: `286`, `310`
+- ant: `1533`, `1238`
+
+### Ant
+
+This is a very strong early ant result.
+
+Both ant seeds committed to low-noise, observation-conditioned policies:
+- seed 4: return `1533`, `policy/obs_to_noise_ratio ~ 4.18`, `action_noise_std_avg ~ 0.046`, `approx_kl ~ 0.44`
+- seed 5: return `1238`, `policy/obs_to_noise_ratio ~ 3.35`, `action_noise_std_avg ~ 0.055`, `approx_kl ~ 0.23`
+
+The representation is not especially broad, but it is sufficiently alive:
+- `cnn_dense/participation_ratio ~ 3.5-4.8`
+- `repr/unit_std_avg ~ 0.19-0.24`
+- `repr/dead_units_frac ~ 0.01-0.11`
+
+So for ant, the encoder-side CRATE bottleneck seems to provide a useful low-dimensional structure that makes policy commitment easy.
+
+### Humanoid
+
+This did not help humanoid.
+
+Both humanoid seeds show the same failure mode as the earlier unbounded swish-style runs: the representation is alive, but policy noise explodes.
+- seed 4: return `286`, `approx_kl ~ 1012`, `action_noise_std_avg ~ 89`, `obs_to_noise_ratio ~ 0.0022`, `action_clip_frac ~ 0.88`
+- seed 5: return `310`, `approx_kl ~ 73`, `action_noise_std_avg ~ 33473`, `obs_to_noise_ratio ~ 6.6e-6`, `action_clip_frac ~ 0.86`
+
+The latent itself is not dead:
+- `repr/dead_units_frac = 0`
+- `repr/unit_std_avg ~ 0.45-0.62`
+- `cnn_dense/participation_ratio ~ 4.8-11.3`
+
+So the humanoid failure is not representation rescue. It is policy-facing scale / stochasticity again.
+
+### Current interpretation
+
+`crate_cnn` appears ant-leaning, not a shared fix.
+
+- Ant benefits from a compact structured CRATE bottleneck even when the effective latent dimension is low.
+- Humanoid still seems to need stronger policy-facing scale control than this encoder provides.
+- Removing the final tanh boundary was good for ant commitment but bad for humanoid policy stability.
+
+This lines up with the broader activation story:
+- ant's dominant failure mode is representation rescue and committing to a low-noise policy
+- humanoid's dominant failure mode is preventing policy-noise blowup through a stable bounded latent interface
+
+## 2026-04-11 UTC - launched `crate_cnn_tanh` shared comparison
+
+Follow-up to `crate_cnn`: keep the same compact encoder-side CRATE block that helped ant, but restore a bounded policy-facing interface for humanoid.
+
+Config:
+- `encoder_type=crate_cnn_tanh`
+- encoder path: `Conv -> LN -> ReLU -> Conv -> LN -> ReLU -> flatten -> Dense(512) -> LN -> CRATEFeedForward(512) -> LN -> tanh(0.5 * x)`
+- `encoder_crate_step_size=0.1`
+- `CRATE` actor/critic heads
+- `use_heads_muon`
+- `anneal_lr`
+- no SIGReg
+
+Runs:
+- job: `64373`
+- humanoid seeds `4,5`
+- ant seeds `4,5`
+
+Hypothesis: the post-CRATE tanh boundary should reduce the humanoid logstd/action-noise blowup seen in `crate_cnn`; the main risk is that bounding the CRATE latent may weaken ant's low-noise commitment.

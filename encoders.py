@@ -951,6 +951,66 @@ class CRATEFeedForward(nn.Module):
         return nn.swish(x + grad_update)
 
 
+class CRATECNNEncoder(nn.Module):
+    """Compact CNN encoder with a CRATE policy-facing bottleneck."""
+
+    crate_step_size: float = 0.1
+    tanh_scale: float = 0.5
+    apply_output_tanh: bool = False
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        pre_crate_hidden = nn.LayerNorm()(dense_pre_ln)
+        hidden = CRATEFeedForward(
+            dim=512,
+            step_size=self.crate_step_size,
+            name="crate_block",
+        )(pre_crate_hidden)
+        crate_hidden = hidden
+        if self.apply_output_tanh:
+            hidden = nn.LayerNorm(name="post_crate_ln")(hidden)
+            hidden = nn.tanh(self.tanh_scale * hidden)
+
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "crate_hidden": crate_hidden,
+                "pre_crate_hidden": pre_crate_hidden,
+                "dense_pre_ln": dense_pre_ln,
+            }
+        return hidden
+
+
 class ProjectedSIGRegCNNEncoder(nn.Module):
     """CNN encoder with optional CRATE block before a learned projector."""
 
@@ -1160,6 +1220,14 @@ def build_encoder(
         return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="swish_tb")
     if kind == "cnn_swish_tc":
         return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="swish_tc")
+    if kind in {"crate_cnn", "cratecnn"}:
+        return CRATECNNEncoder(crate_step_size=crate_step_size)
+    if kind in {"crate_cnn_tanh", "cratecnn_tanh", "cratecnntanh"}:
+        return CRATECNNEncoder(
+            crate_step_size=crate_step_size,
+            tanh_scale=tanh_scale,
+            apply_output_tanh=True,
+        )
     if kind == "cnn_swish_tanh":
         return CNNSwishTanhEncoder(tanh_scale=tanh_scale)
     if kind == "cnn_swish_tanh_resid":
@@ -1245,5 +1313,5 @@ def build_encoder(
             apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )
