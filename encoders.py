@@ -956,6 +956,7 @@ class CRATECNNEncoder(nn.Module):
 
     crate_step_size: float = 0.1
     tanh_scale: float = 0.5
+    residual_scale: float = 0.0
     apply_output_tanh: bool = False
 
     @nn.compact
@@ -997,17 +998,29 @@ class CRATECNNEncoder(nn.Module):
             name="crate_block",
         )(pre_crate_hidden)
         crate_hidden = hidden
+        tanh_hidden = None
+        residual_hidden = None
         if self.apply_output_tanh:
-            hidden = nn.LayerNorm(name="post_crate_ln")(hidden)
-            hidden = nn.tanh(self.tanh_scale * hidden)
+            tanh_hidden = nn.LayerNorm(name="post_crate_ln")(hidden)
+            tanh_hidden = nn.tanh(self.tanh_scale * tanh_hidden)
+            hidden = tanh_hidden
+            if self.residual_scale != 0.0:
+                residual_hidden = nn.LayerNorm(name="residual_ln")(crate_hidden)
+                hidden = tanh_hidden + self.residual_scale * residual_hidden
 
         if return_intermediates:
-            return {
+            intermediates = {
                 "hidden": hidden,
                 "crate_hidden": crate_hidden,
                 "pre_crate_hidden": pre_crate_hidden,
                 "dense_pre_ln": dense_pre_ln,
             }
+            if tanh_hidden is not None:
+                intermediates["tanh_hidden"] = tanh_hidden
+            if residual_hidden is not None:
+                intermediates["residual_hidden"] = residual_hidden
+                intermediates["residual_scale"] = jnp.asarray(self.residual_scale)
+            return intermediates
         return hidden
 
 
@@ -1205,6 +1218,7 @@ def build_encoder(
     use_crate_block: bool = False,
     crate_step_size: float = 0.1,
     innovation_hidden_activation: str = "tanh",
+    residual_scale: float = 0.1,
 ) -> nn.Module:
     """Build an encoder module by name."""
     kind = encoder_type.lower()
@@ -1226,6 +1240,13 @@ def build_encoder(
         return CRATECNNEncoder(
             crate_step_size=crate_step_size,
             tanh_scale=tanh_scale,
+            apply_output_tanh=True,
+        )
+    if kind in {"crate_cnn_tanh_resid", "cratecnn_tanh_resid", "cratecnntanhresid"}:
+        return CRATECNNEncoder(
+            crate_step_size=crate_step_size,
+            tanh_scale=tanh_scale,
+            residual_scale=residual_scale,
             apply_output_tanh=True,
         )
     if kind == "cnn_swish_tanh":
@@ -1313,5 +1334,5 @@ def build_encoder(
             apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )

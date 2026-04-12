@@ -1404,3 +1404,272 @@ Runs:
 - ant seeds `4,5`
 
 Hypothesis: the post-CRATE tanh boundary should reduce the humanoid logstd/action-noise blowup seen in `crate_cnn`; the main risk is that bounding the CRATE latent may weaken ant's low-noise commitment.
+
+## 2026-04-11 UTC - `crate_cnn_tanh` made real progress: Ant survival, Humanoid rescue
+
+Final `crate_cnn_tanh` job `64373` used `encoder_tanh_scale=0.5` with CRATE actor/critic heads, manifold MUON heads, and no SIGReg.
+
+Final 10M results:
+- humanoid seed 4: final `2263`, peak `2552`, last-100-update mean `2372`
+- humanoid seed 5: final `1197`, peak `1314`, last-100-update mean `1238`
+- ant seed 4: final `1005`, peak `1012`, last-100-update mean `1005`, episode length `1000`
+- ant seed 5: final `972`, peak `987`, last-100-update mean `972`, episode length `1000`
+
+Compared with unbounded `crate_cnn` job `64350`:
+- humanoid improved from final `288/300` to `2263/1197`
+- ant dropped from final `2337/1872` to `1005/972`, but this is not the usual Ant collapse
+
+Important correction: the Ant result is still progress. Both Ant seeds reached the stable `1000` episode-length regime instead of the usual collapsed `~500` regime. The issue is not survival or representation death; it is that the policy is too conservative once the post-CRATE latent is bounded.
+
+Mechanism:
+- Humanoid was rescued by policy-facing scale control: action noise dropped from `88.7/33472.6` to `0.094/0.127`, `obs_to_noise_ratio` rose to `2.48/1.93`, and action clipping dropped from `0.87/0.90` to `~0.0001/0.048`.
+- Ant stayed alive but became under-actuated: mean action norm dropped from unbounded `crate_cnn` at `0.77/0.70` to `0.33/0.23`, and `mean_action_obs_std_avg` dropped to `0.085/0.043`.
+- The shared interpretation is now better than before: post-CRATE tanh prevents Humanoid noise blowup and prevents Ant survival collapse, but `encoder_tanh_scale=0.5` over-damps Ant action amplitude.
+
+Next follow-up: launch `crate_cnn_tanh` with softer `encoder_tanh_scale=0.75` to try to keep Humanoid stable while restoring more Ant action amplitude.
+
+## 2026-04-11 UTC - launched softer `crate_cnn_tanh` scale 0.75
+
+Follow-up to job `64373`.
+
+Config:
+- `encoder_type=crate_cnn_tanh`
+- `encoder_tanh_scale=0.75`
+- `encoder_crate_step_size=0.1`
+- CRATE actor/critic heads
+- manifold MUON heads
+- no SIGReg
+- humanoid and ant seeds `4,5`
+
+Run:
+- job: `64632`
+
+Hypothesis: keep the Humanoid policy-noise stability from the post-CRATE tanh boundary while restoring more Ant action amplitude than the `0.5` scale run.
+
+Final results:
+- humanoid seed 4: final `1476`, peak `1560`, last-100-update mean `1452`
+- humanoid seed 5: final `1179`, peak `1182`, last-100-update mean `1117`
+- ant seed 4: final `680`, peak `736`, last-100-update mean `643`, episode length `1000`
+- ant seed 5: final `961`, peak `976`, last-100-update mean `961`, episode length `1000`
+
+Compared with `encoder_tanh_scale=0.5` job `64373`:
+- humanoid seed 4 got worse: `2263 -> 1476`
+- humanoid seed 5 was effectively unchanged/slightly worse: `1197 -> 1179`
+- ant seed 4 got worse: `1005 -> 680`
+- ant seed 5 was effectively unchanged/slightly worse: `972 -> 961`
+
+Mechanism:
+- Increasing the scale did restore more representation variance (`repr/unit_std_avg` rose on humanoid and ant seed 4), but it did not translate into useful Ant control.
+- Ant seed 4 became noisy/overactive rather than better conditioned: action norm rose from `0.33` to `0.93`, action noise rose from `0.012` to `0.297`, `obs_to_noise_ratio` fell from `6.8` to `0.26`, and action clipping appeared (`~0.096`).
+- Ant seed 5 stayed in the same conservative survival regime as `0.5`: final return `961`, action norm `0.29`, and low action conditioning.
+- Humanoid remained protected from the catastrophic unbounded-CRATE noise blowup, but `0.75` reduced the seed-4 upside and did not improve seed 5.
+
+Takeaway: tanh scale is not the right simple knob. `0.5` is the better bounded shared setting so far. Moving to `0.75` either adds unhelpful stochasticity (ant seed 4) or leaves the conservative plateau unchanged (ant seed 5), while making humanoid no better.
+
+Next direction: if we want to improve shared performance, try a gated/residual boundary instead of a harder scale sweep: keep a bounded post-CRATE path for humanoid stability, but add a small learnable or fixed unbounded CRATE residual for ant action amplitude.
+
+## 2026-04-11 UTC - launched fixed residual `crate_cnn_tanh_resid`
+
+Follow-up to the `0.75` hard-scale result. This tests the residual-boundary proposal directly.
+
+Config:
+- `encoder_type=crate_cnn_tanh_resid`
+- encoder path: `Conv -> LN -> ReLU -> Conv -> LN -> ReLU -> flatten -> Dense(512) -> LN -> CRATEFeedForward(512) -> tanh_path + 0.1 * residual_path`
+- tanh path: `post_crate_ln(h_crate) -> tanh(0.5 * x)`
+- residual path: `residual_ln(h_crate)`, no final LayerNorm after the sum
+- `encoder_tanh_scale=0.5`
+- `encoder_residual_scale=0.1`
+- `encoder_crate_step_size=0.1`
+- CRATE actor/critic heads
+- manifold MUON heads
+- no SIGReg
+- humanoid and ant seeds `4,5`
+
+Run:
+- job: `64665`
+
+Hypothesis: preserve the Humanoid stability of the `0.5` hard tanh boundary while giving Ant a small controlled unbounded CRATE channel for action amplitude. The main comparison is against `crate_cnn_tanh` job `64373`; success means Ant improves above the `~1000` survival plateau without reopening Humanoid logstd/action-noise blowup.
+
+Early-stop result:
+- job `64665` was cancelled after `~37` minutes, around `1.9M-2.0M` env steps, so this is not a full `10M` result.
+- humanoid seed 4: `789` at `1.916M`; comparable baselines at the same step were `864` for hard-tanh `0.5`, `806` for hard-tanh `0.75`, and `279` for unbounded `crate_cnn`
+- humanoid seed 5: `671` at `1.897M`; comparable baselines were `663`, `623`, and `314`
+- ant seed 4: `485` at `2.011M`; comparable baselines were `948`, `614`, and `1395`
+- ant seed 5: `956` at `2.002M`; comparable baselines were `976`, `969`, and `1077`
+
+Mechanism:
+- Humanoid remained stable versus unbounded `crate_cnn`, but the residual did not improve over hard-tanh `0.5`.
+- Ant seed 4 showed the same bad direction as hard-tanh `0.75`: action amplitude/noise increased without useful conditioning. It had `action_l2_mean ~ 1.02`, `action_noise_std_avg ~ 0.318`, `obs_to_noise_ratio ~ 0.25`, and action clipping `~0.092`.
+- Ant seed 5 remained in the conservative survival regime, with return `956`, episode length `1000`, low mean-action conditioning, and low representation variance.
+
+Takeaway: a fixed `0.1` residual is not a clear improvement. It appears to behave like a noisier scale increase on the bad Ant seed rather than a controlled useful action-amplitude channel. If we continue residuals, make the residual weaker (`0.03-0.05`) or learn/gate it with stronger regularization; otherwise, hard-tanh `0.5` remains the best shared CRATECNN setting so far.
+
+## 2026-04-11 UTC - launched weaker fixed residual `crate_cnn_tanh_resid` scale 0.03
+
+Follow-up to the early-stopped fixed residual scale `0.1` run, which looked like a noisy scale increase on Ant seed 4.
+
+Config:
+- `encoder_type=crate_cnn_tanh_resid`
+- `encoder_tanh_scale=0.5`
+- `encoder_residual_scale=0.03`
+- `encoder_crate_step_size=0.1`
+- CRATE actor/critic heads
+- manifold MUON heads
+- no SIGReg
+- humanoid and ant seeds `4,5`
+
+Run:
+- job: `64707`
+
+Hypothesis: keep the Humanoid-stabilizing hard tanh path while testing whether a much weaker residual gives Ant a small action-amplitude channel without causing the noisy/low `obs_to_noise_ratio` behavior seen at residual scale `0.1`.
+
+Final result:
+- humanoid seed 4: final `1878`, peak `2182`, last-100-update mean `1880`, episode length `376`
+- humanoid seed 5: final `3096`, peak `3428`, last-100-update mean `3104`, episode length `622`
+- ant seed 4: final `975`, peak `987`, last-100-update mean `976`, episode length `1000`
+- ant seed 5: final `976`, peak `991`, last-100-update mean `976`, episode length `1000`
+
+Compared with hard-tanh `0.5` job `64373`:
+- humanoid seed 4 got worse: final `2263 -> 1878`, peak `2552 -> 2182`
+- humanoid seed 5 got much better: final `1197 -> 3096`, peak `1314 -> 3428`
+- ant seed 4 got slightly worse: final `1005 -> 975`
+- ant seed 5 was effectively unchanged/slightly better: final `972 -> 976`
+
+Mechanism:
+- The weak residual did not reopen the unbounded-CRATE Humanoid failure mode. Humanoid action noise stayed controlled (`0.096/0.091`), `obs_to_noise_ratio` improved to `2.47/2.69`, and action clipping stayed near zero.
+- The Humanoid gain is seed-asymmetric. Seed 5 improved because it reached much longer episodes (`240 -> 622`) while staying in the same low-noise policy regime; seed 4 lost some upside despite similar final policy-noise statistics.
+- Ant stayed alive but remained under-actuated. Both seeds finished at full `1000` episode length, but mean action norm stayed low (`0.223/0.216`) and returns stayed around `975-976`, far below unbounded `crate_cnn` Ant (`2337/1872`).
+- The residual did not create the intended Ant action-amplitude channel. Compared with hard-tanh `0.5`, Ant seed 4 action norm dropped (`0.326 -> 0.223`) and seed 5 stayed low (`0.235 -> 0.216`), while action noise remained tiny.
+
+Takeaway: `encoder_residual_scale=0.03` is a promising Humanoid robustness variant because it produced the best Humanoid seed seen in this CRATECNN branch without policy-noise blowup, but it is not an Ant improvement. It should be treated as a Humanoid-biased variant, not the shared Ant/Humanoid answer. For Ant, the remaining gap is still useful action amplitude under the bounded encoder, not survival.
+
+Next proposal:
+- Keep the `crate_cnn_tanh_resid` encoder with `encoder_tanh_scale=0.5` and `encoder_residual_scale=0.03`.
+- Add an early actor conditionality floor: start with `actor_cond_coef=10`, `actor_cond_target=0.08`, and `actor_cond_stop_updates=1500`.
+- Add the existing actor-noise cap at the same time: start with `actor_noise_coef=10`, `actor_noise_max_std=0.25`, and `actor_noise_stop_updates=1500`.
+
+Rationale: this should be mostly inactive on Humanoid because Humanoid already has high action-mean conditionality (`~0.22-0.24`), while Ant is low (`~0.04-0.06`). It targets the Ant failure mode more directly than residual scale: increase deterministic action variation when it is too small, but cap logstd/noise so it does not become the bad `0.75` or `0.1` residual behavior.
+
+## 2026-04-12 UTC - launched `crate_cnn_tanh_resid` with actor conditionality floor
+
+Follow-up to job `64707`.
+
+Config:
+- `encoder_type=crate_cnn_tanh_resid`
+- `encoder_tanh_scale=0.5`
+- `encoder_residual_scale=0.03`
+- `encoder_crate_step_size=0.1`
+- `actor_cond_coef=10`
+- `actor_cond_target=0.08`
+- `actor_cond_stop_updates=1500`
+- `actor_noise_coef=10`
+- `actor_noise_max_std=0.25`
+- `actor_noise_stop_updates=1500`
+- CRATE actor/critic heads
+- manifold MUON heads
+- no SIGReg
+- humanoid and ant seeds `4,5`
+
+Run:
+- job: `65134`
+- script: `scripts/experiments/crate_cnn_tanhresid003_actorcond_crate_muon_run.sh`
+
+Hypothesis: keep the Humanoid-stable bounded CRATECNN encoder, while encouraging Ant's deterministic action mean to vary enough to escape the `~975-1000` conservative survival plateau. The action-noise cap is included so the conditionality pressure should not turn into the noisy/high-logstd failure mode seen in hard-tanh `0.75` and fixed residual `0.1`.
+
+Partial result:
+- job `65134` was cancelled after about `18:27`, around `0.85M-0.91M` env steps, after Ant seed 4 had already clearly collapsed.
+- humanoid seed 4: `787` at `0.859M`; comparable same-step baselines were `543` for residual `0.03`, `501` for hard-tanh `0.5`, and `359` for unbounded `crate_cnn`.
+- humanoid seed 5: `797` at `0.855M`; comparable baselines were `511`, `461`, and `332`.
+- ant seed 4: `535` at `0.904M`; comparable baselines were `897`, `910`, and `857`.
+- ant seed 5: `946` at `0.910M`; comparable baselines were `946`, `963`, and `848`.
+
+Mechanism:
+- The actor-conditionality/noise-cap test helped early Humanoid returns, but made Humanoid much noisier than the stable final residual run: `obs_to_noise_ratio ~0.73/0.85`, action noise `0.23/0.19`, and approx KL `~0.49/0.55` at only `~0.86M`.
+- Ant seed 4 was not merely low-return; the representation collapsed. It had `repr/active_units_frac=0`, `repr/unit_std_avg ~ 1e-6`, `value/obs_std ~ 5e-6`, `cnn_dense/pre_ln_std ~ 346`, and `policy/mean_action_obs_std_avg ~ 7e-6`.
+- The collapsed Ant seed still produced large nearly state-independent actions: `policy/mean_action_norm_mean ~1.70`, `traj/action_l2_mean ~0.95`, and action clipping `~0.09`. That is the same wrong direction as the `0.75` and residual `0.1` experiments: action magnitude/noise without useful state conditioning.
+- Ant seed 5 did not collapse, but it also did not improve over the residual `0.03` baseline at the same step.
+
+Takeaway: this actor-side conditionality floor is not the right mechanism in its current form. It is too aggressive early, and when the encoder collapses it cannot repair the representation; the result is a degenerate constant-action policy on Ant seed 4. Do not continue this exact `actor_cond_target=0.08`, `actor_cond_coef=10`, `1500`-update setup.
+
+## 2026-04-12 UTC - policy-head bounding diagnostic for unbounded `crate_cnn`
+
+Next test after the actor-conditionality collapse. This is not intended as a policy-side hyperparameter sweep; it is a diagnostic of whether the unbounded `crate_cnn` Humanoid failure is primarily a policy-distribution scale/logstd problem.
+
+Code change:
+- added opt-in `actor_mean_tanh`
+- added opt-in `actor_mean_scale`
+- added opt-in `clip_global_logstd`
+- existing default behavior remains unchanged because all three switches default off
+
+Config:
+- `encoder_type=crate_cnn`
+- `actor_mean_tanh=true`
+- `actor_mean_scale=1.0`
+- `clip_global_logstd=true`
+- `actor_logstd_min=-5.0`
+- `actor_logstd_max=-1.4`
+- `encoder_crate_step_size=0.1`
+- CRATE actor/critic heads
+- manifold MUON heads
+- no SIGReg
+- humanoid and ant seeds `4,5`
+
+Hypothesis: unbounded `crate_cnn` was excellent for Ant but catastrophic for Humanoid because the policy distribution escaped: Humanoid had huge action noise/logstd and heavy action clipping. If that is the main failure, then bounding actor mean and global logstd should preserve the Ant-friendly unbounded CRATE representation while preventing Humanoid policy blowup. If Humanoid still fails, the unbounded encoder itself is likely corrupting policy learning and the next direction should be a dual-path encoder rather than policy-head bounds.
+
+Script:
+- `scripts/experiments/crate_cnn_policybound_crate_muon_run.sh`
+
+Run:
+- job: `65139`
+
+Final result:
+- humanoid seed 4: final `3628`, peak `3733`, last-100-update mean `3495`, episode length `731`
+- humanoid seed 5: final `3023`, peak `3266`, last-100-update mean `2934`, episode length `607`
+- ant seed 4: final `716`, peak `753`, last-100-update mean `723`, episode length `989`
+- ant seed 5: final `727`, peak `755`, last-100-update mean `726`, episode length `994`
+
+Compared with prior runs:
+- Humanoid was rescued strongly relative to unbounded `crate_cnn` (`288/300 -> 3628/3023`) and improved over hard-tanh `0.5` (`2263/1197`) and residual `0.03` (`1878/3096`) on average.
+- Ant was much worse than every serious baseline: unbounded `crate_cnn` was `2337/1872`, hard-tanh `0.5` was `1005/972`, residual `0.03` was `975/976`, and policy-bound unbounded `crate_cnn` was only `716/727`.
+
+Mechanism:
+- This did confirm the Humanoid failure was largely policy-distribution scale/logstd: with bounded actor mean and capped logstd, Humanoid no longer had huge action clipping or logstd blowup. Final Humanoid action clipping was only `~0.002`, logstd was fixed at `-1.4`, and episode lengths reached `731/607`.
+- Ant committed to the survival regime extremely quickly. Policy-bound Ant reached episode length `>=990` at `0.036M/0.032M` steps and `>=1000` at `0.406M/0.037M` steps, much earlier than unbounded `crate_cnn` (`~0.63M/0.66M` for `>=990`, `~0.71M/0.74M` for `1000`) and hard-tanh/residual baselines (`~0.44M-0.58M` for `>=990`).
+- The fast Ant commitment was not useful locomotion. Returns stayed around `720-730` for the whole run, with raw reward mean only `2.88/2.79` versus hard-tanh `0.5` at `4.02/3.89` and unbounded `crate_cnn` at `9.15/7.60`.
+- Representation did not collapse: Ant had `repr/active_units_frac=1.0`, `repr/unit_std_avg=0.52/0.47`, high participation ratio `38/34`, and stable rank `12.7/12.5`. The failure is policy/noise, not representation death.
+- The actor noise was effectively fixed too high for Ant. Because global `log_std` is initialized at `0` and then clipped to max `-1.4`, `jnp.clip` gives zero gradient while the underlying parameter is above the cap, so the learned global logstd cannot move down. This leaves action noise fixed at `exp(-1.4)=0.247`.
+- Ant's successful unbounded `crate_cnn` had action noise `~0.020`, and hard-tanh/residual had `~0.007-0.012`. Policy-bound Ant instead had noise `0.247`, so `obs_to_noise_ratio` was only `0.31/0.30` despite non-collapsed representation. It learns a robust high-noise survival policy, not a precise gait.
+
+Takeaway: direct policy bounding is enough to control Humanoid and is a useful diagnostic, but the current implementation over-constrains Ant because it freezes global logstd at the max cap. The next diagnostic, if we stay with this direction, should keep the mean bound but initialize global logstd at the cap or use a one-sided parameterization that allows it to decrease below `-1.4`; otherwise we are testing fixed high-noise Ant, not just a safe upper bound.
+
+## 2026-04-12 UTC - launched mean-bound unbounded `crate_cnn` with learnable bounded logstd
+
+Follow-up to job `65139`.
+
+Code change:
+- added opt-in `bounded_global_logstd`
+- added `actor_logstd_init`
+- when `bounded_global_logstd=true`, global logstd is parameterized as `min + (max - min) * sigmoid(raw)` instead of hard-clipping the global `log_std` parameter
+- existing default behavior remains unchanged
+
+Config:
+- `encoder_type=crate_cnn`
+- `actor_mean_tanh=true`
+- `actor_mean_scale=1.0`
+- `bounded_global_logstd=true`
+- `actor_logstd_init=-2.0`
+- `actor_logstd_min=-5.0`
+- `actor_logstd_max=-1.4`
+- `encoder_crate_step_size=0.1`
+- CRATE actor/critic heads
+- manifold MUON heads
+- no SIGReg
+- humanoid and ant seeds `4,5`
+
+Script:
+- `scripts/experiments/crate_cnn_meanbound_boundedstd_crate_muon_run.sh`
+
+Run:
+- job: `65292`
+
+Hypothesis: job `65139` showed that policy-head bounds rescue Humanoid but accidentally froze Ant's global logstd at high noise `exp(-1.4)=0.247`. This run keeps the same actor mean bound but makes logstd learnable under the same upper cap, initialized at `-2.0`. Success means Humanoid remains controlled while Ant noise can decrease after the early `1000`-length survival commitment, allowing returns to climb instead of plateauing near `720`.

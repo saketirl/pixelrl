@@ -209,9 +209,11 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
+    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
+    encoder_residual_scale: float = 0.1
+    """Residual scale for encoder variants with a residual policy-facing path."""
     encoder_hidden_activation: str = "tanh"
     """Hidden bottleneck activation for innovation encoders: 'tanh' or 'swish' ('silu' accepted as alias)."""
     encoder_warmup_updates: int = 0
@@ -302,6 +304,16 @@ class Args:
     """Minimum log-std clamp for the actor policy."""
     actor_logstd_max: float = 2.0
     """Maximum log-std clamp for the actor policy."""
+    clip_global_logstd: bool = False
+    """If true, clamp the global actor log-std parameter with actor_logstd_min/max."""
+    bounded_global_logstd: bool = False
+    """If true, parameterize global log-std inside actor_logstd_min/max with a sigmoid."""
+    actor_logstd_init: float = 0.0
+    """Initializer for the global actor log-std parameter."""
+    actor_mean_tanh: bool = False
+    """If true, bound the actor mean with tanh(actor_mean) * actor_mean_scale."""
+    actor_mean_scale: float = 1.0
+    """Scale for tanh-bounded actor means."""
 
     # CRATE head architecture
     use_crate_head: bool = False
@@ -336,6 +348,11 @@ class Actor(nn.Module):
     state_std_tanh_scale: float = 0.5
     logstd_min: float = -5.0
     logstd_max: float = 2.0
+    clip_global_logstd: bool = False
+    bounded_global_logstd: bool = False
+    actor_logstd_init: float = 0.0
+    actor_mean_tanh: bool = False
+    actor_mean_scale: float = 1.0
 
     @nn.compact
     def __call__(self, x):
@@ -348,6 +365,8 @@ class Actor(nn.Module):
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
         )(x)
+        if self.actor_mean_tanh:
+            actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
         if self.state_dependent_std:
             log_std_bias = self.param(
                 "log_std_bias",
@@ -363,11 +382,31 @@ class Actor(nn.Module):
             actor_logstd = log_std_bias + self.state_std_tanh_scale * jnp.tanh(log_std_delta)
             actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         else:
-            actor_logstd = self.param(
-                "log_std",
-                nn.initializers.zeros,
-                (self.action_dim,)
-            )
+            if self.bounded_global_logstd:
+                eps = 1e-6
+                init = np.clip(
+                    self.actor_logstd_init,
+                    self.logstd_min + eps,
+                    self.logstd_max - eps,
+                )
+                frac = (init - self.logstd_min) / (self.logstd_max - self.logstd_min)
+                raw_init = np.log(frac) - np.log1p(-frac)
+                actor_logstd_raw = self.param(
+                    "log_std_raw",
+                    constant(float(raw_init)),
+                    (self.action_dim,),
+                )
+                actor_logstd = self.logstd_min + (
+                    self.logstd_max - self.logstd_min
+                ) * jax.nn.sigmoid(actor_logstd_raw)
+            else:
+                actor_logstd = self.param(
+                    "log_std",
+                    constant(self.actor_logstd_init),
+                    (self.action_dim,)
+                )
+                if self.clip_global_logstd:
+                    actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         return actor_mean, actor_logstd
 
 
@@ -391,6 +430,11 @@ class CRATEActor(nn.Module):
     state_std_tanh_scale: float = 0.5
     logstd_min: float = -5.0
     logstd_max: float = 2.0
+    clip_global_logstd: bool = False
+    bounded_global_logstd: bool = False
+    actor_logstd_init: float = 0.0
+    actor_mean_tanh: bool = False
+    actor_mean_scale: float = 1.0
 
     @nn.compact
     def __call__(self, x):
@@ -402,6 +446,8 @@ class CRATEActor(nn.Module):
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
         )(x)
+        if self.actor_mean_tanh:
+            actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
         if self.state_dependent_std:
             log_std_bias = self.param(
                 "log_std_bias",
@@ -417,11 +463,31 @@ class CRATEActor(nn.Module):
             actor_logstd = log_std_bias + self.state_std_tanh_scale * jnp.tanh(log_std_delta)
             actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         else:
-            actor_logstd = self.param(
-                "log_std",
-                nn.initializers.zeros,
-                (self.action_dim,)
-            )
+            if self.bounded_global_logstd:
+                eps = 1e-6
+                init = np.clip(
+                    self.actor_logstd_init,
+                    self.logstd_min + eps,
+                    self.logstd_max - eps,
+                )
+                frac = (init - self.logstd_min) / (self.logstd_max - self.logstd_min)
+                raw_init = np.log(frac) - np.log1p(-frac)
+                actor_logstd_raw = self.param(
+                    "log_std_raw",
+                    constant(float(raw_init)),
+                    (self.action_dim,),
+                )
+                actor_logstd = self.logstd_min + (
+                    self.logstd_max - self.logstd_min
+                ) * jax.nn.sigmoid(actor_logstd_raw)
+            else:
+                actor_logstd = self.param(
+                    "log_std",
+                    constant(self.actor_logstd_init),
+                    (self.action_dim,)
+                )
+                if self.clip_global_logstd:
+                    actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         return actor_mean, actor_logstd
 
 
@@ -1264,6 +1330,7 @@ if __name__ == "__main__":
     print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
+    print(f"  encoder_residual_scale: {args.encoder_residual_scale}")
     print(f"  encoder_hidden_activation: {args.encoder_hidden_activation}")
     print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
     print(f"  encoder_use_crate_block: {args.encoder_use_crate_block}")
@@ -1283,13 +1350,22 @@ if __name__ == "__main__":
     print(f"  innovation_t_max: {args.innovation_t_max}")
     print(f"  innovation_warmup_updates: {args.innovation_warmup_updates}")
     print(f"  innovation_ramp_updates: {args.innovation_ramp_updates}")
+    print(f"  state_dependent_std: {args.state_dependent_std}")
+    print(f"  state_std_tanh_scale: {args.state_std_tanh_scale}")
+    print(f"  actor_logstd_min: {args.actor_logstd_min}")
+    print(f"  actor_logstd_max: {args.actor_logstd_max}")
+    print(f"  clip_global_logstd: {args.clip_global_logstd}")
+    print(f"  bounded_global_logstd: {args.bounded_global_logstd}")
+    print(f"  actor_logstd_init: {args.actor_logstd_init}")
+    print(f"  actor_mean_tanh: {args.actor_mean_tanh}")
+    print(f"  actor_mean_scale: {args.actor_mean_scale}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
     encoder_type = args.encoder_type.lower()
-    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
+    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
         raise ValueError(
-            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
         )
 
     sigreg_mode = args.sigreg_mode.lower()
@@ -1336,6 +1412,7 @@ if __name__ == "__main__":
         use_crate_block=args.encoder_use_crate_block,
         crate_step_size=args.encoder_crate_step_size,
         innovation_hidden_activation=encoder_hidden_activation,
+        residual_scale=args.encoder_residual_scale,
     )
     if args.use_crate_head:
         actor = CRATEActor(
@@ -1345,6 +1422,11 @@ if __name__ == "__main__":
             state_std_tanh_scale=args.state_std_tanh_scale,
             logstd_min=args.actor_logstd_min,
             logstd_max=args.actor_logstd_max,
+            clip_global_logstd=args.clip_global_logstd,
+            bounded_global_logstd=args.bounded_global_logstd,
+            actor_logstd_init=args.actor_logstd_init,
+            actor_mean_tanh=args.actor_mean_tanh,
+            actor_mean_scale=args.actor_mean_scale,
         )
         critic = CRATECritic(crate_step_size=args.crate_step_size)
         print(f"Using CRATE heads with step_size={args.crate_step_size}")
@@ -1355,6 +1437,11 @@ if __name__ == "__main__":
             state_std_tanh_scale=args.state_std_tanh_scale,
             logstd_min=args.actor_logstd_min,
             logstd_max=args.actor_logstd_max,
+            clip_global_logstd=args.clip_global_logstd,
+            bounded_global_logstd=args.bounded_global_logstd,
+            actor_logstd_init=args.actor_logstd_init,
+            actor_mean_tanh=args.actor_mean_tanh,
+            actor_mean_scale=args.actor_mean_scale,
         )
         critic = Critic()
 
@@ -1554,7 +1641,7 @@ if __name__ == "__main__":
 
 
     def encode_with_intermediates(network_params, obs):
-        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
             raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
         return network_debug_apply(network_params, obs, return_intermediates=True)
 
@@ -1782,7 +1869,7 @@ if __name__ == "__main__":
                 actor_hidden, critic_hidden = split_actor_critic_hiddens(
                     network.apply(params["network"], x)
                 )
-        elif encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh"} and args.bottleneck_pre_ln_coef > 0.0:
+        elif encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid"} and args.bottleneck_pre_ln_coef > 0.0:
             encoder_debug = encode_with_intermediates(params["network"], x)
             actor_hidden = encoder_debug["hidden"]
             critic_hidden = actor_hidden
@@ -2596,7 +2683,7 @@ if __name__ == "__main__":
                     sample_next_obs = storage.next_obs[0, :256]
                     sample_actions = storage.actions[0, :256]
                     sample_next_done = storage.next_dones[0, :256]
-                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
                         cnn_debug = encode_with_intermediates(
                             agent_state.params["network"],
                             sample_obs,
