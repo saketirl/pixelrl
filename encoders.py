@@ -931,6 +931,41 @@ class SplitActorCriticCNNEncoder(nn.Module):
         return actor_hidden, critic_hidden
 
 
+class SeparateActorCriticCNNEncoder(nn.Module):
+    """Fully separate CNN encoders for actor and critic."""
+
+    tanh_scale: float = 0.5
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        actor_encoder = CNNEncoder(
+            tanh_scale=self.tanh_scale,
+            hidden_activation="tanh",
+            name="actor_encoder",
+        )
+        critic_encoder = CNNEncoder(
+            tanh_scale=self.tanh_scale,
+            hidden_activation="tanh",
+            name="critic_encoder",
+        )
+
+        if return_intermediates:
+            actor_debug = actor_encoder(x, return_intermediates=True)
+            critic_debug = critic_encoder(x, return_intermediates=True)
+            return {
+                "hidden": actor_debug["hidden"],
+                "dense_pre_ln": actor_debug["dense_pre_ln"],
+                "actor_hidden": actor_debug["hidden"],
+                "critic_hidden": critic_debug["hidden"],
+                "actor_dense_pre_ln": actor_debug["dense_pre_ln"],
+                "critic_dense_pre_ln": critic_debug["dense_pre_ln"],
+            }
+
+        actor_hidden = actor_encoder(x)
+        critic_hidden = critic_encoder(x)
+        return actor_hidden, critic_hidden
+
+
 class CRATEFeedForward(nn.Module):
     """CRATE-style FeedForward layer implementing an ISTA step."""
 
@@ -1257,6 +1292,8 @@ def build_encoder(
         return CNNSwishTanhResidualLearnedEncoder(tanh_scale=tanh_scale)
     if kind == "split_cnn":
         return SplitActorCriticCNNEncoder(tanh_scale=tanh_scale)
+    if kind == "separate_cnn":
+        return SeparateActorCriticCNNEncoder(tanh_scale=tanh_scale)
     if kind == "sigreg_cnn":
         return ProjectedSIGRegCNNEncoder(
             tanh_scale=tanh_scale,
@@ -1334,5 +1371,5 @@ def build_encoder(
             apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'separate_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )

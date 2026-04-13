@@ -209,7 +209,7 @@ class Args:
 
     # Encoder architecture
     encoder_type: str = "cnn"
-    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
+    """encoder architecture to use: 'resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'separate_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', or 'mlp'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
     encoder_residual_scale: float = 0.1
@@ -860,6 +860,11 @@ def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...],
             ("network", "params", "actor_dense", "kernel"),
             ("network", "params", "critic_dense", "kernel"),
         )
+    if kind == "separate_cnn":
+        return (
+            ("network", "params", "actor_encoder", "Dense_0", "kernel"),
+            ("network", "params", "critic_encoder", "Dense_0", "kernel"),
+        )
     if kind == "innovation_direct_cnn":
         return (("network", "params", "innovation_projector", "kernel"),)
     if kind in {"cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned"}:
@@ -1363,9 +1368,9 @@ if __name__ == "__main__":
     print("=" * 60)
 
     encoder_type = args.encoder_type.lower()
-    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
+    if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "separate_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
         raise ValueError(
-            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
+            f"Unsupported encoder_type='{args.encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'separate_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp']"
         )
 
     sigreg_mode = args.sigreg_mode.lower()
@@ -1641,7 +1646,7 @@ if __name__ == "__main__":
 
 
     def encode_with_intermediates(network_params, obs):
-        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "separate_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
             raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
         return network_debug_apply(network_params, obs, return_intermediates=True)
 
@@ -1657,7 +1662,7 @@ if __name__ == "__main__":
 
     def shared_hidden_sigreg(actor_hidden, critic_hidden, rng):
         """Apply SIGReg to the latent(s) consumed by the actor/critic heads."""
-        if encoder_type == "split_cnn":
+        if encoder_type in {"split_cnn", "separate_cnn"}:
             actor_key, critic_key = jax.random.split(rng)
             actor_total, actor_re, actor_im = sigreg_loss(
                 actor_hidden,
@@ -1858,7 +1863,7 @@ if __name__ == "__main__":
                 num_t=args.innovation_num_t,
                 t_max=args.innovation_t_max,
             )
-        elif encoder_type == "split_cnn":
+        elif encoder_type in {"split_cnn", "separate_cnn"}:
             if args.bottleneck_pre_ln_coef > 0.0:
                 encoder_debug = encode_with_intermediates(params["network"], x)
                 actor_hidden = encoder_debug["actor_hidden"]
@@ -1887,7 +1892,7 @@ if __name__ == "__main__":
                 sigreg_key,
             )
 
-        if encoder_type == "split_cnn":
+        if encoder_type in {"split_cnn", "separate_cnn"}:
             (
                 actor_vicreg_total,
                 actor_vicreg_unit_std_avg,
@@ -2683,12 +2688,12 @@ if __name__ == "__main__":
                     sample_next_obs = storage.next_obs[0, :256]
                     sample_actions = storage.actions[0, :256]
                     sample_next_done = storage.next_dones[0, :256]
-                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+                    if encoder_type in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "separate_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
                         cnn_debug = encode_with_intermediates(
                             agent_state.params["network"],
                             sample_obs,
                         )
-                        if encoder_type == "split_cnn":
+                        if encoder_type in {"split_cnn", "separate_cnn"}:
                             hidden = cnn_debug["actor_hidden"]
                             critic_hidden_debug = cnn_debug["critic_hidden"]
                             actor_mean_debug, actor_logstd_debug = actor.apply(
@@ -2699,19 +2704,29 @@ if __name__ == "__main__":
                                 agent_state.params["critic"],
                                 critic_hidden_debug,
                             ).squeeze(-1)
+                            if encoder_type == "separate_cnn":
+                                actor_dense_kernel = agent_state.params["network"]["params"]["actor_encoder"]["Dense_0"]["kernel"]
+                                actor_dense_grad = final_grads["network"]["params"]["actor_encoder"]["Dense_0"]["kernel"]
+                                critic_dense_kernel = agent_state.params["network"]["params"]["critic_encoder"]["Dense_0"]["kernel"]
+                                critic_dense_grad = final_grads["network"]["params"]["critic_encoder"]["Dense_0"]["kernel"]
+                            else:
+                                actor_dense_kernel = agent_state.params["network"]["params"]["actor_dense"]["kernel"]
+                                actor_dense_grad = final_grads["network"]["params"]["actor_dense"]["kernel"]
+                                critic_dense_kernel = agent_state.params["network"]["params"]["critic_dense"]["kernel"]
+                                critic_dense_grad = final_grads["network"]["params"]["critic_dense"]["kernel"]
                             dense_metrics = cnn_dense_metrics(
                                 cnn_debug["actor_dense_pre_ln"],
                                 hidden,
-                                agent_state.params["network"]["params"]["actor_dense"]["kernel"],
-                                final_grads["network"]["params"]["actor_dense"]["kernel"],
+                                actor_dense_kernel,
+                                actor_dense_grad,
                             )
                             for k, v in dense_metrics.items():
                                 log_dict[k] = float(v)
                             critic_dense_metrics = cnn_dense_metrics(
                                 cnn_debug["critic_dense_pre_ln"],
                                 critic_hidden_debug,
-                                agent_state.params["network"]["params"]["critic_dense"]["kernel"],
-                                final_grads["network"]["params"]["critic_dense"]["kernel"],
+                                critic_dense_kernel,
+                                critic_dense_grad,
                                 prefix="critic_cnn_dense",
                             )
                             for k, v in critic_dense_metrics.items():
