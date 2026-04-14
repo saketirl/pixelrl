@@ -1673,3 +1673,88 @@ Run:
 - job: `65292`
 
 Hypothesis: job `65139` showed that policy-head bounds rescue Humanoid but accidentally froze Ant's global logstd at high noise `exp(-1.4)=0.247`. This run keeps the same actor mean bound but makes logstd learnable under the same upper cap, initialized at `-2.0`. Success means Humanoid remains controlled while Ant noise can decrease after the early `1000`-length survival commitment, allowing returns to climb instead of plateauing near `720`.
+
+Final result:
+- humanoid seed 4: final `3141`, peak `3141`, last-100-update mean `2878`, episode length `630`
+- humanoid seed 5: final `1917`, peak `2039`, last-100-update mean `1896`, episode length `383`
+- ant seed 4: final `2318`, peak `2321`, last-100-update mean `2306`, episode length `1000`
+- ant seed 5: final `1245`, peak `1458`, last-100-update mean `1259`, episode length `1000`
+
+Compared with job `65139` hard-clipped policy-bound `crate_cnn`:
+- humanoid seed 4 dropped from `3628 -> 3141`, but remained strong and controlled
+- humanoid seed 5 dropped from `3023 -> 1917`, still far above unbounded `crate_cnn` failure
+- ant seed 4 jumped from `716 -> 2318`
+- ant seed 5 jumped from `727 -> 1245`
+
+Compared with unbounded `crate_cnn`:
+- humanoid is rescued: `288/300 -> 3141/1917`
+- ant seed 4 is essentially recovered: `2337 -> 2318`
+- ant seed 5 is partially recovered but still below unbounded: `1872 -> 1245`
+
+Mechanism:
+- The learnable bounded logstd did exactly what the diagnostic intended. Policy-bound hard clip froze Ant at `logstd=-1.4` and action noise `0.247`; bounded logstd learned down to `logstd=-3.87/-3.79`, action noise `0.021/0.023`, close to successful unbounded `crate_cnn` (`0.020/0.021`).
+- Ant kept the very fast survival commitment: both seeds reached episode length `1000` by `0.032M` steps. Unlike the hard-clipped run, seed 4 then kept improving: `~991` at `0.5M`, `1146` at `1M`, `1567` at `2M`, `1998` at `4M`, and `2318` final.
+- Ant seed 5 improved over the fixed-noise plateau but stayed weaker: `~986` at `0.5M`, `1021` at `1M`, `1224` at `6M`, peak `1458` at `7.04M`, and final `1245`. This should count as a partial success rather than a failed seed: episode length was already `1000`, representation stayed healthy, and the return trend was still upward before the late dip.
+- Representation stayed alive. Ant had `repr/active_units_frac=1.0`, `repr/unit_std_avg=0.36/0.29`, participation ratio `4.20/4.39`, and no action clipping.
+- The remaining Ant seed-5 gap looks like under-actuation/conditioning relative to unbounded `crate_cnn`: action norm `0.43` vs unbounded `0.72`, mean-action obs std `0.146` vs `0.224`, and raw reward mean `5.17` vs `7.60`.
+- Humanoid was controlled by the policy-head bound without action clipping. Final Humanoid action clipping was `0`, logstd learned to `-2.61/-2.59`, and obs-to-noise ratio was healthy (`3.04/2.97`).
+
+Implementation note:
+- The actor distribution is still a diagonal Gaussian policy: `action ~ Normal(mu(s), exp(logstd))`. A learned state-independent logstd vector is standard for PPO-style Gaussian policies.
+- The new part is the bounded parameterization of that global logstd:
+  `logstd = min + (max - min) * sigmoid(raw_logstd)`.
+- This is a smooth constrained-parameter version of a common logstd bound. It is analogous to SAC-style implementations that clamp or map logstd into `[logstd_min, logstd_max]`, but avoids the zero-gradient failure we hit with `jnp.clip`.
+- In this run the range was `[-5.0, -1.4]`, so `std` could move from `exp(-2.0)=0.135` at initialization down toward `exp(-5.0)=0.0067`, while never exceeding `exp(-1.4)=0.247`.
+- This is why Ant could learn noise down to `~0.02`. The hard-clipped version initialized the underlying parameter above the cap, clipped it to `-1.4`, and then had zero gradient through the cap, effectively fixing Ant at high noise.
+- The actor mean bound is separate: `actor_mean = tanh(raw_mean) * 1.0`. This limits the Gaussian center but still allows sampled actions to vary; the learnable logstd controls how often samples leave the action range and hit the environment action clip.
+- References for the pieces: OpenAI Spinning Up / Stable-Baselines3 use learned logstd for Gaussian PPO policies; OpenAI Spinning Up SAC clamps logstd to `[LOG_STD_MIN, LOG_STD_MAX]`; TorchRL has a tanh-to-range logstd mapping. Our sigmoid mapping is the same bounded-parameter idea adapted to a global PPO logstd.
+
+Network diagram for the successful shared setup:
+
+```text
+pixels: 84x84 frame stack
+        |
+        v
+normalize / 255
+        |
+        v
+Conv(64, 4x4, stride 2, VALID) -> LayerNorm -> ReLU
+        |
+        v
+Conv(64, 3x3, stride 1, VALID) -> LayerNorm -> ReLU
+        |
+        v
+flatten
+        |
+        v
+Dense(512) -> LayerNorm
+        |
+        v
+CRATEFeedForward(dim=512, step_size=0.1)  # outputs 512-dim hidden
+        |
+        +-------------------------------+
+        |                               |
+        v                               v
+actor head                        critic head
+Dense(256) -> Swish               Dense(256) -> Swish
+CRATEFeedForward(256, 0.1)        CRATEFeedForward(256, 0.1)
+        |                               |
+        v                               v
+raw actor mean                     value
+        |
+        v
+mu(s) = tanh(raw mean) * 1.0
+
+global learned logstd:
+raw_logstd parameter
+        |
+        v
+logstd = -5.0 + (-1.4 + 5.0) * sigmoid(raw_logstd)
+std = exp(logstd)
+
+policy:
+action ~ Normal(mu(s), std)
+action sent to env is clipped to [-1, 1], but successful runs have near-zero clip fraction
+```
+
+Takeaway: this is the best shared mechanism so far. It preserves the Ant-friendly unbounded CRATECNN representation and fixes Humanoid's policy-distribution blowup, provided the logstd bound is learnable rather than a hard clip. The mid Ant seed is better interpreted as healthy-but-underpowered progress, not collapse: it has a live representation, early `1000`-length survival, no clipping, learned-down noise, and improving returns. The remaining issue is seed variance / action strength after survival commitment, with Ant seed 5 and Humanoid seed 5 still below their best prior individual runs.
