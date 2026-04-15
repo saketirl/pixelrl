@@ -21,9 +21,9 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "optax==0.2.2",
     "pillow>=11.3.0",
+    "PyYAML==6.0.3",
     "scipy>=1.13.1",
     "tqdm>=4.67.1",
     "tyro>=1.0.2",
     "wandb==0.17.2",
 ]
-

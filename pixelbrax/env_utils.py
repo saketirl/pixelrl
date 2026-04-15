@@ -883,14 +883,31 @@ def make_pixel_brax(
         def __init__(self, env):
             super().__init__(sys=env.sys, backend=env.backend)
             self.env = env
+            self.base_sys = env.sys
             self.seed = ret
-            self._reset_fn = jax.jit(jax.vmap(env.reset))
-            self._step_fn = jax.jit(jax.vmap(env.step))
+            self._reset_with_sys_fn = jax.jit(
+                jax.vmap(
+                    lambda sys, rng: self._env_with_sys(sys).reset(rng),
+                    in_axes=(None, 0),
+                )
+            )
+            self._step_with_sys_fn = jax.jit(
+                jax.vmap(
+                    lambda sys, state, action: self._env_with_sys(sys).step(
+                        state, action
+                    ),
+                    in_axes=(None, 0, 0),
+                )
+            )
             # self._frames = deque([jnp.zeros(shape=(n_envs, hw, hw, 3)) for _ in range(3)], maxlen=3)
+
+        def _env_with_sys(self, sys):
+            self.env.unwrapped.sys = sys
+            return self.env
 
         @property
         def action_size(self):
-            return self.env.action_size
+            return self.base_sys.act_size()
 
         @property
         def observation_sample(self):
@@ -907,14 +924,17 @@ def make_pixel_brax(
             return 1000
 
         def reset(self, rng: jax.Array):
-            raw_state = self._reset_fn(rng)
+            return self.reset_with_sys(self.base_sys, rng)
+
+        def reset_with_sys(self, sys: brax.System, rng: jax.Array):
+            raw_state = self._reset_with_sys_fn(sys, rng)
 
             # This is only used for the video distractors. This API design is kinda gross, but oh well...
             video_idx = jax.random.choice(
                 rng[0], jnp.arange(start=0, stop=len(BG_FRAMES)), shape=(n_envs,)
             )
 
-            frames = render_pixels(self.env.sys, raw_state.pipeline_state)
+            frames = render_pixels(sys, raw_state.pipeline_state)
             if not return_float32:
                 frames = (frames * 255).astype(jnp.uint8)
 
@@ -968,12 +988,15 @@ def make_pixel_brax(
             )
 
         def step(self, states, actions):
+            return self.step_with_sys(self.base_sys, states, actions)
+
+        def step_with_sys(self, sys: brax.System, states, actions):
             # Annoyingly, we need to replace the pixels obs in the previous state to the env's actual obs...
-            raw_next_states = self._step_fn(states, actions)
+            raw_next_states = self._step_with_sys_fn(sys, states, actions)
 
             frame_idx = states.frame_idx
 
-            next_frames = render_pixels(self.env.sys, raw_next_states.pipeline_state)
+            next_frames = render_pixels(sys, raw_next_states.pipeline_state)
             if not return_float32:
                 next_frames = (next_frames * 255).astype(jnp.uint8)
 
@@ -1023,7 +1046,8 @@ def make_pixel_brax(
                 frame_idx=frame_idx.astype(jnp.int8),
             )
     
-    return PixelEnv(env), PixelEnv(env).reset(ret), ret
+    pixel_env = PixelEnv(env)
+    return pixel_env, pixel_env.reset(ret), ret
 
 
 # adapted from https://github.com/openai/baselines/blob/master/baselines/common/vec_env/vec_normalize.py

@@ -1,0 +1,42 @@
+enabled: true
+env_name: inverted_pendulum
+backend: generalized
+
+# Must be an exact multiple of n_envs * num_steps so task switches happen
+# between PPO rollouts. This is the closest aligned value to 1,000,000 for
+# the launcher/full_run hyperparameters (128 envs * 10 steps = 1,280), giving
+# ten tasks over 9,996,800 env steps.
+switch_every_env_steps: 999680
+
+# null means use the training --seed. Set an integer to reuse the same dynamics
+# schedule across different training seeds.
+seed: null
+
+# Task 0 always uses the loaded Brax defaults. Sampling starts at task_index=1.
+first_task_uses_defaults: true
+
+parameters:
+  geom_friction_slide:
+    enabled: true
+    # default: 1.0, from sys.geom_friction[:, 0]
+    default: 1.0
+    min: 0.5
+    max: 2.5
+
+  actuator_gear:
+    enabled: true
+    # default actuator gear from the inverted_pendulum slide motor.
+    defaults:
+      slide: 100.0
+    ranges:
+      slide: [50.0, 150.0]
+
+  link_mass:
+    enabled: true
+    # defaults from sys.link.inertia.mass: cart=10.4719753, pole=5.0185914
+    defaults:
+      cart: 10.4719753
+      pole: 5.0185914
+    ranges:
+      cart: [7.3304, 13.6136]
+      pole: [3.5130, 6.5242]

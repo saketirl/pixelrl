@@ -1,0 +1,64 @@
+enabled: true
+env_name: walker2d
+backend: spring
+
+# Must be an exact multiple of n_envs * num_steps so task switches happen
+# between PPO rollouts. This is the closest aligned value to 1,000,000 for
+# the launcher/full_run hyperparameters (128 envs * 10 steps = 1,280), giving
+# ten tasks over 9,996,800 env steps.
+switch_every_env_steps: 999680
+
+# null means use the training --seed. Set an integer to reuse the same dynamics
+# schedule across different training seeds.
+seed: null
+
+# Task 0 always uses the loaded Brax defaults. Sampling starts at task_index=1.
+first_task_uses_defaults: true
+
+parameters:
+  geom_friction_slide:
+    enabled: false
+    # Walker2d spring has nonuniform default slide friction by geom:
+    # floor=0.7, torso/thigh/leg/foot/right-leg=0.9, left_foot=1.9.
+    # Keep this disabled until we add a per-geom or multiplicative friction mode.
+
+  actuator_gear:
+    enabled: true
+    # defaults from sys.actuator.gear, action order:
+    # thigh=100, leg=100, foot=100, thigh_left=100, leg_left=100, foot_left=100
+    defaults:
+      thigh: 100.0
+      leg: 100.0
+      foot: 100.0
+      thigh_left: 100.0
+      leg_left: 100.0
+      foot_left: 100.0
+    ranges:
+      thigh: [50.0, 150.0]
+      leg: [50.0, 150.0]
+      foot: [50.0, 150.0]
+      thigh_left: [50.0, 150.0]
+      leg_left: [50.0, 150.0]
+      foot_left: [50.0, 150.0]
+
+  link_mass:
+    enabled: true
+    # defaults from sys.link.inertia.mass:
+    # torso=3.6651914, thigh=4.0578904, leg=2.7813568, foot=3.1667254,
+    # thigh_left=4.0578904, leg_left=2.7813568, foot_left=3.1667254
+    defaults:
+      torso: 3.6651914
+      thigh: 4.0578904
+      leg: 2.7813568
+      foot: 3.1667254
+      thigh_left: 4.0578904
+      leg_left: 2.7813568
+      foot_left: 3.1667254
+    ranges:
+      torso: [2.5656, 4.7647]
+      thigh: [2.8405, 5.2753]
+      leg: [1.9469, 3.6158]
+      foot: [2.2167, 4.1167]
+      thigh_left: [2.8405, 5.2753]
+      leg_left: [1.9469, 3.6158]
+      foot_left: [2.2167, 4.1167]

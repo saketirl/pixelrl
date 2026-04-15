@@ -8,11 +8,12 @@ Uses:
 - Adam for actor/critic head vectors/scalars (biases, log_std)
 """
 import os
+import json
 import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Sequence
+from typing import Optional, Sequence
 
 import flax
 import flax.linen as nn
@@ -28,6 +29,14 @@ from flax.training.train_state import TrainState
 import sys
 sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/brax")
 import pixelbrax
+from pixelbrax.continual_dynamics import (
+    apply_dynamics_task,
+    continual_log_metrics,
+    load_continual_dynamics_config,
+    make_dynamics_task,
+    resolve_schedule_seed,
+    validate_continual_dynamics_config,
+)
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
@@ -76,6 +85,8 @@ class Args:
     """learning rate for actor/critic head vectors/scalars (Adam/AdamW)"""
     weight_decay: float = 0.0
     """weight decay for AdamW (0.0 uses Adam instead)"""
+    use_heads_muon: bool = True
+    """if toggled, use MUON for actor/critic head matrices"""
 
     num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
@@ -131,6 +142,10 @@ class Args:
     # Action repeat
     action_repeat: int = 1
     """Number of times to repeat each action (frame skip)"""
+
+    # Continual dynamics
+    continual_dynamics_config: Optional[str] = None
+    """Path to a YAML continual dynamics config"""
 
     # Debug/analysis flags
     debug_repr: bool = False
@@ -349,6 +364,12 @@ class RewardNormalizer:
         normalized = rewards / jnp.sqrt(self.return_rms_var + epsilon)
         return jnp.clip(normalized, -clip, clip)
 
+    def reset_discounted_return(self):
+        """Reset per-env discounted returns while preserving running moments."""
+        return self.replace(
+            discounted_return=jnp.zeros_like(self.discounted_return),
+        )
+
 
 # --------------------------------------------------------
 #  Debug Metrics for Encoder Representations
@@ -470,6 +491,7 @@ def create_encoder_adam_heads_muon_optimizer(
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
+    use_heads_muon: bool = True,
 ):
     """
     Create optimizer that uses:
@@ -542,6 +564,8 @@ def create_encoder_adam_heads_muon_optimizer(
             if path[0] == 'network':
                 return 'encoder'
             else:
+                if not use_heads_muon:
+                    return 'heads_adam'
                 # For actor/critic heads, check if matrix or vector/scalar
                 is_matrix = param.ndim >= 2 and min(param.shape) > 1
                 if is_matrix:
@@ -637,6 +661,7 @@ if __name__ == "__main__":
     adam_type = "AdamW" if args.weight_decay > 0 else "Adam"
     print(f"\nOptimizer config:")
     print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
+    print(f"  use_heads_muon: {args.use_heads_muon}")
     print(f"  heads_muon_lr (MUON for matrices): {args.heads_muon_lr}")
     print(f"  heads_adam_lr ({adam_type} for vectors): {args.heads_adam_lr}")
     print(f"  weight_decay: {args.weight_decay}")
@@ -651,9 +676,49 @@ if __name__ == "__main__":
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
 
+    base_sys = envs.base_sys
+    current_sys = base_sys
+    continual_config = None
+    current_task = None
+    task_start_step = 0
+    updates_per_task = 0
+    schedule_seed = args.seed
+
+    if args.continual_dynamics_config is not None:
+        loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
+        if loaded_config.enabled:
+            updates_per_task = validate_continual_dynamics_config(
+                loaded_config,
+                env_name=args.env_name,
+                backend=args.backend,
+                n_envs=args.n_envs,
+                num_steps=args.num_steps,
+                base_sys=base_sys,
+            )
+            continual_config = loaded_config
+            schedule_seed = resolve_schedule_seed(continual_config, args.seed)
+            current_task = make_dynamics_task(
+                continual_config,
+                base_sys,
+                task_index=0,
+                schedule_seed=schedule_seed,
+            )
+            current_sys = apply_dynamics_task(base_sys, current_task)
+            print("\nContinual dynamics: ENABLED")
+            print(f"  config: {continual_config.path}")
+            print(f"  switch_every_env_steps: {continual_config.switch_every_env_steps}")
+            print(f"  updates_per_task: {updates_per_task}")
+            print(f"  schedule_seed: {schedule_seed}")
+            print(
+                "  task=0 step=0 default=True values="
+                f"{json.dumps(current_task.values, sort_keys=True)}"
+            )
+        else:
+            print("\nContinual dynamics: config disabled; using fixed dynamics")
+
     # Get observation shape
     reset_rng = jax.random.split(jax.random.PRNGKey(args.seed), args.n_envs)
-    init_env_state = envs.reset(reset_rng)
+    init_env_state = envs.reset_with_sys(current_sys, reset_rng)
     raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
     obs_shape = (raw_obs_shape[0], raw_obs_shape[1], raw_obs_shape[2] * args.frame_stack)
     print(f"raw_obs_shape: {raw_obs_shape}")
@@ -704,6 +769,11 @@ if __name__ == "__main__":
 
     actor_muon, actor_adam = count_by_type(all_params, 'actor')
     critic_muon, critic_adam = count_by_type(all_params, 'critic')
+    if not args.use_heads_muon:
+        actor_adam += actor_muon
+        critic_adam += critic_muon
+        actor_muon = 0
+        critic_muon = 0
 
     print(f"\nParameter breakdown:")
     print(f"  Encoder (Adam): {encoder_params:,}")
@@ -741,6 +811,7 @@ if __name__ == "__main__":
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
         weight_decay=args.weight_decay,
+        use_heads_muon=args.use_heads_muon,
     )
 
     agent_state = TrainState.create(
@@ -920,7 +991,7 @@ if __name__ == "__main__":
     # Reset environment
     key, reset_key = jax.random.split(key)
     reset_rngs = jax.random.split(reset_key, args.n_envs)
-    env_state = envs.reset(reset_rngs)
+    env_state = envs.reset_with_sys(current_sys, reset_rngs)
 
     # Initialize frame stack with initial observation
     frame_stack = FrameStack.create(args.n_envs, args.frame_stack, raw_obs_shape)
@@ -931,48 +1002,48 @@ if __name__ == "__main__":
     # Initialize reward normalizer
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
-    def step_once(carry, step):
-        agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
-        action, logprob, value, key = get_action_and_value(agent_state, obs, key)
+    def rollout(current_sys, agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
+        def step_once(carry, step):
+            agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
+            action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
-        env_state = envs.step(env_state, action)
-        raw_obs = env_state.pixels
-        raw_reward = env_state.reward
-        next_done = env_state.done.astype(jnp.bool_)
+            env_state = envs.step_with_sys(current_sys, env_state, action)
+            raw_obs = env_state.pixels
+            raw_reward = env_state.reward
+            next_done = env_state.done.astype(jnp.bool_)
 
-        fs = fs.push(raw_obs)
-        fs = fs.reset(raw_obs, next_done)
-        next_obs = fs.get_stacked()
+            fs = fs.push(raw_obs)
+            fs = fs.reset(raw_obs, next_done)
+            next_obs = fs.get_stacked()
 
-        reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
-        reward = reward_norm.normalize(raw_reward)
+            reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
+            reward = reward_norm.normalize(raw_reward)
 
-        new_episode_return = episode_stats.episode_returns + raw_reward
-        new_episode_length = episode_stats.episode_lengths + 1
-        episode_stats = episode_stats.replace(
-            episode_returns=jnp.where(next_done, 0.0, new_episode_return),
-            episode_lengths=jnp.where(next_done, 0, new_episode_length).astype(jnp.int32),
-            returned_episode_returns=jnp.where(
-                next_done, new_episode_return, episode_stats.returned_episode_returns
-            ),
-            returned_episode_lengths=jnp.where(
-                next_done, new_episode_length, episode_stats.returned_episode_lengths
-            ).astype(jnp.int32),
-        )
+            new_episode_return = episode_stats.episode_returns + raw_reward
+            new_episode_length = episode_stats.episode_lengths + 1
+            episode_stats = episode_stats.replace(
+                episode_returns=jnp.where(next_done, 0.0, new_episode_return),
+                episode_lengths=jnp.where(next_done, 0, new_episode_length).astype(jnp.int32),
+                returned_episode_returns=jnp.where(
+                    next_done, new_episode_return, episode_stats.returned_episode_returns
+                ),
+                returned_episode_lengths=jnp.where(
+                    next_done, new_episode_length, episode_stats.returned_episode_lengths
+                ).astype(jnp.int32),
+            )
 
-        storage = Storage(
-            obs=obs,
-            actions=action,
-            logprobs=logprob,
-            dones=done,
-            values=value,
-            rewards=reward,
-            returns=jnp.zeros_like(reward),
-            advantages=jnp.zeros_like(reward),
-        )
-        return (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage
+            storage = Storage(
+                obs=obs,
+                actions=action,
+                logprobs=logprob,
+                dones=done,
+                values=value,
+                rewards=reward,
+                returns=jnp.zeros_like(reward),
+                advantages=jnp.zeros_like(reward),
+            )
+            return (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage
 
-    def rollout(agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
         (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage = jax.lax.scan(
             step_once, (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), jnp.arange(max_steps)
         )
@@ -984,9 +1055,56 @@ if __name__ == "__main__":
     print("\nStarting training...")
     cumulative_episodic_return = 0.0
     for iteration in range(1, args.num_updates + 1):
+        if (
+            continual_config is not None
+            and iteration > 1
+            and (iteration - 1) % updates_per_task == 0
+        ):
+            task_index = (iteration - 1) // updates_per_task
+            current_task = make_dynamics_task(
+                continual_config,
+                base_sys,
+                task_index=task_index,
+                schedule_seed=schedule_seed,
+            )
+            current_sys = apply_dynamics_task(base_sys, current_task)
+            task_start_step = global_step
+
+            key, reset_key = jax.random.split(key)
+            reset_rngs = jax.random.split(reset_key, args.n_envs)
+            env_state = envs.reset_with_sys(current_sys, reset_rngs)
+            frame_stack = frame_stack.reset(env_state.pixels)
+            next_obs = frame_stack.get_stacked()
+            next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
+            episode_stats = EpisodeStatistics(
+                episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
+                episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
+                returned_episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
+                returned_episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
+            )
+            reward_normalizer = reward_normalizer.reset_discounted_return()
+
+            print(
+                f"continual_switch task={task_index} step={global_step} "
+                f"default={current_task.is_default} values="
+                f"{json.dumps(current_task.values, sort_keys=True)}"
+            )
+
+            if args.track:
+                import wandb
+                wandb.log(
+                    continual_log_metrics(
+                        current_task,
+                        switch_every_env_steps=continual_config.switch_every_env_steps,
+                        task_start_step=task_start_step,
+                        global_step=global_step,
+                    ),
+                    step=global_step,
+                )
+
         iteration_time_start = time.time()
         agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, storage, key = rollout(
-            agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, key
+            current_sys, agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, key
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
@@ -1032,7 +1150,8 @@ if __name__ == "__main__":
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
                     "charts/encoder_lr": encoder_lr_current,
                     "charts/heads_adam_lr": heads_adam_lr_current,
-                    "charts/heads_muon_lr": args.heads_muon_lr,  # Fixed
+                    "charts/heads_muon_lr": args.heads_muon_lr if args.use_heads_muon else 0.0,
+                    "charts/use_heads_muon": int(args.use_heads_muon),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),
@@ -1041,6 +1160,16 @@ if __name__ == "__main__":
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
                 }
+
+                if continual_config is not None:
+                    log_dict.update(
+                        continual_log_metrics(
+                            current_task,
+                            switch_every_env_steps=continual_config.switch_every_env_steps,
+                            task_start_step=task_start_step,
+                            global_step=global_step,
+                        )
+                    )
 
                 # Debug metrics for encoder representations
                 if args.debug_repr:

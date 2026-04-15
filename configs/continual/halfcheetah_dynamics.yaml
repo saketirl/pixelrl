@@ -1,0 +1,65 @@
+enabled: true
+env_name: halfcheetah
+backend: spring
+
+# Must be an exact multiple of n_envs * num_steps so task switches happen
+# between PPO rollouts. This is the closest aligned value to 2,000,000 for
+# the launcher/full_run hyperparameters (128 envs * 10 steps = 1,280), giving
+# five tasks over 9,996,800 env steps.
+switch_every_env_steps: 1999360
+
+# null means use the training --seed. Set an integer to reuse the same dynamics
+# schedule across different training seeds.
+seed: null
+
+# Task 0 always uses the loaded Brax defaults. Sampling starts at task_index=1.
+first_task_uses_defaults: true
+
+parameters:
+  geom_friction_slide:
+    enabled: true
+    # default: 0.4, from sys.geom_friction[:, 0]
+    default: 0.4
+    min: 0.2
+    max: 1.0
+
+  actuator_gear:
+    enabled: true
+    # defaults after HalfCheetah spring override, action order:
+    # bthigh=120, bshin=90, bfoot=60, fthigh=120, fshin=100, ffoot=100
+    defaults:
+      bthigh: 120.0
+      bshin: 90.0
+      bfoot: 60.0
+      fthigh: 120.0
+      fshin: 100.0
+      ffoot: 100.0
+    ranges:
+      bthigh: [90.0, 150.0]
+      bshin: [67.5, 112.5]
+      bfoot: [45.0, 75.0]
+      fthigh: [90.0, 150.0]
+      fshin: [75.0, 125.0]
+      ffoot: [75.0, 125.0]
+
+  link_mass:
+    enabled: true
+    # defaults from sys.link.inertia.mass:
+    # torso=6.2502093, bthigh=1.5435146, bshin=1.5874476, bfoot=1.0953975,
+    # fthigh=1.4380753, fshin=1.2008368, ffoot=0.8845188
+    defaults:
+      torso: 6.2502093
+      bthigh: 1.5435146
+      bshin: 1.5874476
+      bfoot: 1.0953975
+      fthigh: 1.4380753
+      fshin: 1.2008368
+      ffoot: 0.8845188
+    ranges:
+      torso: [5.3127, 7.1877]
+      bthigh: [1.3120, 1.7750]
+      bshin: [1.3493, 1.8256]
+      bfoot: [0.9311, 1.2597]
+      fthigh: [1.2224, 1.6538]
+      fshin: [1.0207, 1.3810]
+      ffoot: [0.7518, 1.0172]
