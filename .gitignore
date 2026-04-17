@@ -183,13 +183,10 @@ run_data/*
 wandb/
 *.json
 lqr_ac_compare/Stiefel_Ascent_RLC.pdf
-
+*.png
 # secrets
 secrets/
-
-# checkpoints
-checkpoints/
-*.pkl
-
-node_modules/
+*.pkl 
+node_modules/ 
+*.csv
 

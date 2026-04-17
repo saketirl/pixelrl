@@ -64,6 +64,7 @@ def make_pixel_brax(
     alpha=0.5,
     action_repeat=1,
     return_float32=True,
+    frame_stack=3,
 ):
     assert backend in ["generalized", "positional", "spring"]
     assert video_set in ["train", "test"]
@@ -894,7 +895,7 @@ def make_pixel_brax(
         @property
         def observation_sample(self):
             return jnp.zeros(
-                (hw, hw, 9), dtype=jnp.float32 if return_float32 else jnp.uint8
+                (hw, hw, frame_stack * 3), dtype=jnp.float32 if return_float32 else jnp.uint8
             )
 
         @property
@@ -951,7 +952,7 @@ def make_pixel_brax(
             else:
                 video_idx = jnp.zeros(shape=(n_envs,), dtype=jnp.int8)
 
-            _frames = jnp.concatenate([frames, frames, frames], axis=-1)
+            _frames = jnp.concatenate([frames] * frame_stack, axis=-1)
 
             return State(
                 raw_state.pipeline_state,
