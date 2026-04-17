@@ -1,18 +1,17 @@
 #!/usr/bin/env python
 """
-PPO for PixelBrax environments - CleanRL style with Manifold MUON optimizer.
+PPO for PixelBrax environments.
 
-Uses:
-- Adam for encoder (CNN)
+Optimizer split:
+- Adam/AdamW for encoder (network)
 - Manifold MUON for actor/critic head matrices (2D+ params)
-- Adam for actor/critic head vectors/scalars (biases, log_std)
+- Adam/AdamW for actor/critic vectors/scalars
 """
 import os
 import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Sequence
 
 import flax
 import flax.linen as nn
@@ -31,13 +30,50 @@ import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
-from manifold_muon_optax import manifold_muon
+from manifold_muon_optax import manifold_muon, manifold_muon_per_head
+from encoders import ViTConfig, build_encoder
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
 # Fix CUDNN non-determinism
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+
+
+class CRATEFeedForward(nn.Module):
+    """CRATE-style FeedForward layer implementing an ISTA step.
+
+    Computes: output = swish(x + step_size * (W.T @ x - W.T @ W @ x))
+
+    This implements a gradient descent step for sparse coding with dictionary W.
+    Reference: https://github.com/Ma-Lab-Berkeley/CRATE/blob/main/model/crate.py
+    """
+    dim: int
+    step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        # Weight matrix W of shape (dim, dim), initialized with Kaiming uniform
+        weight = self.param(
+            "weight",
+            nn.initializers.kaiming_uniform(),
+            (self.dim, self.dim)
+        )
+
+        # Compute D^T * D * x (W @ x then W.T @ result)
+        x1 = x @ weight.T  # (batch, dim) @ (dim, dim) -> (batch, dim)
+        grad_1 = x1 @ weight  # (batch, dim) @ (dim, dim) -> (batch, dim)
+
+        # Compute D^T * x
+        grad_2 = x @ weight  # (batch, dim) @ (dim, dim) -> (batch, dim)
+
+        # Compute gradient update: step_size * (D^T * x - D^T * D * x)
+        # lambda is set to 0.0 so we omit the - step_size * lambda term
+        grad_update = self.step_size * (grad_2 - grad_1)
+
+        # Apply swish activation (instead of ReLU in original CRATE)
+        output = nn.swish(x + grad_update)
+        return output
 
 
 @dataclass
@@ -54,9 +90,9 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Environment arguments
-    env_name: str = "halfcheetah"
+    env_name: str = "inverted_pendulum"
     """the name of the environment"""
-    backend: str = "spring"
+    backend: str = "generalized"
     """the physics backend (spring, generalized, positional)"""
     n_envs: int = 512
     """the number of parallel game environments"""
@@ -111,6 +147,8 @@ class Args:
     """logging interval (in updates)"""
 
     # Manifold MUON optimizer arguments
+    use_heads_muon: bool = True
+    """if True, use manifold MUON for actor/critic weight matrices; if False, use Adam for all head params"""
     muon_dual_lr: float = 0.01
     """dual learning rate for MUON"""
     muon_dual_steps: int = 5
@@ -136,9 +174,87 @@ class Args:
     debug_repr: bool = False
     """Toggle debug logging for encoder representations"""
 
+    # Checkpoint saving
+    save_checkpoint: bool = False
+    """If true, save model params to disk at end of training"""
+    checkpoint_dir: str = "checkpoints"
+    """Directory for saved checkpoints"""
+
+    # Online linear probe
+    probe_interval: int = 0
+    """Run linear probe every N global steps (0 disables). E.g. 100000."""
+    probe_n_eval_steps: int = 400
+    """Number of random-action rollout steps for probe data collection."""
+    probe_output_dir: str = "probe_results"
+    """Directory for probe plots (subdirectory per probe call is created)."""
+    probe_save_plots: bool = False
+    """If true, generate probe/additive plots to disk and log them to wandb when tracking."""
+
     # Encoder architecture
+    encoder_type: str = "cnn"
+    """encoder architecture to use: 'cnn', 'mlp', 'vit', 'hybrid_vit', or 'drq_vit'"""
     encoder_tanh_scale: float = 0.5
     """Multiplier for encoder output before tanh (controls saturation)"""
+    encoder_warmup_updates: int = 0
+    """Warmup updates for encoder LR when annealing is enabled (0 disables warmup)."""
+    vit_patch_size: int = 14
+    """ViT patch size (pixels) for both height and width."""
+    vit_hidden_size: int = 192
+    """ViT token/embedding hidden dimension."""
+    vit_proj_dim: int = 512
+    """RL projection head output dimension for ViT/HybridViT encoders."""
+    vit_mlp_dim: int = 768
+    """ViT MLP expansion dimension in transformer blocks."""
+    vit_num_heads: int = 3
+    """ViT number of self-attention heads."""
+    vit_num_layers: int = 4
+    """ViT number of transformer encoder blocks."""
+    vit_dropout_rate: float = 0.0
+    """ViT dropout rate (kept deterministic unless encoder path is extended)."""
+    vit_attention_dropout_rate: float = 0.0
+    """ViT attention dropout rate (kept deterministic unless encoder path is extended)."""
+    vit_use_cls_token: bool = False
+    """If true, use CLS-token readout; otherwise mean-pool patch tokens."""
+    vit_use_conv_stem: bool = True
+    """If true, apply a lightweight CNN stem before ViT patch embedding."""
+    vit_conv_stem_channels: int = 64
+    """Channel width for the optional ViT CNN stem."""
+    vit_conv_stem_kernel: int = 3
+    """Kernel size for the optional ViT CNN stem convolutions."""
+    vit_apply_output_tanh: bool = False
+    """If true, apply tanh bottleneck on ViT encoder output projection."""
+    vit_qk_stiefel: bool = False
+    """If true, apply Stiefel-constrained updates to ViT attention Q/K kernels."""
+    vit_qk_stiefel_lr: float = 1e-4
+    """Learning rate for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_dual_lr: float = 0.01
+    """Dual-variable learning rate for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_dual_steps: int = 5
+    """Number of dual optimization steps for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_msign_steps: int = 5
+    """Number of matrix-sign iterations for ViT Q/K Stiefel updates."""
+    vit_qk_stiefel_max_grad_norm: float = 0.5
+    """Max grad norm clip for ViT Q/K Stiefel parameter group."""
+    hybrid_vit_stem_c1: int = 24
+    """HybridViT conv stem stage-1 output channels."""
+    hybrid_vit_stem_c2: int = 48
+    """HybridViT conv stem stage-2 output channels."""
+    hybrid_vit_stem_c3: int = 96
+    """HybridViT conv stem stage-3 output channels."""
+    hybrid_vit_stem_c4: int = 192
+    """HybridViT conv stem stage-4 output channels."""
+    drq_vit_stem_channels: int = 32
+    """DrQViT conv stem channel width (all 4 stem layers use this)."""
+    drq_vit_token_downsample: int = 1
+    """Optional patch-like downsample factor after DrQ bridge conv (1 disables)."""
+    drq_vit_apply_output_tanh: bool = False
+    """If true, apply tanh to DrQViT encoder output projection."""
+
+    # CRATE head architecture
+    use_crate_head: bool = False
+    """If true, use CRATE-style FeedForward as final hidden layer in actor/critic."""
+    crate_step_size: float = 0.1
+    """Step size for CRATE FeedForward ISTA update."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -147,56 +263,6 @@ class Args:
     """the mini-batch size (computed in runtime)"""
     num_updates: int = 0
     """the number of updates (computed in runtime)"""
-
-
-class Network(nn.Module):
-    """CNN encoder for pixel observations with LayerNorm for stability."""
-    tanh_scale: float = 0.5
-
-    @nn.compact
-    def __call__(self, x):
-        # x: (B, H, W, C) - already in NHWC format from PixelBrax
-        x = x.astype(jnp.float32) / 255.0
-
-        # Conv layers with LayerNorm for stable training
-        x = nn.Conv(
-            32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(
-            64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(
-            64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.LayerNorm()(x)
-        x = nn.tanh(self.tanh_scale * x)  # tanh for bounded features, helps with stability
-        return x
 
 
 class Critic(nn.Module):
@@ -220,6 +286,41 @@ class Actor(nn.Module):
         x = nn.swish(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
+        actor_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0)
+        )(x)
+        actor_logstd = self.param(
+            "log_std",
+            nn.initializers.zeros,
+            (self.action_dim,)
+        )
+        return actor_mean, actor_logstd
+
+
+class CRATECritic(nn.Module):
+    """Value network with CRATE FeedForward as final hidden layer."""
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.swish(x)
+        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
+        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+
+
+class CRATEActor(nn.Module):
+    """Continuous action actor with CRATE FeedForward as final hidden layer."""
+    action_dim: int
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.swish(x)
+        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
@@ -422,7 +523,7 @@ def encoder_repr_metrics(hidden: jnp.ndarray) -> dict:
 
 
 def compute_grad_norms(grads: dict) -> dict:
-    """Compute gradient norms for encoder, actor, and critic."""
+    """Compute gradient norms for key model components."""
     def tree_norm(tree):
         leaves = jax.tree_util.tree_leaves(tree)
         return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves))
@@ -438,27 +539,11 @@ def compute_grad_norms(grads: dict) -> dict:
     return metrics
 
 
-def swish_activation_metrics(hidden: jnp.ndarray, name: str) -> dict:
-    """
-    Compute activation metrics for Swish layers in actor/critic.
-    """
-    metrics = {}
-    norms = jnp.linalg.norm(hidden, axis=-1)
-
-    metrics[f"{name}/mean"] = jnp.mean(hidden)
-    metrics[f"{name}/std"] = jnp.std(hidden)
-    metrics[f"{name}/norm_mean"] = jnp.mean(norms)
-    metrics[f"{name}/dead_frac"] = jnp.mean(jnp.abs(hidden) < 0.01)
-    metrics[f"{name}/negative_frac"] = jnp.mean(hidden < 0)
-
-    return metrics
-
-
 # --------------------------------------------------------
 #  Optimizer: Adam for encoder, MUON for head matrices, Adam for head vectors
 # --------------------------------------------------------
 
-def create_encoder_adam_heads_muon_optimizer(
+def create_optimizer(
     encoder_lr,  # Can be float or schedule
     heads_muon_lr: float,
     heads_adam_lr,  # Can be float or schedule
@@ -470,10 +555,18 @@ def create_encoder_adam_heads_muon_optimizer(
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
+    vit_qk_stiefel: bool = False,
+    vit_qk_stiefel_lr: float = 1e-4,
+    vit_qk_stiefel_dual_lr: float = 0.01,
+    vit_qk_stiefel_dual_steps: int = 5,
+    vit_qk_stiefel_msign_steps: int = 5,
+    vit_qk_stiefel_max_grad_norm: float = 0.5,
+    use_heads_muon: bool = True,
 ):
     """
     Create optimizer that uses:
     - Adam/AdamW for encoder (all params) - supports lr schedule, with grad clipping
+    - Optional per-head manifold MUON for ViT encoder attention Q/K kernels
     - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
     - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
@@ -495,6 +588,18 @@ def create_encoder_adam_heads_muon_optimizer(
     encoder_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
         adam_opt(encoder_lr),
+    )
+
+    # Optional Stiefel-constrained updates for ViT Q/K kernels (per-head)
+    encoder_qk_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(vit_qk_stiefel_max_grad_norm),
+        manifold_muon_per_head(
+            learning_rate=vit_qk_stiefel_lr,
+            dual_lr=vit_qk_stiefel_dual_lr,
+            dual_steps=vit_qk_stiefel_dual_steps,
+            msign_steps=vit_qk_stiefel_msign_steps,
+            min_ndim=2,
+        ),
     )
 
     # Adam/AdamW for head vectors/scalars (with schedule support and grad clipping)
@@ -527,9 +632,11 @@ def create_encoder_adam_heads_muon_optimizer(
         ),
     )
 
-    # 4 transforms: encoder, actor_muon (matrices), critic_muon (matrices), heads_adam (vectors/scalars)
+    # 5 transforms: encoder, encoder_qk_stiefel, actor_muon (matrices),
+    # critic_muon (matrices), heads_adam (actor/critic vectors/scalars)
     transforms = {
         'encoder': encoder_tx,
+        'encoder_qk_stiefel': encoder_qk_stiefel_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
@@ -538,16 +645,28 @@ def create_encoder_adam_heads_muon_optimizer(
     # Label function
     def label_fn(params):
         def _label(path, param):
-            # path[0] is 'network', 'actor', or 'critic'
+            # path[0] is a top-level module key in params
             if path[0] == 'network':
+                is_vit_qk_kernel = (
+                    len(path) >= 7
+                    and path[1] == 'params'
+                    and 'Transformer' in path
+                    and 'SelfAttention_0' in path
+                    and path[-1] == 'kernel'
+                    and path[-2] in ('query', 'key')
+                )
+                if vit_qk_stiefel and is_vit_qk_kernel:
+                    return 'encoder_qk_stiefel'
                 return 'encoder'
-            else:
-                # For actor/critic heads, check if matrix or vector/scalar
-                is_matrix = param.ndim >= 2 and min(param.shape) > 1
-                if is_matrix:
-                    return 'actor_muon' if path[0] == 'actor' else 'critic_muon'
-                else:
-                    return 'heads_adam'
+            # For actor/critic heads, check if matrix or vector/scalar
+            is_matrix = param.ndim >= 2 and min(param.shape) > 1
+            if path[0] == 'actor':
+                return 'actor_muon' if (is_matrix and use_heads_muon) else 'heads_adam'
+            if path[0] == 'critic':
+                return 'critic_muon' if (is_matrix and use_heads_muon) else 'heads_adam'
+
+            # Fallback for any extra top-level params.
+            return 'heads_adam'
 
         flat = flax.traverse_util.flatten_dict(params)
         labeled = {k: _label(k, v) for k, v in flat.items()}
@@ -599,6 +718,7 @@ def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.n
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
@@ -623,7 +743,7 @@ if __name__ == "__main__":
 
     # Environment setup
     print("=" * 60)
-    print("PPO with Manifold MUON for Actor/Critic Heads")
+    print("PPO with Manifold MUON")
     print("=" * 60)
     print(f"JAX devices: {jax.devices()}")
     print(f"env name: {args.env_name}")
@@ -637,14 +757,56 @@ if __name__ == "__main__":
     adam_type = "AdamW" if args.weight_decay > 0 else "Adam"
     print(f"\nOptimizer config:")
     print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
-    print(f"  heads_muon_lr (MUON for matrices): {args.heads_muon_lr}")
-    print(f"  heads_adam_lr ({adam_type} for vectors): {args.heads_adam_lr}")
+    print(f"  heads_muon_lr (MUON for actor/critic matrices): {args.heads_muon_lr}")
+    print(f"  heads_adam_lr ({adam_type} for actor/critic vectors): {args.heads_adam_lr}")
     print(f"  weight_decay: {args.weight_decay}")
     print(f"  muon_dual_lr: {args.muon_dual_lr}")
     print(f"  muon_dual_steps: {args.muon_dual_steps}")
     print(f"  max_grad_norm ({adam_type}): {args.max_grad_norm}")
     print(f"  actor_muon_max_grad_norm: {args.actor_muon_max_grad_norm}")
     print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
+    print(f"  encoder_type: {args.encoder_type}")
+    print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
+    print(f"  encoder_warmup_updates: {args.encoder_warmup_updates}")
+    if args.encoder_type.lower() == "vit":
+        print(f"  vit_patch_size: {args.vit_patch_size}")
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  vit_dropout_rate: {args.vit_dropout_rate}")
+        print(f"  vit_attention_dropout_rate: {args.vit_attention_dropout_rate}")
+        print(f"  vit_use_cls_token: {args.vit_use_cls_token}")
+        print(f"  vit_use_conv_stem: {args.vit_use_conv_stem}")
+        print(f"  vit_conv_stem_channels: {args.vit_conv_stem_channels}")
+        print(f"  vit_conv_stem_kernel: {args.vit_conv_stem_kernel}")
+        print(f"  vit_apply_output_tanh: {args.vit_apply_output_tanh}")
+        print(f"  vit_qk_stiefel: {args.vit_qk_stiefel}")
+        print(f"  vit_qk_stiefel_lr: {args.vit_qk_stiefel_lr}")
+        print(f"  vit_qk_stiefel_dual_lr: {args.vit_qk_stiefel_dual_lr}")
+        print(f"  vit_qk_stiefel_dual_steps: {args.vit_qk_stiefel_dual_steps}")
+        print(f"  vit_qk_stiefel_msign_steps: {args.vit_qk_stiefel_msign_steps}")
+        print(f"  vit_qk_stiefel_max_grad_norm: {args.vit_qk_stiefel_max_grad_norm}")
+    if args.encoder_type.lower() == "hybrid_vit":
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  hybrid_vit_stem_c1: {args.hybrid_vit_stem_c1}")
+        print(f"  hybrid_vit_stem_c2: {args.hybrid_vit_stem_c2}")
+        print(f"  hybrid_vit_stem_c3: {args.hybrid_vit_stem_c3}")
+        print(f"  hybrid_vit_stem_c4: {args.hybrid_vit_stem_c4}")
+    if args.encoder_type.lower() == "drq_vit":
+        print(f"  vit_hidden_size: {args.vit_hidden_size}")
+        print(f"  vit_proj_dim: {args.vit_proj_dim}")
+        print(f"  vit_mlp_dim: {args.vit_mlp_dim}")
+        print(f"  vit_num_heads: {args.vit_num_heads}")
+        print(f"  vit_num_layers: {args.vit_num_layers}")
+        print(f"  drq_vit_stem_channels: {args.drq_vit_stem_channels}")
+        print(f"  drq_vit_token_downsample: {args.drq_vit_token_downsample}")
+        print(f"  drq_vit_apply_output_tanh: {args.drq_vit_apply_output_tanh}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
@@ -669,19 +831,52 @@ if __name__ == "__main__":
     )
 
     # Initialize networks
-    network = Network(tanh_scale=args.encoder_tanh_scale)
-    actor = Actor(action_dim=action_dim)
-    critic = Critic()
+    vit_config = ViTConfig(
+        patch_size=args.vit_patch_size,
+        hidden_size=args.vit_hidden_size,
+        mlp_dim=args.vit_mlp_dim,
+        num_heads=args.vit_num_heads,
+        num_layers=args.vit_num_layers,
+        dropout_rate=args.vit_dropout_rate,
+        attention_dropout_rate=args.vit_attention_dropout_rate,
+        use_cls_token=args.vit_use_cls_token,
+        use_conv_stem=args.vit_use_conv_stem,
+        conv_stem_channels=args.vit_conv_stem_channels,
+        conv_stem_kernel=args.vit_conv_stem_kernel,
+        apply_output_tanh=args.vit_apply_output_tanh,
+        stem_c1=args.hybrid_vit_stem_c1,
+        stem_c2=args.hybrid_vit_stem_c2,
+        stem_c3=args.hybrid_vit_stem_c3,
+        stem_c4=args.hybrid_vit_stem_c4,
+        drq_stem_channels=args.drq_vit_stem_channels,
+        drq_token_downsample=args.drq_vit_token_downsample,
+        drq_apply_output_tanh=args.drq_vit_apply_output_tanh,
+        proj_dim=args.vit_proj_dim,
+    )
+    network = build_encoder(
+        args.encoder_type,
+        args.encoder_tanh_scale,
+        vit_config=vit_config,
+    )
+    if args.use_crate_head:
+        actor = CRATEActor(action_dim=action_dim, crate_step_size=args.crate_step_size)
+        critic = CRATECritic(crate_step_size=args.crate_step_size)
+        print(f"Using CRATE heads with step_size={args.crate_step_size}")
+    else:
+        actor = Actor(action_dim=action_dim)
+        critic = Critic()
 
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
     dummy_hidden = network.apply(network_params, dummy_obs)
 
-    all_params = flax.core.freeze({
-        'network': network_params,
-        'actor': actor.init(actor_key, dummy_hidden),
-        'critic': critic.init(critic_key, dummy_hidden),
-    })
+    params_dict = {
+        "network": network_params,
+        "actor": actor.init(actor_key, dummy_hidden),
+        "critic": critic.init(critic_key, dummy_hidden),
+    }
+
+    all_params = flax.core.freeze(params_dict)
 
     # Count params by component and type
     def count_params(params, key):
@@ -697,13 +892,13 @@ if __name__ == "__main__":
         adam_count = sum(p.size for p in flat.values() if p.ndim < 2 or min(p.shape) <= 1)
         return muon_count, adam_count
 
-    encoder_params = count_params(all_params, 'network')
-    actor_params = count_params(all_params, 'actor')
-    critic_params = count_params(all_params, 'critic')
+    encoder_params = count_params(all_params, "network")
+    actor_params = count_params(all_params, "actor")
+    critic_params = count_params(all_params, "critic")
     total_params = encoder_params + actor_params + critic_params
 
-    actor_muon, actor_adam = count_by_type(all_params, 'actor')
-    critic_muon, critic_adam = count_by_type(all_params, 'critic')
+    actor_muon, actor_adam = count_by_type(all_params, "actor")
+    critic_muon, critic_adam = count_by_type(all_params, "critic")
 
     print(f"\nParameter breakdown:")
     print(f"  Encoder (Adam): {encoder_params:,}")
@@ -712,24 +907,48 @@ if __name__ == "__main__":
     print(f"  Total: {total_params:,}")
 
     # Create learning rate schedules for Adam optimizers
-    def make_linear_schedule(base_lr):
-        """Linear annealing schedule for Adam optimizers."""
+    steps_per_update = args.num_minibatches * args.update_epochs
+
+    def lr_from_update(base_lr: float, update_idx: int, warmup_updates: int = 0):
+        """Warmup + linear decay learning-rate helper."""
+        update_idx = jnp.asarray(update_idx, dtype=jnp.float32)
+        warmup = float(max(0, warmup_updates))
+        decay_updates = float(max(1, args.num_updates - warmup_updates))
+
+        warm_lr = base_lr * ((update_idx + 1.0) / jnp.maximum(1.0, warmup))
+        decay_idx = jnp.maximum(0.0, update_idx - warmup)
+        frac = 1.0 - jnp.minimum(1.0, decay_idx / decay_updates)
+        decay_lr = base_lr * frac
+
+        if warmup_updates <= 0:
+            return decay_lr
+        return jnp.where(update_idx < warmup, warm_lr, decay_lr)
+
+    def make_linear_schedule(base_lr, warmup_updates: int = 0):
+        """Schedule for Adam optimizers; optional warmup before linear decay."""
         def schedule(count):
-            frac = 1.0 - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
-            return base_lr * frac
+            update_idx = count // steps_per_update
+            return lr_from_update(base_lr, update_idx, warmup_updates)
+
         return schedule
 
     if args.anneal_lr:
-        encoder_lr = make_linear_schedule(args.encoder_lr)
-        heads_adam_lr = make_linear_schedule(args.heads_adam_lr)
-        print(f"\nLearning rate annealing: ENABLED (linear decay for Adam)")
+        encoder_lr = make_linear_schedule(args.encoder_lr, args.encoder_warmup_updates)
+        heads_adam_lr = make_linear_schedule(args.heads_adam_lr, warmup_updates=0)
+        if args.encoder_warmup_updates > 0:
+            print(
+                f"\nLearning rate annealing: ENABLED "
+                f"(encoder warmup={args.encoder_warmup_updates} updates + linear decay)"
+            )
+        else:
+            print("\nLearning rate annealing: ENABLED (linear decay for Adam)")
     else:
         encoder_lr = args.encoder_lr
         heads_adam_lr = args.heads_adam_lr
-        print(f"\nLearning rate annealing: DISABLED")
+        print("\nLearning rate annealing: DISABLED")
 
     # Create optimizer
-    tx = create_encoder_adam_heads_muon_optimizer(
+    tx = create_optimizer(
         encoder_lr=encoder_lr,
         heads_muon_lr=args.heads_muon_lr,
         heads_adam_lr=heads_adam_lr,
@@ -741,6 +960,13 @@ if __name__ == "__main__":
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
         weight_decay=args.weight_decay,
+        vit_qk_stiefel=args.vit_qk_stiefel,
+        vit_qk_stiefel_lr=args.vit_qk_stiefel_lr,
+        vit_qk_stiefel_dual_lr=args.vit_qk_stiefel_dual_lr,
+        vit_qk_stiefel_dual_steps=args.vit_qk_stiefel_dual_steps,
+        vit_qk_stiefel_msign_steps=args.vit_qk_stiefel_msign_steps,
+        vit_qk_stiefel_max_grad_norm=args.vit_qk_stiefel_max_grad_norm,
+        use_heads_muon=args.use_heads_muon,
     )
 
     agent_state = TrainState.create(
@@ -760,15 +986,15 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """Sample action, calculate value, logprob, and return updated key."""
-        hidden = network.apply(agent_state.params['network'], next_obs)
-        actor_mean, actor_logstd = actor.apply(agent_state.params['actor'], hidden)
+        hidden = network.apply(agent_state.params["network"], next_obs)
+        actor_mean, actor_logstd = actor.apply(agent_state.params["actor"], hidden)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         key, subkey = jax.random.split(key)
         action = pi.sample(seed=subkey)
         logprob = pi.log_prob(action)
-        value = critic.apply(agent_state.params['critic'], hidden)
+        value = critic.apply(agent_state.params["critic"], hidden)
 
         action = jnp.clip(action, -args.max_action, args.max_action)
 
@@ -781,14 +1007,14 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """Calculate value, logprob of supplied action, and entropy."""
-        hidden = network.apply(params['network'], x)
-        actor_mean, actor_logstd = actor.apply(params['actor'], hidden)
+        hidden = network.apply(params["network"], x)
+        actor_mean, actor_logstd = actor.apply(params["actor"], hidden)
 
         pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logstd))
 
         logprob = pi.log_prob(action)
         entropy = pi.entropy()
-        value = critic.apply(params['critic'], hidden).squeeze(-1)
+        value = critic.apply(params["critic"], hidden).squeeze(-1)
 
         return logprob, entropy, value
 
@@ -811,15 +1037,18 @@ if __name__ == "__main__":
         storage: Storage,
     ):
         next_value = critic.apply(
-            agent_state.params['critic'],
-            network.apply(agent_state.params['network'], next_obs)
+            agent_state.params["critic"],
+            network.apply(agent_state.params["network"], next_obs),
         ).squeeze(-1)
 
         advantages = jnp.zeros((args.n_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
         _, advantages = jax.lax.scan(
-            compute_gae_once, advantages, (dones[1:], values[1:], values[:-1], storage.rewards), reverse=True
+            compute_gae_once,
+            advantages,
+            (dones[1:], values[1:], values[:-1], storage.rewards),
+            reverse=True,
         )
         storage = storage.replace(
             advantages=advantages,
@@ -827,8 +1056,17 @@ if __name__ == "__main__":
         )
         return storage
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, mb_values, aug_key):
-        # Apply random shift augmentation if enabled
+    def ppo_loss(
+        params,
+        x,
+        a,
+        logp,
+        mb_advantages,
+        mb_returns,
+        mb_values,
+        aug_key,
+    ):
+        """PPO loss function."""
         if args.use_augmentation:
             x = random_shift(aug_key, x, pad=args.augment_pad)
 
@@ -840,25 +1078,27 @@ if __name__ == "__main__":
         if args.norm_adv:
             mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-        # Policy loss
         pg_loss1 = -mb_advantages * ratio
         pg_loss2 = -mb_advantages * jnp.clip(ratio, 1 - args.clip_eps, 1 + args.clip_eps)
         pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
 
-        # Value loss with clipping
         if args.clip_vloss:
             v_loss_unclipped = (newvalue - mb_returns) ** 2
-            v_clipped = mb_values + jnp.clip(
-                newvalue - mb_values, -args.clip_eps, args.clip_eps
-            )
+            v_clipped = mb_values + jnp.clip(newvalue - mb_values, -args.clip_eps, args.clip_eps)
             v_loss_clipped = (v_clipped - mb_returns) ** 2
             v_loss = 0.5 * jnp.maximum(v_loss_unclipped, v_loss_clipped).mean()
         else:
             v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
         entropy_loss = entropy.mean()
-        loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-        return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
+        total_loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+        return total_loss, (
+            pg_loss,
+            v_loss,
+            entropy_loss,
+            jax.lax.stop_gradient(approx_kl),
+        )
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
@@ -868,8 +1108,9 @@ if __name__ == "__main__":
         storage: Storage,
         key: jax.random.PRNGKey,
     ):
+        """PPO update."""
         def update_epoch(carry, unused_inp):
-            agent_state, key = carry
+            agent_state, key, last_grads = carry
             key, subkey, aug_key = jax.random.split(key, 3)
 
             def flatten(x):
@@ -886,9 +1127,18 @@ if __name__ == "__main__":
             aug_keys = jax.random.split(aug_key, args.num_minibatches)
 
             def update_minibatch(carry, inputs):
-                agent_state = carry
+                agent_state, _ = carry
                 minibatch, mb_aug_key = inputs
-                (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
+
+                (
+                    loss,
+                    (
+                        pg_loss,
+                        v_loss,
+                        entropy_loss,
+                        approx_kl,
+                    ),
+                ), grads = ppo_loss_grad_fn(
                     agent_state.params,
                     minibatch.obs,
                     minibatch.actions,
@@ -898,20 +1148,71 @@ if __name__ == "__main__":
                     minibatch.values,
                     mb_aug_key,
                 )
+
+                grad_norm = optax.global_norm(grads)
                 agent_state = agent_state.apply_gradients(grads=grads)
-                return agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
 
-            agent_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-                update_minibatch, agent_state, (shuffled_storage, aug_keys)
+                return (agent_state, grads), (
+                    loss,
+                    pg_loss,
+                    v_loss,
+                    entropy_loss,
+                    approx_kl,
+                    grad_norm,
+                )
+
+            (
+                (agent_state, last_grads),
+                (
+                    loss,
+                    pg_loss,
+                    v_loss,
+                    entropy_loss,
+                    approx_kl,
+                    grad_norm,
+                ),
+            ) = jax.lax.scan(
+                update_minibatch,
+                (agent_state, last_grads),
+                (shuffled_storage, aug_keys),
             )
-            return (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads)
+            return (agent_state, key, last_grads), (
+                loss,
+                pg_loss,
+                v_loss,
+                entropy_loss,
+                approx_kl,
+                grad_norm,
+            )
 
-        (agent_state, key), (loss, pg_loss, v_loss, entropy_loss, approx_kl, grads) = jax.lax.scan(
-            update_epoch, (agent_state, key), (), length=args.update_epochs
+        init_grads = jax.tree_util.tree_map(jnp.zeros_like, agent_state.params)
+        (
+            (agent_state, key, final_grads),
+            (
+                loss,
+                pg_loss,
+                v_loss,
+                entropy_loss,
+                approx_kl,
+                grad_norm,
+            ),
+        ) = jax.lax.scan(
+            update_epoch,
+            (agent_state, key, init_grads),
+            (),
+            length=args.update_epochs,
         )
-        # Get final gradients from last minibatch of last epoch
-        final_grads = jax.tree_util.tree_map(lambda x: x[-1, -1], grads)
-        return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key
+        return (
+            agent_state,
+            loss,
+            pg_loss,
+            v_loss,
+            entropy_loss,
+            approx_kl,
+            grad_norm,
+            final_grads,
+            key,
+        )
 
     # Start the game
     global_step = 0
@@ -938,25 +1239,29 @@ if __name__ == "__main__":
         env_state = envs.step(env_state, action)
         raw_obs = env_state.pixels
         raw_reward = env_state.reward
-        next_done = env_state.done.astype(jnp.bool_)
+        next_done_local = env_state.done.astype(jnp.bool_)
 
         fs = fs.push(raw_obs)
-        fs = fs.reset(raw_obs, next_done)
-        next_obs = fs.get_stacked()
+        fs = fs.reset(raw_obs, next_done_local)
+        next_obs_local = fs.get_stacked()
 
-        reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
+        reward_norm = reward_norm.update(raw_reward, next_done_local.astype(jnp.float32))
         reward = reward_norm.normalize(raw_reward)
 
         new_episode_return = episode_stats.episode_returns + raw_reward
         new_episode_length = episode_stats.episode_lengths + 1
         episode_stats = episode_stats.replace(
-            episode_returns=jnp.where(next_done, 0.0, new_episode_return),
-            episode_lengths=jnp.where(next_done, 0, new_episode_length).astype(jnp.int32),
+            episode_returns=jnp.where(next_done_local, 0.0, new_episode_return),
+            episode_lengths=jnp.where(next_done_local, 0, new_episode_length).astype(jnp.int32),
             returned_episode_returns=jnp.where(
-                next_done, new_episode_return, episode_stats.returned_episode_returns
+                next_done_local,
+                new_episode_return,
+                episode_stats.returned_episode_returns,
             ),
             returned_episode_lengths=jnp.where(
-                next_done, new_episode_length, episode_stats.returned_episode_lengths
+                next_done_local,
+                new_episode_length,
+                episode_stats.returned_episode_lengths,
             ).astype(jnp.int32),
         )
 
@@ -970,11 +1275,31 @@ if __name__ == "__main__":
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
-        return (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage
+        return (
+            agent_state,
+            episode_stats,
+            reward_norm,
+            fs,
+            env_state,
+            next_obs_local,
+            next_done_local,
+            key,
+        ), storage
 
     def rollout(agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
-        (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), storage = jax.lax.scan(
-            step_once, (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key), jnp.arange(max_steps)
+        (
+            agent_state,
+            episode_stats,
+            reward_norm,
+            fs,
+            env_state,
+            next_obs,
+            next_done,
+            key,
+        ), storage = jax.lax.scan(
+            step_once,
+            (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key),
+            jnp.arange(max_steps),
         )
         return agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, storage, key
 
@@ -983,18 +1308,143 @@ if __name__ == "__main__":
 
     print("\nStarting training...")
     cumulative_episodic_return = 0.0
+
+    def collect_probe_plot_images(output_dir: str) -> dict:
+        """Load probe plot PNGs as wandb.Image for logging, if tracking is enabled."""
+        if not args.track or not args.probe_save_plots or output_dir is None:
+            return {}
+
+        plot_files = {
+            "probe/plots/r2_vs_k": f"{args.env_name}_r2_vs_k.png",
+            "probe/plots/scree": f"{args.env_name}_scree.png",
+            "probe/plots/corr_heatmap": f"{args.env_name}_corr_heatmap.png",
+            "additive/plots/parity": f"{args.env_name}_additive_parity.png",
+            "additive/plots/cosine_gram": f"{args.env_name}_cosine_gram.png",
+            "additive/plots/raw_gram": f"{args.env_name}_raw_gram.png",
+            "additive/plots/component_norms": f"{args.env_name}_component_norms.png",
+        }
+
+        image_logs = {}
+        for log_key, file_name in plot_files.items():
+            file_path = os.path.join(output_dir, file_name)
+            if os.path.exists(file_path):
+                image_logs[log_key] = wandb.Image(file_path)
+        return image_logs
+
+    # Track next probe threshold as an absolute step count so LCM cadence issues
+    # don't arise when global_step jumps by (num_steps * n_envs) each iteration.
+    next_probe_step = args.probe_interval if args.probe_interval > 0 else float("inf")
+    # Probe metrics are buffered here and flushed into the main wandb.log call
+    # so we never call wandb.log twice at the same step.
+    pending_probe_metrics: dict = {}
+
+    # Probe at initialisation (step 0) — establishes random-encoder baseline.
+    if args.probe_interval > 0:
+        from linear_probe import run_online_probe
+        import pickle
+        probe_init_output = os.path.join(args.probe_output_dir, "step_0") if args.probe_output_dir else None
+        probe_init_metrics = run_online_probe(
+            network=network,
+            network_params=agent_state.params["network"],
+            envs=envs,
+            args_dict=vars(args),
+            n_eval_envs=args.n_envs,
+            n_eval_steps=args.probe_n_eval_steps,
+            seed=args.seed,
+            output_dir=probe_init_output if args.probe_save_plots else None,
+        )
+        print(f"[probe] step=0 (init) metrics={probe_init_metrics}")
+        if args.save_checkpoint:
+            ckpt_dir = os.path.join(args.checkpoint_dir, run_name)
+            os.makedirs(ckpt_dir, exist_ok=True)
+            params_bytes = flax.serialization.to_bytes(agent_state.params)
+            ckpt_path = os.path.join(ckpt_dir, "params_step0.pkl")
+            with open(ckpt_path, "wb") as f:
+                pickle.dump({"params_bytes": params_bytes, "args": vars(args),
+                             "global_step": 0}, f)
+            print(f"Checkpoint saved to {ckpt_path}")
+        if args.track:
+            probe_init_media = collect_probe_plot_images(probe_init_output)
+            wandb.log({**probe_init_metrics, **probe_init_media}, step=0)
+
     for iteration in range(1, args.num_updates + 1):
         iteration_time_start = time.time()
-        agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, storage, key = rollout(
-            agent_state, episode_stats, reward_normalizer, frame_stack, env_state, next_obs, next_done, key
+        (
+            agent_state,
+            episode_stats,
+            reward_normalizer,
+            frame_stack,
+            env_state,
+            next_obs,
+            next_done,
+            storage,
+            key,
+        ) = rollout(
+            agent_state,
+            episode_stats,
+            reward_normalizer,
+            frame_stack,
+            env_state,
+            next_obs,
+            next_done,
+            key,
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, final_grads, key = update_ppo(
+
+        (
+            agent_state,
+            loss,
+            pg_loss,
+            v_loss,
+            entropy_loss,
+            approx_kl,
+            grad_norm,
+            final_grads,
+            key,
+        ) = update_ppo(
             agent_state,
             storage,
             key,
         )
+
+        # Online linear probe — fire when global_step crosses the next threshold.
+        # Using >= avoids the LCM cadence problem that % would cause when
+        # global_step jumps by (num_steps * n_envs = 1280) each iteration.
+        if global_step >= next_probe_step:
+            from linear_probe import run_online_probe
+            probe_output = os.path.join(args.probe_output_dir, f"step_{global_step}")
+            probe_metrics = run_online_probe(
+                network=network,
+                network_params=agent_state.params["network"],
+                envs=envs,
+                args_dict=vars(args),
+                n_eval_envs=args.n_envs,
+                n_eval_steps=args.probe_n_eval_steps,
+                seed=args.seed + iteration,
+                output_dir=probe_output if args.probe_save_plots else None,
+            )
+            print(f"[probe] step={global_step} metrics={probe_metrics}")
+            # Buffer into pending_probe_metrics; flushed in the main wandb.log
+            # call below so we never call wandb.log twice at the same step.
+            pending_probe_metrics.update(probe_metrics)
+            if args.track:
+                pending_probe_metrics.update(collect_probe_plot_images(probe_output))
+
+            # Save a checkpoint at each probe point so the probe can be re-run
+            # offline on any training snapshot without retraining.
+            if args.save_checkpoint:
+                import pickle
+                ckpt_dir = os.path.join(args.checkpoint_dir, run_name)
+                os.makedirs(ckpt_dir, exist_ok=True)
+                params_bytes = flax.serialization.to_bytes(agent_state.params)
+                ckpt_path = os.path.join(ckpt_dir, f"params_step{global_step}.pkl")
+                with open(ckpt_path, "wb") as f:
+                    pickle.dump({"params_bytes": params_bytes, "args": vars(args),
+                                 "global_step": global_step}, f)
+                print(f"Checkpoint saved to {ckpt_path}")
+
+            next_probe_step += args.probe_interval
 
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
@@ -1003,24 +1453,29 @@ if __name__ == "__main__":
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
 
-            print(
+            base_msg = (
                 f"update={iteration} step={global_step} "
                 f"ep_return={avg_episodic_return:.1f} "
                 f"ep_len={avg_episodic_length * args.action_repeat:.0f} "
                 f"loss={loss[-1, -1].item():.4f} "
                 f"SPS={sps}"
             )
+            print(base_msg)
 
             if args.track:
-                # Get actual learning rates from optimizer state
-                # opt_state structure: (clip_state, multi_transform_state)
-                # multi_transform_state has inner states for each transform
                 opt_step = iteration * args.update_epochs * args.num_minibatches
                 if args.anneal_lr:
-                    # Calculate scheduled LR
-                    frac = 1.0 - (opt_step // (args.num_minibatches * args.update_epochs)) / args.num_updates
-                    encoder_lr_current = args.encoder_lr * frac
-                    heads_adam_lr_current = args.heads_adam_lr * frac
+                    update_idx = opt_step // steps_per_update
+                    encoder_lr_current = lr_from_update(
+                        args.encoder_lr,
+                        update_idx,
+                        args.encoder_warmup_updates,
+                    )
+                    heads_adam_lr_current = lr_from_update(
+                        args.heads_adam_lr,
+                        update_idx,
+                        warmup_updates=0,
+                    )
                 else:
                     encoder_lr_current = args.encoder_lr
                     heads_adam_lr_current = args.heads_adam_lr
@@ -1030,39 +1485,55 @@ if __name__ == "__main__":
                     "charts/avg_episodic_return": avg_episodic_return,
                     "charts/cumulative_episodic_return": cumulative_episodic_return,
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
-                    "charts/encoder_lr": encoder_lr_current,
-                    "charts/heads_adam_lr": heads_adam_lr_current,
-                    "charts/heads_muon_lr": args.heads_muon_lr,  # Fixed
+                    "charts/encoder_lr": float(encoder_lr_current),
+                    "charts/heads_adam_lr": float(heads_adam_lr_current),
+                    "charts/heads_muon_lr": args.heads_muon_lr,
+                    "charts/vit_qk_stiefel_lr": (
+                        args.vit_qk_stiefel_lr if args.vit_qk_stiefel else 0.0
+                    ),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),
                     "losses/policy_loss": pg_loss[-1, -1].item(),
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
+                    "losses/grad_norm": grad_norm[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
                 }
 
                 # Debug metrics for encoder representations
                 if args.debug_repr:
-                    # Compute encoder output for a sample of observations
-                    sample_obs = storage.obs[0, :256]  # First step, up to 256 envs
-                    hidden = network.apply(agent_state.params['network'], sample_obs)
+                    sample_obs = storage.obs[0, :256]
+                    hidden = network.apply(agent_state.params["network"], sample_obs)
 
-                    # Encoder representation metrics
                     repr_metrics = encoder_repr_metrics(hidden)
                     for k, v in repr_metrics.items():
                         log_dict[k] = float(v)
 
-                    # Gradient norms
                     grad_metrics = compute_grad_norms(final_grads)
                     for k, v in grad_metrics.items():
                         log_dict[k] = float(v)
+
+                # Flush any buffered probe metrics into the same wandb step.
+                if pending_probe_metrics:
+                    log_dict.update(pending_probe_metrics)
+                    pending_probe_metrics = {}
 
                 wandb.log(log_dict, step=global_step)
 
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed:.1f}s")
     print(f"Average SPS: {args.total_timesteps / elapsed:.0f}")
+
+    if args.save_checkpoint:
+        import pickle
+        ckpt_dir = os.path.join(args.checkpoint_dir, run_name)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        params_bytes = flax.serialization.to_bytes(agent_state.params)
+        ckpt_path = os.path.join(ckpt_dir, "params.pkl")
+        with open(ckpt_path, "wb") as f:
+            pickle.dump({"params_bytes": params_bytes, "args": vars(args)}, f)
+        print(f"Checkpoint saved to {ckpt_path}")
 
     if args.track:
         wandb.finish()

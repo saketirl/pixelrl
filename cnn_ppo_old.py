@@ -69,11 +69,13 @@ class Args:
 
     # Learning rates
     encoder_lr: float = 3e-4
-    """learning rate for encoder (Adam)"""
+    """learning rate for encoder (Adam/AdamW)"""
     heads_muon_lr: float = 0.02
     """learning rate for actor/critic head matrices (MUON)"""
     heads_adam_lr: float = 3e-4
-    """learning rate for actor/critic head vectors/scalars (Adam)"""
+    """learning rate for actor/critic head vectors/scalars (Adam/AdamW)"""
+    weight_decay: float = 0.0
+    """weight decay for AdamW (0.0 uses Adam instead)"""
 
     num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
@@ -98,7 +100,11 @@ class Args:
     vf_coef: float = 0.5
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
+    """the maximum norm for gradient clipping (Adam)"""
+    actor_muon_max_grad_norm: float = 1.0
+    """the maximum norm for gradient clipping (actor MUON)"""
+    critic_muon_max_grad_norm: float = 1.0
+    """the maximum norm for gradient clipping (critic MUON)"""
     max_action: float = 1.0
     """maximum action value for clipping"""
     log_interval: int = 10
@@ -130,6 +136,10 @@ class Args:
     debug_repr: bool = False
     """Toggle debug logging for encoder representations"""
 
+    # Encoder architecture
+    encoder_tanh_scale: float = 0.5
+    """Multiplier for encoder output before tanh (controls saturation)"""
+
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -141,6 +151,7 @@ class Args:
 
 class Network(nn.Module):
     """CNN encoder for pixel observations with LayerNorm for stability."""
+    tanh_scale: float = 0.5
 
     @nn.compact
     def __call__(self, x):
@@ -184,7 +195,7 @@ class Network(nn.Module):
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.LayerNorm()(x)
-        x = nn.tanh(x)  # tanh for bounded features, helps with stability
+        x = nn.tanh(self.tanh_scale * x)  # tanh for bounded features, helps with stability
         return x
 
 
@@ -456,42 +467,71 @@ def create_encoder_adam_heads_muon_optimizer(
     muon_msign_steps: int = 5,
     adam_eps: float = 1e-5,
     max_grad_norm: float = 0.5,
+    actor_muon_max_grad_norm: float = 1.0,
+    critic_muon_max_grad_norm: float = 1.0,
+    weight_decay: float = 0.0,
 ):
     """
     Create optimizer that uses:
-    - Adam for encoder (all params) - supports lr schedule, with grad clipping
-    - Manifold MUON for actor/critic head matrices (2D+ with min dim > 1) - NO grad clipping
-    - Adam for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
+    - Adam/AdamW for encoder (all params) - supports lr schedule, with grad clipping
+    - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
+    - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
+    - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
 
-    Gradient clipping is applied only to Adam optimizers, not MUON.
-    MUON's manifold projection naturally bounds updates.
+    Uses AdamW when weight_decay > 0, otherwise uses Adam.
     """
 
-    # Adam for encoder (with schedule support and grad clipping)
+    # Choose Adam or AdamW based on weight_decay
+    if weight_decay > 0:
+        adam_opt = lambda lr: optax.inject_hyperparams(optax.adamw)(
+            learning_rate=lr, eps=adam_eps, weight_decay=weight_decay
+        )
+    else:
+        adam_opt = lambda lr: optax.inject_hyperparams(optax.adam)(
+            learning_rate=lr, eps=adam_eps
+        )
+
+    # Adam/AdamW for encoder (with schedule support and grad clipping)
     encoder_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
-        optax.inject_hyperparams(optax.adam)(learning_rate=encoder_lr, eps=adam_eps),
+        adam_opt(encoder_lr),
     )
 
-    # Adam for head vectors/scalars (with schedule support and grad clipping)
+    # Adam/AdamW for head vectors/scalars (with schedule support and grad clipping)
     heads_adam_tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
-        optax.inject_hyperparams(optax.adam)(learning_rate=heads_adam_lr, eps=adam_eps),
+        adam_opt(heads_adam_lr),
     )
 
-    # MUON for head matrices (NO grad clipping - manifold projection bounds updates)
-    heads_muon_tx = manifold_muon(
-        learning_rate=heads_muon_lr,
-        dual_lr=muon_dual_lr,
-        dual_steps=muon_dual_steps,
-        msign_steps=muon_msign_steps,
-        min_ndim=2,
+    # MUON for actor head matrices (with separate grad clipping)
+    actor_muon_tx = optax.chain(
+        optax.clip_by_global_norm(actor_muon_max_grad_norm),
+        manifold_muon(
+            learning_rate=heads_muon_lr,
+            dual_lr=muon_dual_lr,
+            dual_steps=muon_dual_steps,
+            msign_steps=muon_msign_steps,
+            min_ndim=2,
+        ),
     )
 
-    # 3 transforms: encoder, heads_muon (matrices), heads_adam (vectors/scalars)
+    # MUON for critic head matrices (with separate grad clipping)
+    critic_muon_tx = optax.chain(
+        optax.clip_by_global_norm(critic_muon_max_grad_norm),
+        manifold_muon(
+            learning_rate=heads_muon_lr,
+            dual_lr=muon_dual_lr,
+            dual_steps=muon_dual_steps,
+            msign_steps=muon_msign_steps,
+            min_ndim=2,
+        ),
+    )
+
+    # 4 transforms: encoder, actor_muon (matrices), critic_muon (matrices), heads_adam (vectors/scalars)
     transforms = {
         'encoder': encoder_tx,
-        'heads_muon': heads_muon_tx,
+        'actor_muon': actor_muon_tx,
+        'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
     }
 
@@ -504,7 +544,10 @@ def create_encoder_adam_heads_muon_optimizer(
             else:
                 # For actor/critic heads, check if matrix or vector/scalar
                 is_matrix = param.ndim >= 2 and min(param.shape) > 1
-                return 'heads_muon' if is_matrix else 'heads_adam'
+                if is_matrix:
+                    return 'actor_muon' if path[0] == 'actor' else 'critic_muon'
+                else:
+                    return 'heads_adam'
 
         flat = flax.traverse_util.flatten_dict(params)
         labeled = {k: _label(k, v) for k, v in flat.items()}
@@ -591,13 +634,17 @@ if __name__ == "__main__":
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
 
+    adam_type = "AdamW" if args.weight_decay > 0 else "Adam"
     print(f"\nOptimizer config:")
-    print(f"  encoder_lr (Adam): {args.encoder_lr}")
+    print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
     print(f"  heads_muon_lr (MUON for matrices): {args.heads_muon_lr}")
-    print(f"  heads_adam_lr (Adam for vectors): {args.heads_adam_lr}")
+    print(f"  heads_adam_lr ({adam_type} for vectors): {args.heads_adam_lr}")
+    print(f"  weight_decay: {args.weight_decay}")
     print(f"  muon_dual_lr: {args.muon_dual_lr}")
     print(f"  muon_dual_steps: {args.muon_dual_steps}")
-    print(f"  max_grad_norm: {args.max_grad_norm}")
+    print(f"  max_grad_norm ({adam_type}): {args.max_grad_norm}")
+    print(f"  actor_muon_max_grad_norm: {args.actor_muon_max_grad_norm}")
+    print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
@@ -622,7 +669,7 @@ if __name__ == "__main__":
     )
 
     # Initialize networks
-    network = Network()
+    network = Network(tanh_scale=args.encoder_tanh_scale)
     actor = Actor(action_dim=action_dim)
     critic = Critic()
 
@@ -691,6 +738,9 @@ if __name__ == "__main__":
         muon_msign_steps=args.muon_msign_steps,
         adam_eps=1e-5,
         max_grad_norm=args.max_grad_norm,
+        actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
+        critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
+        weight_decay=args.weight_decay,
     )
 
     agent_state = TrainState.create(
