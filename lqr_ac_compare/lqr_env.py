@@ -213,8 +213,13 @@ class LQRUpDownEnv:
         noise = Sigma_eff @ self.rng.standard_normal(self.ds) * np.sqrt(self.dt)
         s_next = self.s + drift * self.dt + noise
 
+        # Clip states to prevent overflow (unstable policies can cause explosion)
+        max_state = 1e6
+        s_next = np.clip(s_next, -max_state, max_state)
+
         # cost uses current state/action (standard)
         cost = float(self.s.T @ self.Q @ self.s + a.T @ self.R @ a)
+        cost = np.clip(cost, -1e10, 1e10)  # Clip cost too
         reward = -cost
 
         self.s = s_next

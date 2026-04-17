@@ -177,6 +177,9 @@ clean_rl_reference/
 *.out
 slurm_logs/
 
+lqr_ac_compare/*.csv
+*.gif
+
 run_data/*
 .DS_Store
 #wandb

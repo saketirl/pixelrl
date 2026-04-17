@@ -113,7 +113,7 @@ up_actor.W2 = np.eye(d)
 ### Case 1: Small Problem (ds=4, da=1)
 
 ```bash
-python compare_upstairs_downstairs.py --iters 3000 --L 10 --ds 4 --da 1 --d 64 --alpha 0.5 \
+python compare_upstairs_downstairs.py --iters 3000 --n_steps 10 --ds 4 --da 1 --d 64 --alpha 0.5 \
     --eta_actor 0.01 --eta_critic 0.05 --save_plot comparison_plot.png --save_csv comparison_results.csv
 ```
 
@@ -125,10 +125,10 @@ python compare_upstairs_downstairs.py --iters 3000 --L 10 --ds 4 --da 1 --d 64 -
 | Final cos to optimal | 0.64 | 0.74 | 1.0 |
 | **Policy correlation** | **0.9788** | | |
 
-### Case 2: Harder Problem (ds=8, da=2)
+### Case 2: Harder Problem (ds=8, da=2) - Recommended
 
 ```bash
-python compare_upstairs_downstairs.py --iters 3000 --L 3 --ds 8 --da 2 --d 128 --alpha 0.3 \
+python compare_upstairs_downstairs.py --iters 500 --n_steps 30 --ds 8 --da 2 --d 128 --alpha 0.3 \
     --eta_actor 0.01 --eta_critic 0.05 --save_plot comparison_hard.png --save_csv comparison_hard.csv
 ```
 
@@ -142,6 +142,13 @@ python compare_upstairs_downstairs.py --iters 3000 --L 3 --ds 8 --da 2 --d 128 -
 | **Policy correlation** | **0.9914** | | |
 
 **Key observation**: K K^T = I_2 (Stiefel constraint verified), ||K_opt|| = 1.414 = sqrt(2).
+
+### Quick Test Command
+
+For rapid iteration during development:
+```bash
+python compare_upstairs_downstairs.py --iters 50 --n_steps 30 --ds 8 --da 2 --d 128 --alpha 0.3
+```
 
 ## Known Quirks
 
@@ -161,6 +168,168 @@ python compare_upstairs_downstairs.py --iters 3000 --L 3 --ds 8 --da 2 --d 128 -
 
 6. **Value function U=I initialization hurts upstairs**: Random orthogonal initialization works better than U1=U2=U3=I.
 
+## SGD vs Cayley Retraction (Stiefel Manifold Learning)
+
+The codebase supports two optimization modes controlled by `--use_sgd`:
+
+### Cayley Retraction (Default, Recommended)
+
+Cayley retraction keeps matrices on the Stiefel manifold after each gradient step:
+
+```python
+def cayley_retract(X: Array, G: Array, eta: float) -> Array:
+    """Cayley retraction for matrices on Stiefel manifold."""
+    n, p = X.shape
+    I = np.eye(n)
+    A = G @ X.T - X @ G.T  # skew-symmetric
+    return np.linalg.solve(I + 0.5 * eta * A, (I - 0.5 * eta * A) @ X)
+```
+
+**Properties**:
+- Maintains orthogonality constraint: `X^T X = I_p` after update
+- Bounded matrix norms prevent divergence
+- Numerically stable for long training runs
+- Required for theoretical guarantees in Stiefel_Ascent_RLC.pdf
+
+### Canonical SGD (`--use_sgd`)
+
+Standard gradient descent without manifold constraints:
+
+```python
+def sgd_update(X: Array, G: Array, eta: float) -> Array:
+    return X + eta * G
+```
+
+**Properties**:
+- Matrices can grow unboundedly
+- Faster per-iteration (no linear solve)
+- Often diverges or stagnates without careful learning rate tuning
+- Useful for ablation studies comparing manifold vs unconstrained optimization
+
+**Example comparison**:
+```bash
+# With Cayley retraction (stable, converges)
+python compare_upstairs_downstairs.py --iters 500
+
+# With SGD (may diverge or stagnate)
+python compare_upstairs_downstairs.py --iters 500 --use_sgd
+```
+
+## Multi-step Bootstrapping (`--n_steps`)
+
+The `n_steps` parameter controls the **bootstrapping horizon** for computing TD targets. This is critical for variance control in continuous-time RL.
+
+### How It Works
+
+Instead of single-step TD (high variance as dt→0):
+```
+delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)  # variance ~ O(1/dt)
+```
+
+We use multi-step returns (bounded variance):
+```
+G_t = sum_{l=0}^{n_steps-1} gamma^l [r_{t+l} - q_{t+l}] * dt + gamma^{n_steps} V(s_{t+n_steps})
+```
+
+### Parameter Meaning
+
+- `n_steps=30` means bootstrap from state 30 timesteps ahead
+- Effective bootstrapping time horizon = `n_steps * dt` time units
+- For `dt=0.02`, `n_steps=30` → 0.6 time units of integration
+
+### Recommended Values
+
+| Problem Size | n_steps | Reason |
+|--------------|---------|--------|
+| ds=4, da=1 | 10 | Smaller problem tolerates shorter horizon |
+| ds=8, da=2 | **30** | Working default, realistic horizon |
+
+With `dt=0.02`, `n_steps=30` gives a bootstrapping horizon of 0.6 time units, which provides good bias-variance tradeoff for the CT-DDPG algorithm.
+
+**Note**: `n_steps` is NOT the network depth (L=3 for DLN). The parameter was renamed from `--L` to `--n_steps` to avoid this confusion.
+
+## Sweep Experiments (`run_sweep.py`)
+
+The sweep script runs multiple experiments with different noise seeds while keeping the LQR problem and policy initialization fixed. This tests robustness across environment noise realizations.
+
+### Seed Structure
+
+Three independent seeds control different sources of randomness:
+- `--seed`: LQR problem construction (G, H, Q, R matrices)
+- `--init_seed`: Policy/critic initialization (default: seed+1)
+- `--noise_seed`: Exploration and environment noise (swept over)
+
+### Working Commands
+
+**Standard comparison sweep (16 seeds, 4 parallel)**:
+```bash
+python run_sweep.py \
+    --noise_seeds 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 \
+    --n_steps 30 \
+    --iters 500 \
+    --max_parallel 4
+```
+
+**Quick test sweep (4 seeds)**:
+```bash
+python run_sweep.py \
+    --noise_seeds 0 1 2 3 \
+    --n_steps 30 \
+    --iters 100 \
+    --max_parallel 4
+```
+
+**Downstairs only (faster, for debugging)**:
+```bash
+python run_sweep.py \
+    --noise_seeds 0 1 2 3 4 5 6 7 \
+    --n_steps 30 \
+    --iters 500 \
+    --downstairs_only \
+    --max_parallel 8
+```
+
+**With SGD instead of Cayley (ablation)**:
+```bash
+python run_sweep.py \
+    --noise_seeds 0 1 2 3 \
+    --n_steps 30 \
+    --iters 500 \
+    --use_sgd \
+    --max_parallel 4
+```
+
+### Output Files
+
+Results are saved with naming convention:
+```
+results_nsteps{n_steps}_noise{noise_seed}.csv
+plot_nsteps{n_steps}_noise{noise_seed}.png
+```
+
+### Working Hyperparameters
+
+The following configuration has been verified to work reliably:
+
+```bash
+python run_sweep.py \
+    --seed 0 \
+    --ds 8 --da 2 --d 128 \
+    --n_steps 30 \
+    --alpha 0.3 \
+    --eta_actor 0.01 \
+    --eta_critic 0.05 \
+    --iters 500 \
+    --noise_seeds 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 \
+    --max_parallel 4
+```
+
+**Typical results (16-seed average)**:
+| Metric | Downstairs | Upstairs |
+|--------|-----------|----------|
+| Final reward | -0.414 ± 0.078 | -0.376 ± 0.055 |
+| Final cos to optimal | 0.282 ± 0.005 | 0.463 ± 0.007 |
+
 ## Summary
 
 The theorem is verified: **upstairs and downstairs have equivalent learning dynamics** (policy correlation 0.97-0.99) when:
@@ -168,3 +337,5 @@ The theorem is verified: **upstairs and downstairs have equivalent learning dyna
 2. Matching initial effective parameters (downstairs first, then upstairs matches)
 3. Using CT-DDPG [r - q] loss formulation
 4. Using bilinear advantage function Psi(s, a) = s^T Zb a + Zc a
+5. Using Cayley retraction (not SGD) for Stiefel manifold optimization
+6. Using appropriate bootstrapping horizon (n_steps=30 for ds=8, da=2)
