@@ -385,6 +385,18 @@ def upstairs_batch_multistep_update(
     gZp2 /= n_samples
     mse /= n_samples
 
+    # Clip gradients to prevent overflow
+    max_grad = 1e6
+    for g in [gU1, gU2, gU3, gUp1, gUp2, gZ1, gZ2, gZp2]:
+        np.clip(g, -max_grad, max_grad, out=g)
+    gc = np.clip(gc, -max_grad, max_grad)
+
+    # Check for NaN/Inf
+    all_grads = [gU1, gU2, gU3, gUp1, gUp2, gZ1, gZ2, gZp2]
+    if not all(np.isfinite(g).all() for g in all_grads) or not np.isfinite(gc):
+        return {"mse": float('inf'), "ortho_err_W1": 0.0, "ortho_err_U1": 0.0,
+                "G_W1_norm": 0.0, "G_U1_norm": 0.0, "skipped": True}
+
     # Apply critic updates
     critic.U1 = update_matrix(critic.U1, gU1, eta_critic, use_cayley)
     critic.U2 = update_matrix(critic.U2, gU2, eta_critic, use_cayley)
@@ -416,6 +428,14 @@ def upstairs_batch_multistep_update(
 
     gW1 /= n_samples
     gW2 /= n_samples
+
+    # Clip actor gradients
+    np.clip(gW1, -max_grad, max_grad, out=gW1)
+    np.clip(gW2, -max_grad, max_grad, out=gW2)
+    if not (np.isfinite(gW1).all() and np.isfinite(gW2).all()):
+        return {"mse": float(mse) if np.isfinite(mse) else float('inf'),
+                "ortho_err_W1": 0.0, "ortho_err_U1": 0.0,
+                "G_W1_norm": 0.0, "G_U1_norm": 0.0, "skipped": True}
 
     # Apply actor updates (gradient ASCENT for maximizing return)
     actor.W1 = update_matrix(actor.W1, gW1, eta_actor, use_cayley)
