@@ -4,7 +4,7 @@ PPO for PixelBrax environments.
 
 Optimizer split:
 - Adam/AdamW for encoder (network)
-- Manifold MUON for actor/critic head matrices (2D+ params)
+- selectable Adam, Optax Muon, or manifold Stiefel for actor/critic head matrices
 - Adam/AdamW for actor/critic vectors/scalars
 """
 import os
@@ -12,6 +12,7 @@ import random
 import time
 from dataclasses import dataclass
 from functools import partial
+from typing import Literal
 
 import flax
 import flax.linen as nn
@@ -29,8 +30,8 @@ sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/
 import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
-# Import manifold MUON optimizer
-from manifold_muon_optax import manifold_muon
+# Import manifold Stiefel optimizer
+from manifold_stiefel_optax import manifold_stiefel
 from encoders import build_encoder
 from sigreg import sigreg_loss, sigreg_loss_masked
 
@@ -39,6 +40,9 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
 # Fix CUDNN non-determinism
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+
+
+HeadsOptimizer = Literal["auto", "adam", "stiefel", "muon"]
 
 
 class CRATEFeedForward(nn.Module):
@@ -111,8 +115,12 @@ class Args:
     # Learning rates
     encoder_lr: float = 3e-4
     """learning rate for encoder (Adam/AdamW)"""
-    heads_muon_lr: float = 0.02
-    """learning rate for actor/critic head matrices (MUON)"""
+    heads_optimizer: HeadsOptimizer = "auto"
+    """head matrix optimizer: auto preserves use_heads_stiefel, or choose adam/stiefel/muon explicitly"""
+    heads_stiefel_lr: float = 0.02
+    """learning rate for actor/critic head matrices (Stiefel)"""
+    heads_muon_lr: float = 1e-3
+    """learning rate for actor/critic head matrices (Optax Muon)"""
     heads_adam_lr: float = 3e-4
     """learning rate for actor/critic head vectors/scalars (Adam/AdamW)"""
     weight_decay: float = 0.0
@@ -142,36 +150,54 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for gradient clipping (Adam)"""
+    actor_stiefel_max_grad_norm: float = 1.0
+    """the maximum norm for gradient clipping (actor Stiefel)"""
+    critic_stiefel_max_grad_norm: float = 1.0
+    """the maximum norm for gradient clipping (critic Stiefel)"""
     actor_muon_max_grad_norm: float = 1.0
-    """the maximum norm for gradient clipping (actor MUON)"""
+    """the maximum norm for gradient clipping (actor Optax Muon)"""
     critic_muon_max_grad_norm: float = 1.0
-    """the maximum norm for gradient clipping (critic MUON)"""
+    """the maximum norm for gradient clipping (critic Optax Muon)"""
     max_action: float = 1.0
     """maximum action value for clipping"""
     log_interval: int = 10
     """logging interval (in updates)"""
 
-    # Manifold MUON optimizer arguments
-    use_heads_muon: bool = True
-    """if True, use manifold MUON for actor/critic weight matrices; if False, use Adam for all head params"""
-    use_encoder_final_muon: bool = False
-    """if True, use manifold MUON for the encoder's final Dense kernel only"""
-    use_encoder_upstream_muon: bool = False
-    """if True, use manifold MUON for the encoder's upstream Dense bottleneck only"""
-    encoder_muon_include_upstream: bool = False
-    """If true for innovation_direct_cnn, also apply encoder-final MUON to the upstream Dense_0 bottleneck."""
-    encoder_upstream_muon_lr: float = -1.0
-    """Learning rate for the upstream Dense_0 MUON branch; if negative, reuse encoder_muon_lr."""
-    encoder_muon_lr: float = 0.02
-    """learning rate for the encoder's final Dense kernel when using MUON"""
-    encoder_muon_max_grad_norm: float = 1.0
-    """maximum norm for gradient clipping on the encoder final Dense MUON branch"""
-    muon_dual_lr: float = 0.01
-    """dual learning rate for MUON"""
-    muon_dual_steps: int = 5
-    """number of dual optimization steps for MUON"""
-    muon_msign_steps: int = 5
-    """number of matrix sign iterations for MUON"""
+    # Manifold Stiefel optimizer arguments
+    use_heads_stiefel: bool = True
+    """if True, use manifold Stiefel for actor/critic weight matrices; if False, use Adam for all head params"""
+    use_encoder_final_stiefel: bool = False
+    """if True, use manifold Stiefel for the encoder's final Dense kernel only"""
+    use_encoder_upstream_stiefel: bool = False
+    """if True, use manifold Stiefel for the encoder's upstream Dense bottleneck only"""
+    encoder_stiefel_include_upstream: bool = False
+    """If true for innovation_direct_cnn, also apply encoder-final Stiefel to the upstream Dense_0 bottleneck."""
+    encoder_upstream_stiefel_lr: float = -1.0
+    """Learning rate for the upstream Dense_0 Stiefel branch; if negative, reuse encoder_stiefel_lr."""
+    encoder_stiefel_lr: float = 0.02
+    """learning rate for the encoder's final Dense kernel when using Stiefel"""
+    encoder_stiefel_max_grad_norm: float = 1.0
+    """maximum norm for gradient clipping on the encoder final Dense Stiefel branch"""
+    stiefel_dual_lr: float = 0.01
+    """dual learning rate for Stiefel"""
+    stiefel_dual_steps: int = 5
+    """number of dual optimization steps for Stiefel"""
+    stiefel_msign_steps: int = 5
+    """number of matrix sign iterations for Stiefel"""
+
+    # Optax Muon optimizer arguments
+    muon_ns_steps: int = 5
+    """number of Newton-Schulz iterations for Optax Muon"""
+    muon_beta: float = 0.95
+    """momentum decay for Optax Muon"""
+    muon_eps: float = 1e-8
+    """epsilon for Optax Muon"""
+    muon_weight_decay: float = 0.0
+    """weight decay for Optax Muon matrix params"""
+    muon_nesterov: bool = True
+    """if True, use Nesterov momentum in Optax Muon"""
+    muon_adaptive: bool = False
+    """if True, use adaptive scaling in Optax Muon"""
 
     # Data augmentation (DrQ-style)
     use_augmentation: bool = False
@@ -852,8 +878,32 @@ def split_actor_critic_hiddens(encoded):
     return encoded, encoded
 
 
-def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...], ...]:
-    """Parameter paths that should receive the main encoder-final Muon branch."""
+def resolve_heads_optimizer(
+    heads_optimizer: str,
+    use_heads_stiefel: bool,
+) -> str:
+    """Resolve the head optimizer, preserving legacy use_heads_stiefel behavior."""
+    optimizer = heads_optimizer.lower()
+    if optimizer == "auto":
+        return "stiefel" if use_heads_stiefel else "adam"
+    if optimizer not in {"adam", "stiefel", "muon"}:
+        raise ValueError(
+            f"Unsupported heads_optimizer='{heads_optimizer}'. "
+            "Expected one of: auto, adam, stiefel, muon."
+        )
+    return optimizer
+
+
+def is_stiefel_matrix_param(param) -> bool:
+    return param.ndim >= 2 and min(param.shape) > 1
+
+
+def is_muon_matrix_param(param) -> bool:
+    return param.ndim == 2 and min(param.shape) > 1
+
+
+def encoder_final_stiefel_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...], ...]:
+    """Parameter paths that should receive the main encoder-final Stiefel branch."""
     kind = encoder_type.lower()
     if kind == "split_cnn":
         return (
@@ -872,11 +922,11 @@ def encoder_final_muon_kernel_paths(encoder_type: str) -> tuple[tuple[str, ...],
     return (("network", "params", "Dense_0", "kernel"),)
 
 
-def encoder_upstream_muon_kernel_paths(
+def encoder_upstream_stiefel_kernel_paths(
     encoder_type: str,
     include_upstream_for_innovation_direct: bool = False,
 ) -> tuple[tuple[str, ...], ...]:
-    """Optional upstream encoder paths that should receive a separate Muon branch."""
+    """Optional upstream encoder paths that should receive a separate Stiefel branch."""
     kind = encoder_type.lower()
     if kind == "innovation_direct_cnn" and include_upstream_for_innovation_direct:
         return (("network", "params", "Dense_0", "kernel"),)
@@ -1072,40 +1122,50 @@ def compute_grad_norms(grads: dict) -> dict:
 
 
 # --------------------------------------------------------
-#  Optimizer: Adam for encoder, MUON for head matrices, Adam for head vectors
+#  Optimizer: Adam for encoder, selectable head matrices, Adam fallback vectors
 # --------------------------------------------------------
 
 def create_optimizer(
     encoder_lr,  # Can be float or schedule
-    heads_muon_lr: float,
+    heads_stiefel_lr: float,
     heads_adam_lr,  # Can be float or schedule
-    muon_dual_lr: float = 0.01,
-    muon_dual_steps: int = 5,
-    muon_msign_steps: int = 5,
+    heads_muon_lr: float = 1e-3,
+    stiefel_dual_lr: float = 0.01,
+    stiefel_dual_steps: int = 5,
+    stiefel_msign_steps: int = 5,
     adam_eps: float = 1e-5,
     max_grad_norm: float = 0.5,
+    actor_stiefel_max_grad_norm: float = 1.0,
+    critic_stiefel_max_grad_norm: float = 1.0,
     actor_muon_max_grad_norm: float = 1.0,
     critic_muon_max_grad_norm: float = 1.0,
-    encoder_muon_lr: float = 0.02,
-    encoder_upstream_muon_lr: float = -1.0,
-    encoder_muon_max_grad_norm: float = 1.0,
+    encoder_stiefel_lr: float = 0.02,
+    encoder_upstream_stiefel_lr: float = -1.0,
+    encoder_stiefel_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
-    use_heads_muon: bool = True,
-    use_encoder_final_muon: bool = False,
-    use_encoder_upstream_muon: bool = False,
-    encoder_final_muon_paths: tuple[tuple[str, ...], ...] = (("network", "params", "Dense_0", "kernel"),),
-    encoder_upstream_muon_paths: tuple[tuple[str, ...], ...] = (),
+    heads_optimizer: str = "auto",
+    use_heads_stiefel: bool = True,
+    use_encoder_final_stiefel: bool = False,
+    use_encoder_upstream_stiefel: bool = False,
+    muon_ns_steps: int = 5,
+    muon_beta: float = 0.95,
+    muon_eps: float = 1e-8,
+    muon_weight_decay: float = 0.0,
+    muon_nesterov: bool = True,
+    muon_adaptive: bool = False,
+    encoder_final_stiefel_paths: tuple[tuple[str, ...], ...] = (("network", "params", "Dense_0", "kernel"),),
+    encoder_upstream_stiefel_paths: tuple[tuple[str, ...], ...] = (),
 ):
     """
     Create optimizer that uses:
-    - Adam/AdamW for encoder (all params except optional final Dense kernel MUON branch) - supports lr schedule, with grad clipping
-    - Manifold MUON for the encoder final Dense kernel only when enabled
-    - Manifold MUON for actor head matrices (2D+ with min dim > 1) - with separate grad clipping
-    - Manifold MUON for critic head matrices (2D+ with min dim > 1) - with separate grad clipping
-    - Adam/AdamW for actor/critic head vectors/scalars (biases, log_std, etc.) - supports lr schedule, with grad clipping
+    - Adam/AdamW for encoder (all params except optional final Dense kernel Stiefel branch) - supports lr schedule, with grad clipping
+    - Manifold Stiefel for the encoder final Dense kernel only when enabled
+    - Adam, Optax Muon, or manifold Stiefel for actor/critic head matrices
+    - Adam/AdamW fallback for actor/critic params not handled by the selected head optimizer
 
     Uses AdamW when weight_decay > 0, otherwise uses Adam.
     """
+    resolved_heads_optimizer = resolve_heads_optimizer(heads_optimizer, use_heads_stiefel)
 
     # Choose Adam or AdamW based on weight_decay
     if weight_decay > 0:
@@ -1129,88 +1189,122 @@ def create_optimizer(
         adam_opt(heads_adam_lr),
     )
 
-    # MUON for encoder final Dense kernel only (with separate grad clipping)
-    encoder_final_muon_tx = optax.chain(
-        optax.clip_by_global_norm(encoder_muon_max_grad_norm),
-        manifold_muon(
-            learning_rate=encoder_muon_lr,
-            dual_lr=muon_dual_lr,
-            dual_steps=muon_dual_steps,
-            msign_steps=muon_msign_steps,
+    # Stiefel for encoder final Dense kernel only (with separate grad clipping)
+    encoder_final_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(encoder_stiefel_max_grad_norm),
+        manifold_stiefel(
+            learning_rate=encoder_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            dual_steps=stiefel_dual_steps,
+            msign_steps=stiefel_msign_steps,
             min_ndim=2,
         ),
     )
 
-    upstream_muon_lr = encoder_muon_lr if encoder_upstream_muon_lr < 0 else encoder_upstream_muon_lr
-    encoder_upstream_muon_tx = optax.chain(
-        optax.clip_by_global_norm(encoder_muon_max_grad_norm),
-        manifold_muon(
-            learning_rate=upstream_muon_lr,
-            dual_lr=muon_dual_lr,
-            dual_steps=muon_dual_steps,
-            msign_steps=muon_msign_steps,
+    upstream_stiefel_lr = encoder_stiefel_lr if encoder_upstream_stiefel_lr < 0 else encoder_upstream_stiefel_lr
+    encoder_upstream_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(encoder_stiefel_max_grad_norm),
+        manifold_stiefel(
+            learning_rate=upstream_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            dual_steps=stiefel_dual_steps,
+            msign_steps=stiefel_msign_steps,
             min_ndim=2,
         ),
     )
 
-    # MUON for actor head matrices (with separate grad clipping)
+    # Stiefel for actor head matrices (with separate grad clipping)
+    actor_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
+        manifold_stiefel(
+            learning_rate=heads_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            dual_steps=stiefel_dual_steps,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+
+    # Stiefel for critic head matrices (with separate grad clipping)
+    critic_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(critic_stiefel_max_grad_norm),
+        manifold_stiefel(
+            learning_rate=heads_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            dual_steps=stiefel_dual_steps,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+
+    if not hasattr(optax, "contrib") or not hasattr(optax.contrib, "muon"):
+        if resolved_heads_optimizer == "muon":
+            raise ImportError(
+                "heads_optimizer='muon' requires optax.contrib.muon. "
+                "Install a Muon-capable Optax release, e.g. optax>=0.2.5."
+            )
+        muon_opt = None
+    else:
+        muon_opt = lambda lr: optax.contrib.muon(
+            learning_rate=lr,
+            ns_steps=muon_ns_steps,
+            beta=muon_beta,
+            eps=muon_eps,
+            weight_decay=muon_weight_decay,
+            nesterov=muon_nesterov,
+            adaptive=muon_adaptive,
+        )
+
     actor_muon_tx = optax.chain(
         optax.clip_by_global_norm(actor_muon_max_grad_norm),
-        manifold_muon(
-            learning_rate=heads_muon_lr,
-            dual_lr=muon_dual_lr,
-            dual_steps=muon_dual_steps,
-            msign_steps=muon_msign_steps,
-            min_ndim=2,
-        ),
+        muon_opt(heads_muon_lr) if muon_opt is not None else optax.set_to_zero(),
     )
-
-    # MUON for critic head matrices (with separate grad clipping)
     critic_muon_tx = optax.chain(
         optax.clip_by_global_norm(critic_muon_max_grad_norm),
-        manifold_muon(
-            learning_rate=heads_muon_lr,
-            dual_lr=muon_dual_lr,
-            dual_steps=muon_dual_steps,
-            msign_steps=muon_msign_steps,
-            min_ndim=2,
-        ),
+        muon_opt(heads_muon_lr) if muon_opt is not None else optax.set_to_zero(),
     )
 
-    # 4 transforms: encoder, actor_muon (matrices),
-    # critic_muon (matrices), heads_adam (actor/critic vectors/scalars)
     transforms = {
         'encoder': encoder_tx,
-        'encoder_upstream_muon': encoder_upstream_muon_tx,
-        'encoder_final_muon': encoder_final_muon_tx,
+        'encoder_upstream_stiefel': encoder_upstream_stiefel_tx,
+        'encoder_final_stiefel': encoder_final_stiefel_tx,
+        'actor_stiefel': actor_stiefel_tx,
+        'critic_stiefel': critic_stiefel_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
         'heads_adam': heads_adam_tx,
     }
 
-    encoder_final_muon_paths = set(encoder_final_muon_paths)
-    encoder_upstream_muon_paths = set(encoder_upstream_muon_paths)
+    encoder_final_stiefel_paths = set(encoder_final_stiefel_paths)
+    encoder_upstream_stiefel_paths = set(encoder_upstream_stiefel_paths)
 
     # Label function
     def label_fn(params):
         def _label(path, param):
             # path[0] is a top-level module key in params
             if path[0] == 'network':
-                is_encoder_upstream_dense_kernel = path in encoder_upstream_muon_paths
-                is_encoder_final_dense_kernel = path in encoder_final_muon_paths
-                if use_encoder_upstream_muon and is_encoder_upstream_dense_kernel:
-                    return 'encoder_upstream_muon'
-                if use_encoder_final_muon and is_encoder_final_dense_kernel:
-                    return 'encoder_final_muon'
+                is_encoder_upstream_dense_kernel = path in encoder_upstream_stiefel_paths
+                is_encoder_final_dense_kernel = path in encoder_final_stiefel_paths
+                if use_encoder_upstream_stiefel and is_encoder_upstream_dense_kernel:
+                    return 'encoder_upstream_stiefel'
+                if use_encoder_final_stiefel and is_encoder_final_dense_kernel:
+                    return 'encoder_final_stiefel'
                 return 'encoder'
             if path[0] == 'innovation':
                 return 'encoder'
             # For actor/critic heads, check if matrix or vector/scalar
-            is_matrix = param.ndim >= 2 and min(param.shape) > 1
             if path[0] == 'actor':
-                return 'actor_muon' if (is_matrix and use_heads_muon) else 'heads_adam'
+                if resolved_heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
+                    return 'actor_stiefel'
+                if resolved_heads_optimizer == "muon" and is_muon_matrix_param(param):
+                    return 'actor_muon'
+                return 'heads_adam'
             if path[0] == 'critic':
-                return 'critic_muon' if (is_matrix and use_heads_muon) else 'heads_adam'
+                if resolved_heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
+                    return 'critic_stiefel'
+                if resolved_heads_optimizer == "muon" and is_muon_matrix_param(param):
+                    return 'critic_muon'
+                return 'heads_adam'
 
             # Fallback for any extra top-level params.
             return 'heads_adam'
@@ -1270,6 +1364,10 @@ if __name__ == "__main__":
         args.init_seed = args.seed
     if args.data_seed < 0:
         args.data_seed = args.seed
+    args.heads_optimizer = resolve_heads_optimizer(
+        args.heads_optimizer,
+        args.use_heads_stiefel,
+    )
 
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -1300,7 +1398,7 @@ if __name__ == "__main__":
 
     # Environment setup
     print("=" * 60)
-    print("PPO with Manifold MUON")
+    print("PPO with Selectable Head Optimizer")
     print("=" * 60)
     print(f"JAX devices: {jax.devices()}")
     print(f"env name: {args.env_name}")
@@ -1314,25 +1412,36 @@ if __name__ == "__main__":
     print(f"minibatch_size: {args.minibatch_size}")
 
     adam_type = "AdamW" if args.weight_decay > 0 else "Adam"
-    use_encoder_upstream_muon = args.use_encoder_upstream_muon or (
-        args.use_encoder_final_muon and args.encoder_muon_include_upstream
+    use_encoder_upstream_stiefel = args.use_encoder_upstream_stiefel or (
+        args.use_encoder_final_stiefel and args.encoder_stiefel_include_upstream
     )
     print(f"\nOptimizer config:")
     print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
-    print(f"  heads_muon_lr (MUON for actor/critic matrices): {args.heads_muon_lr}")
+    print(f"  heads_optimizer: {args.heads_optimizer}")
+    print(f"  use_heads_stiefel (legacy auto flag): {args.use_heads_stiefel}")
+    print(f"  heads_stiefel_lr (Stiefel for actor/critic matrices): {args.heads_stiefel_lr}")
+    print(f"  heads_muon_lr (Optax Muon for actor/critic matrices): {args.heads_muon_lr}")
     print(f"  heads_adam_lr ({adam_type} for actor/critic vectors): {args.heads_adam_lr}")
-    print(f"  use_encoder_final_muon: {args.use_encoder_final_muon}")
-    print(f"  use_encoder_upstream_muon: {use_encoder_upstream_muon}")
-    print(f"  encoder_muon_include_upstream: {args.encoder_muon_include_upstream}")
-    print(f"  encoder_upstream_muon_lr: {args.encoder_upstream_muon_lr}")
-    print(f"  encoder_muon_lr: {args.encoder_muon_lr}")
-    print(f"  encoder_muon_max_grad_norm: {args.encoder_muon_max_grad_norm}")
+    print(f"  use_encoder_final_stiefel: {args.use_encoder_final_stiefel}")
+    print(f"  use_encoder_upstream_stiefel: {use_encoder_upstream_stiefel}")
+    print(f"  encoder_stiefel_include_upstream: {args.encoder_stiefel_include_upstream}")
+    print(f"  encoder_upstream_stiefel_lr: {args.encoder_upstream_stiefel_lr}")
+    print(f"  encoder_stiefel_lr: {args.encoder_stiefel_lr}")
+    print(f"  encoder_stiefel_max_grad_norm: {args.encoder_stiefel_max_grad_norm}")
     print(f"  weight_decay: {args.weight_decay}")
-    print(f"  muon_dual_lr: {args.muon_dual_lr}")
-    print(f"  muon_dual_steps: {args.muon_dual_steps}")
+    print(f"  stiefel_dual_lr: {args.stiefel_dual_lr}")
+    print(f"  stiefel_dual_steps: {args.stiefel_dual_steps}")
     print(f"  max_grad_norm ({adam_type}): {args.max_grad_norm}")
+    print(f"  actor_stiefel_max_grad_norm: {args.actor_stiefel_max_grad_norm}")
+    print(f"  critic_stiefel_max_grad_norm: {args.critic_stiefel_max_grad_norm}")
     print(f"  actor_muon_max_grad_norm: {args.actor_muon_max_grad_norm}")
     print(f"  critic_muon_max_grad_norm: {args.critic_muon_max_grad_norm}")
+    print(f"  muon_ns_steps: {args.muon_ns_steps}")
+    print(f"  muon_beta: {args.muon_beta}")
+    print(f"  muon_eps: {args.muon_eps}")
+    print(f"  muon_weight_decay: {args.muon_weight_decay}")
+    print(f"  muon_nesterov: {args.muon_nesterov}")
+    print(f"  muon_adaptive: {args.muon_adaptive}")
     print(f"  encoder_type: {args.encoder_type}")
     print(f"  encoder_tanh_scale: {args.encoder_tanh_scale}")
     print(f"  encoder_residual_scale: {args.encoder_residual_scale}")
@@ -1456,10 +1565,10 @@ if __name__ == "__main__":
     dummy_actor_hidden, dummy_critic_hidden = split_actor_critic_hiddens(
         network.apply(network_params, dummy_obs)
     )
-    encoder_muon_paths = encoder_final_muon_kernel_paths(encoder_type)
-    encoder_upstream_muon_paths = encoder_upstream_muon_kernel_paths(
+    encoder_stiefel_paths = encoder_final_stiefel_kernel_paths(encoder_type)
+    encoder_upstream_stiefel_paths = encoder_upstream_stiefel_kernel_paths(
         encoder_type,
-        include_upstream_for_innovation_direct=args.encoder_muon_include_upstream,
+        include_upstream_for_innovation_direct=args.encoder_stiefel_include_upstream,
     )
 
     params_dict = {
@@ -1487,13 +1596,18 @@ if __name__ == "__main__":
             return sum(p.size for p in jax.tree_util.tree_leaves(params[key]))
         return 0
 
-    def count_by_type(params, key):
+    def count_head_optimizer_params(params, key, heads_optimizer):
         if key not in params:
             return 0, 0
         flat = flax.traverse_util.flatten_dict(params[key])
-        muon_count = sum(p.size for p in flat.values() if p.ndim >= 2 and min(p.shape) > 1)
-        adam_count = sum(p.size for p in flat.values() if p.ndim < 2 or min(p.shape) <= 1)
-        return muon_count, adam_count
+        total_count = sum(p.size for p in flat.values())
+        if heads_optimizer == "stiefel":
+            optimized_count = sum(p.size for p in flat.values() if is_stiefel_matrix_param(p))
+        elif heads_optimizer == "muon":
+            optimized_count = sum(p.size for p in flat.values() if is_muon_matrix_param(p))
+        else:
+            optimized_count = 0
+        return optimized_count, total_count - optimized_count
 
     encoder_params = count_params(all_params, "network")
     innovation_params = count_params(all_params, "innovation")
@@ -1501,35 +1615,57 @@ if __name__ == "__main__":
     critic_params = count_params(all_params, "critic")
     total_params = encoder_params + innovation_params + actor_params + critic_params
 
-    actor_muon, actor_adam = count_by_type(all_params, "actor")
-    critic_muon, critic_adam = count_by_type(all_params, "critic")
-    encoder_final_muon_params = 0
-    encoder_upstream_muon_params = 0
-    if args.use_encoder_final_muon or use_encoder_upstream_muon:
+    actor_head_opt, actor_adam = count_head_optimizer_params(
+        all_params,
+        "actor",
+        args.heads_optimizer,
+    )
+    critic_head_opt, critic_adam = count_head_optimizer_params(
+        all_params,
+        "critic",
+        args.heads_optimizer,
+    )
+    encoder_final_stiefel_params = 0
+    encoder_upstream_stiefel_params = 0
+    if args.use_encoder_final_stiefel or use_encoder_upstream_stiefel:
         flat_all_params = flax.traverse_util.flatten_dict(all_params)
-        if args.use_encoder_final_muon:
-            encoder_final_muon_params = sum(
+        if args.use_encoder_final_stiefel:
+            encoder_final_stiefel_params = sum(
                 flat_all_params[path].size
-                for path in encoder_muon_paths
+                for path in encoder_stiefel_paths
                 if path in flat_all_params
             )
-        if use_encoder_upstream_muon:
-            encoder_upstream_muon_params = sum(
+        if use_encoder_upstream_stiefel:
+            encoder_upstream_stiefel_params = sum(
                 flat_all_params[path].size
-                for path in encoder_upstream_muon_paths
+                for path in encoder_upstream_stiefel_paths
                 if path in flat_all_params
             )
-    encoder_adam_params = encoder_params - encoder_final_muon_params - encoder_upstream_muon_params
+    encoder_adam_params = encoder_params - encoder_final_stiefel_params - encoder_upstream_stiefel_params
 
     print(f"\nParameter breakdown:")
     print(
         f"  Encoder total: {encoder_params:,} "
-        f"(MUON upstream: {encoder_upstream_muon_params:,}, MUON final dense: {encoder_final_muon_params:,}, Adam rest: {encoder_adam_params:,})"
+        f"(Stiefel upstream: {encoder_upstream_stiefel_params:,}, Stiefel final dense: {encoder_final_stiefel_params:,}, Adam rest: {encoder_adam_params:,})"
     )
     if innovation_params > 0:
         print(f"  Innovation dynamics (Adam): {innovation_params:,}")
-    print(f"  Actor total: {actor_params:,} (MUON: {actor_muon:,}, Adam: {actor_adam:,})")
-    print(f"  Critic total: {critic_params:,} (MUON: {critic_muon:,}, Adam: {critic_adam:,})")
+    if args.heads_optimizer == "adam":
+        print(f"  Actor total: {actor_params:,} (Adam: {actor_adam:,})")
+        print(f"  Critic total: {critic_params:,} (Adam: {critic_adam:,})")
+    else:
+        head_opt_label = {
+            "stiefel": "Stiefel",
+            "muon": "Optax Muon",
+        }[args.heads_optimizer]
+        print(
+            f"  Actor total: {actor_params:,} "
+            f"({head_opt_label}: {actor_head_opt:,}, Adam fallback: {actor_adam:,})"
+        )
+        print(
+            f"  Critic total: {critic_params:,} "
+            f"({head_opt_label}: {critic_head_opt:,}, Adam fallback: {critic_adam:,})"
+        )
     print(f"  Total: {total_params:,}")
 
     # Create learning rate schedules for Adam optimizers
@@ -1606,24 +1742,34 @@ if __name__ == "__main__":
     # Create optimizer
     tx = create_optimizer(
         encoder_lr=encoder_lr,
-        heads_muon_lr=args.heads_muon_lr,
+        heads_stiefel_lr=args.heads_stiefel_lr,
         heads_adam_lr=heads_adam_lr,
-        muon_dual_lr=args.muon_dual_lr,
-        muon_dual_steps=args.muon_dual_steps,
-        muon_msign_steps=args.muon_msign_steps,
+        heads_muon_lr=args.heads_muon_lr,
+        stiefel_dual_lr=args.stiefel_dual_lr,
+        stiefel_dual_steps=args.stiefel_dual_steps,
+        stiefel_msign_steps=args.stiefel_msign_steps,
         adam_eps=1e-5,
         max_grad_norm=args.max_grad_norm,
+        actor_stiefel_max_grad_norm=args.actor_stiefel_max_grad_norm,
+        critic_stiefel_max_grad_norm=args.critic_stiefel_max_grad_norm,
         actor_muon_max_grad_norm=args.actor_muon_max_grad_norm,
         critic_muon_max_grad_norm=args.critic_muon_max_grad_norm,
-        encoder_muon_lr=args.encoder_muon_lr,
-        encoder_upstream_muon_lr=args.encoder_upstream_muon_lr,
-        encoder_muon_max_grad_norm=args.encoder_muon_max_grad_norm,
+        encoder_stiefel_lr=args.encoder_stiefel_lr,
+        encoder_upstream_stiefel_lr=args.encoder_upstream_stiefel_lr,
+        encoder_stiefel_max_grad_norm=args.encoder_stiefel_max_grad_norm,
         weight_decay=args.weight_decay,
-        use_heads_muon=args.use_heads_muon,
-        use_encoder_final_muon=args.use_encoder_final_muon,
-        use_encoder_upstream_muon=use_encoder_upstream_muon,
-        encoder_final_muon_paths=encoder_muon_paths,
-        encoder_upstream_muon_paths=encoder_upstream_muon_paths,
+        heads_optimizer=args.heads_optimizer,
+        use_heads_stiefel=args.use_heads_stiefel,
+        use_encoder_final_stiefel=args.use_encoder_final_stiefel,
+        use_encoder_upstream_stiefel=use_encoder_upstream_stiefel,
+        muon_ns_steps=args.muon_ns_steps,
+        muon_beta=args.muon_beta,
+        muon_eps=args.muon_eps,
+        muon_weight_decay=args.muon_weight_decay,
+        muon_nesterov=args.muon_nesterov,
+        muon_adaptive=args.muon_adaptive,
+        encoder_final_stiefel_paths=encoder_stiefel_paths,
+        encoder_upstream_stiefel_paths=encoder_upstream_stiefel_paths,
     )
 
     agent_state = TrainState.create(
@@ -2628,7 +2774,11 @@ if __name__ == "__main__":
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
                     "charts/encoder_lr": float(encoder_lr_current),
                     "charts/heads_adam_lr": float(heads_adam_lr_current),
+                    "charts/heads_stiefel_lr": args.heads_stiefel_lr,
                     "charts/heads_muon_lr": args.heads_muon_lr,
+                    "charts/head_optimizer_is_adam": float(args.heads_optimizer == "adam"),
+                    "charts/head_optimizer_is_stiefel": float(args.heads_optimizer == "stiefel"),
+                    "charts/head_optimizer_is_muon": float(args.heads_optimizer == "muon"),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),

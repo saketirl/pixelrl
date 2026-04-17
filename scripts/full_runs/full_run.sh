@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=cnn-muon-me
-#SBATCH --output=slurm_logs/cnn_heads_muon_me_%A_%a.out
+#SBATCH --job-name=cnn-stiefel-me
+#SBATCH --output=slurm_logs/cnn_heads_stiefel_me_%A_%a.out
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
@@ -11,12 +11,12 @@
 
 set -euo pipefail
 
-# Sweep CNN Muon PPO runs across all PixelBrax environments and 6 seeds,
-# comparing head optimizer choice (MUON vs Adam).
+# Sweep CNN Stiefel PPO runs across all PixelBrax environments and 6 seeds,
+# comparing head optimizer choice (Stiefel vs Adam).
 #
 # Swept:
 #   env         in {halfcheetah, walker2d, ant, humanoid, reacher, swimmer, pusher, hopper, inverted_pendulum}
-#   head_opt    in {muon, adam}  (use_heads_muon true/false)
+#   head_opt    in {stiefel, adam}  (use_heads_stiefel true/false)
 #   seed        in {0, 1, 2, 3, 4, 5}
 #
 # 9 x 1 x 2 x 6 = 108 configs
@@ -50,7 +50,7 @@ fi
 ENVS=(halfcheetah walker2d ant humanoid reacher swimmer pusher hopper inverted_pendulum)
 BACKENDS=(spring spring spring spring generalized generalized generalized positional generalized)
 ENCODER_TYPES=(cnn)
-OPT_CONDITIONS=(muon adam)
+OPT_CONDITIONS=(stiefel adam)
 SEEDS=(0 1 2 3 4 5)
 
 NUM_ENVS=${#ENVS[@]}
@@ -82,9 +82,9 @@ ENV_NAME="${ENVS[$ENV_IDX]}"
 BACKEND="${BACKENDS[$ENV_IDX]}"
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="cnn_heads_muon_me_"
+GROUP_NAME="cnn_heads_stiefel_me_"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="cnn_heads_muon_me,encoder_${ENCODER_TYPE},opt_${OPT_CONDITION},env_${ENV_NAME},backend_${BACKEND},seed_${SEED},allenv9,sweep6seeds"
+export WANDB_TAGS="cnn_heads_stiefel_me,encoder_${ENCODER_TYPE},opt_${OPT_CONDITION},env_${ENV_NAME},backend_${BACKEND},seed_${SEED},allenv9,sweep6seeds"
 
 EXP_NAME="ppo_cmp_${ENCODER_TYPE}_${OPT_CONDITION}_${ENV_NAME}_b${BACKEND}_s${SEED}_t${TASK_ID}"
 
@@ -114,10 +114,10 @@ COMMON_ARGS=(
   --frame-stack 4
   --action-repeat 4
   --anneal-lr
-  --muon-dual-lr 0.01
-  --muon-dual-steps 5
-  --actor-muon-max-grad-norm 100
-  --critic-muon-max-grad-norm 1
+  --stiefel-dual-lr 0.01
+  --stiefel-dual-steps 5
+  --actor-stiefel-max-grad-norm 100
+  --critic-stiefel-max-grad-norm 1
   --exp-name "${EXP_NAME}"
 )
 
@@ -129,20 +129,20 @@ ARCH_ARGS=(
   --encoder-type cnn
   --encoder-lr 3e-4
   --heads-adam-lr 3e-4
-  --heads-muon-lr 0.001
+  --heads-stiefel-lr 0.001
   --max-grad-norm 0.05
   --encoder-tanh-scale 0.5
 )
 
 OPT_ARGS=()
-if [[ "${OPT_CONDITION}" == "muon" ]]; then
-  OPT_ARGS+=(--use-heads-muon)
+if [[ "${OPT_CONDITION}" == "stiefel" ]]; then
+  OPT_ARGS+=(--use-heads-stiefel)
 else
-  OPT_ARGS+=(--no-use-heads-muon)
+  OPT_ARGS+=(--no-use-heads-stiefel)
 fi
 
 cd "${REPO_ROOT}"
-uv run python "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" \
+uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
   "${OPT_ARGS[@]}"

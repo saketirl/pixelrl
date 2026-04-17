@@ -29,7 +29,7 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 
@@ -108,10 +108,10 @@ COMMON_ARGS=(
   --frame-stack 4
   --action-repeat 4
   --anneal-lr
-  --muon-dual-lr 0.01
-  --muon-dual-steps 5
-  --actor-muon-max-grad-norm 100
-  --critic-muon-max-grad-norm 1
+  --stiefel-dual-lr 0.01
+  --stiefel-dual-steps 5
+  --actor-stiefel-max-grad-norm 100
+  --critic-stiefel-max-grad-norm 1
   --exp-name "${EXP_NAME}"
 )
 
@@ -119,7 +119,7 @@ ARCH_ARGS=(
   --encoder-type cnn
   --encoder-lr 3e-4
   --heads-adam-lr 3e-4
-  --heads-muon-lr 0.001
+  --heads-stiefel-lr 0.001
   --max-grad-norm 0.05
   --encoder-tanh-scale "${ENCODER_SCALE}"
   --use-crate-head
@@ -128,7 +128,7 @@ ARCH_ARGS=(
 
 cd "${REPO_ROOT}"
 uv run python -m wandb login 9fb4ba17a708de72496774b2e25d219f07de038d
-uv run python "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" \
+uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
-  --no-use-heads-muon
+  --no-use-heads-stiefel

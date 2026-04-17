@@ -29,7 +29,7 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 
@@ -95,7 +95,7 @@ export WANDB_TAGS="staging,crate_cnn_meanbound_boundedstd,env_${ENV_NAME},backen
 EXP_NAME="ppo_staging_cratecnn_meanbound_boundedstd_plainheads_adam_${ENV_NAME}_b${BACKEND}_s${SEED}_t${TASK_ID}"
 
 echo "Running TASK_ID=${TASK_ID}/${NUM_CONFIGS} group=${GROUP_NAME}"
-echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=crate_cnn encoder_crate_step_size=${ENCODER_CRATE_STEP_SIZE} actor_mean_tanh=true actor_mean_scale=${ACTOR_MEAN_SCALE} bounded_global_logstd=true actor_logstd_init=${ACTOR_LOGSTD_INIT} actor_logstd_min=${ACTOR_LOGSTD_MIN} actor_logstd_max=${ACTOR_LOGSTD_MAX} crate_head=false heads_muon=false sigreg=off seed=${SEED}"
+echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=crate_cnn encoder_crate_step_size=${ENCODER_CRATE_STEP_SIZE} actor_mean_tanh=true actor_mean_scale=${ACTOR_MEAN_SCALE} bounded_global_logstd=true actor_logstd_init=${ACTOR_LOGSTD_INIT} actor_logstd_min=${ACTOR_LOGSTD_MIN} actor_logstd_max=${ACTOR_LOGSTD_MAX} crate_head=false heads_stiefel=false sigreg=off seed=${SEED}"
 echo "Exp: ${EXP_NAME}"
 
 COMMON_ARGS=(
@@ -120,10 +120,10 @@ COMMON_ARGS=(
   --frame-stack 4
   --action-repeat 4
   --anneal-lr
-  --muon-dual-lr 0.01
-  --muon-dual-steps 5
-  --actor-muon-max-grad-norm 100
-  --critic-muon-max-grad-norm 1
+  --stiefel-dual-lr 0.01
+  --stiefel-dual-steps 5
+  --actor-stiefel-max-grad-norm 100
+  --critic-stiefel-max-grad-norm 1
   --actor-mean-tanh
   --actor-mean-scale "${ACTOR_MEAN_SCALE}"
   --bounded-global-logstd
@@ -141,14 +141,14 @@ ARCH_ARGS=(
   --encoder-type crate_cnn
   --encoder-lr 3e-4
   --heads-adam-lr 3e-4
-  --heads-muon-lr 0.001
+  --heads-stiefel-lr 0.001
   --max-grad-norm 0.05
   --encoder-crate-step-size "${ENCODER_CRATE_STEP_SIZE}"
   --sigreg-mode off
 )
 
 cd "${REPO_ROOT}"
-uv run python "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" \
+uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
-  --no-use-heads-muon
+  --no-use-heads-stiefel

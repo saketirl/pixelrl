@@ -1,26 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=cnn-vit-stiefel-me
-#SBATCH --output=slurm_logs/cnn_vit_heads_stiefel_me_%A_%a.out
+#SBATCH --job-name=cnn-muon-vs-stiefel
+#SBATCH --output=slurm_logs/cnn_builtin_muon_vs_stiefel_muon_%A_%a.out
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=08:00:00
 #SBATCH --mem=64GB
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-215%8
+#SBATCH --array=0-107%8
 
 set -euo pipefail
 
-# Compare encoder architecture (CNN vs ViT) and head optimizer (Stiefel vs Adam)
-# across all PixelBrax environments and 6 seeds.
+# Sweep CNN PPO runs across all PixelBrax environments and 6 seeds,
+# comparing Optax built-in Muon against the existing manifold/Stiefel Muon.
 #
 # Swept:
 #   env         in {halfcheetah, walker2d, ant, humanoid, reacher, swimmer, pusher, hopper, inverted_pendulum}
-#   encoder     in {cnn, vit}
-#   head_opt    in {stiefel, adam}  (use_heads_stiefel true/false)
+#   head_opt    in {muon, stiefel_muon}
 #   seed        in {0, 1, 2, 3, 4, 5}
 #
-# 9 x 2 x 2 x 6 = 216 configs
+# 9 x 1 x 2 x 6 = 108 configs
 
 WANDB_PROJECT="${1:-benchmark}"
 WANDB_ENTITY="${2:-}"
@@ -50,8 +49,8 @@ fi
 
 ENVS=(halfcheetah walker2d ant humanoid reacher swimmer pusher hopper inverted_pendulum)
 BACKENDS=(spring spring spring spring generalized generalized generalized positional generalized)
-ENCODER_TYPES=(cnn vit)
-OPT_CONDITIONS=(stiefel adam)
+ENCODER_TYPES=(cnn)
+OPT_CONDITIONS=(muon stiefel_muon)
 SEEDS=(0 1 2 3 4 5)
 
 NUM_ENVS=${#ENVS[@]}
@@ -83,9 +82,9 @@ ENV_NAME="${ENVS[$ENV_IDX]}"
 BACKEND="${BACKENDS[$ENV_IDX]}"
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="cnn_vit_heads_stiefel_me_${GROUP_ID}"
+GROUP_NAME="cnn_builtin_muon_vs_stiefel_muon_${GROUP_ID}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="cnn_vit_heads_stiefel_me,encoder_${ENCODER_TYPE},opt_${OPT_CONDITION},env_${ENV_NAME},backend_${BACKEND},seed_${SEED},allenv9,sweep6seeds"
+export WANDB_TAGS="cnn_builtin_muon_vs_stiefel_muon,encoder_${ENCODER_TYPE},opt_${OPT_CONDITION},env_${ENV_NAME},backend_${BACKEND},seed_${SEED},sweep6seeds,neurips_baselines"
 
 EXP_NAME="ppo_cmp_${ENCODER_TYPE}_${OPT_CONDITION}_${ENV_NAME}_b${BACKEND}_s${SEED}_t${TASK_ID}"
 
@@ -119,6 +118,9 @@ COMMON_ARGS=(
   --stiefel-dual-steps 5
   --actor-stiefel-max-grad-norm 100
   --critic-stiefel-max-grad-norm 1
+  --muon-ns-steps 5
+  --actor-muon-max-grad-norm 100
+  --critic-muon-max-grad-norm 1
   --exp-name "${EXP_NAME}"
 )
 
@@ -126,47 +128,24 @@ if [[ -n "${WANDB_ENTITY}" ]]; then
   COMMON_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
 fi
 
-ARCH_ARGS=()
-if [[ "${ENCODER_TYPE}" == "cnn" ]]; then
-  ARCH_ARGS+=(
-    --encoder-type cnn
-    --encoder-lr 3e-4
-    --heads-adam-lr 3e-4
-    --heads-stiefel-lr 0.001
-    --max-grad-norm 0.05
-    --encoder-tanh-scale 0.5
-  )
-else
-  ARCH_ARGS+=(
-    --encoder-type vit
-    --encoder-lr 5e-5
-    --heads-adam-lr 3e-4
-    --heads-stiefel-lr 0.001
-    --weight-decay 1e-4
-    --max-grad-norm 0.5
-    --encoder-warmup-updates 500
-    --encoder-tanh-scale 0.25
-    --vit-patch-size 21
-    --vit-hidden-size 128
-    --vit-mlp-dim 512
-    --vit-num-heads 8
-    --vit-num-layers 4
-    --vit-dropout-rate 0.0
-    --vit-attention-dropout-rate 0.0
-    --vit-conv-stem-channels 64
-    --vit-conv-stem-kernel 3
-    --vit-use-conv-stem
-    --no-vit-use-cls-token
-    --no-vit-apply-output-tanh
-    --no-vit-qk-stiefel
-  )
-fi
+ARCH_ARGS=(
+  --encoder-type cnn
+  --encoder-lr 3e-4
+  --heads-adam-lr 3e-4
+  --heads-muon-lr 0.001
+  --heads-stiefel-lr 0.001
+  --max-grad-norm 0.05
+  --encoder-tanh-scale 0.5
+)
 
 OPT_ARGS=()
-if [[ "${OPT_CONDITION}" == "stiefel" ]]; then
-  OPT_ARGS+=(--use-heads-stiefel)
+if [[ "${OPT_CONDITION}" == "muon" ]]; then
+  OPT_ARGS+=(--heads-optimizer muon)
+elif [[ "${OPT_CONDITION}" == "stiefel_muon" ]]; then
+  OPT_ARGS+=(--heads-optimizer stiefel)
 else
-  OPT_ARGS+=(--no-use-heads-stiefel)
+  echo "Unknown OPT_CONDITION=${OPT_CONDITION}" >&2
+  exit 1
 fi
 
 cd "${REPO_ROOT}"
