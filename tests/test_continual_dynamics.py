@@ -103,6 +103,9 @@ def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
     base_sys = _inverted_pendulum_sys()
     base_mass = np.asarray(jax.device_get(base_sys.link.inertia.mass))
     base_inertia = np.asarray(jax.device_get(base_sys.link.inertia.i))
+    base_pole_com = np.asarray(jax.device_get(base_sys.link.inertia.transform.pos))[1]
+    base_geom_size = np.asarray(jax.device_get(base_sys.geom_size))
+    base_pole_length = 2.0 * base_geom_size[2, 1]
     config = _inverted_pendulum_config()
 
     updates_per_task = validate_continual_dynamics_config(
@@ -117,28 +120,36 @@ def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
 
     task0 = make_dynamics_task(config, base_sys, task_index=0, schedule_seed=7)
     assert task0.is_default
-    assert task0.values["geom_friction_slide"] == pytest.approx(1.0)
+    assert "geom_friction_slide" not in task0.values
     assert task0.values["actuator_gear"]["slide"] == pytest.approx(100.0)
     assert task0.values["link_mass"]["cart"] == pytest.approx(10.4719753)
     assert task0.values["link_mass"]["pole"] == pytest.approx(5.0185914)
+    assert task0.values["gravity_z"] == pytest.approx(-9.81)
+    assert task0.values["dof_damping"]["slider"] == pytest.approx(1.0)
+    assert task0.values["dof_damping"]["hinge"] == pytest.approx(1.0)
+    assert task0.values["pole_length"] == pytest.approx(0.6, abs=1e-5)
     assert apply_dynamics_task(base_sys, task0) is base_sys
 
     task1_a = make_dynamics_task(config, base_sys, task_index=1, schedule_seed=7)
     task1_b = make_dynamics_task(config, base_sys, task_index=1, schedule_seed=7)
     assert task1_a == task1_b
     assert not task1_a.is_default
-    assert 0.5 <= task1_a.values["geom_friction_slide"] <= 2.5
-    assert 50.0 <= task1_a.values["actuator_gear"]["slide"] <= 150.0
-    assert 7.3304 <= task1_a.values["link_mass"]["cart"] <= 13.6136
-    assert 3.5130 <= task1_a.values["link_mass"]["pole"] <= 6.5242
+    assert "geom_friction_slide" not in task1_a.values
+    assert 40.0 <= task1_a.values["actuator_gear"]["slide"] <= 140.0
+    assert 6.0 <= task1_a.values["link_mass"]["cart"] <= 16.0
+    assert 2.5 <= task1_a.values["link_mass"]["pole"] <= 8.0
+    assert -18.0 <= task1_a.values["gravity_z"] <= -7.0
+    assert 0.25 <= task1_a.values["dof_damping"]["slider"] <= 6.0
+    assert 0.25 <= task1_a.values["dof_damping"]["hinge"] <= 4.0
+    assert 0.35 <= task1_a.values["pole_length"] <= 0.9
 
     new_sys = apply_dynamics_task(base_sys, task1_a)
     assert new_sys.q_size() == base_sys.q_size()
     assert new_sys.qd_size() == base_sys.qd_size()
     assert new_sys.act_size() == base_sys.act_size()
     np.testing.assert_allclose(
-        np.asarray(jax.device_get(new_sys.geom_friction))[:, 0],
-        np.full(base_sys.geom_friction.shape[0], task1_a.values["geom_friction_slide"]),
+        np.asarray(jax.device_get(new_sys.geom_friction)),
+        np.asarray(jax.device_get(base_sys.geom_friction)),
     )
     np.testing.assert_allclose(
         np.asarray(jax.device_get(new_sys.actuator.gear)),
@@ -150,6 +161,10 @@ def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
             task1_a.values["link_mass"]["pole"],
         ]
     )
+    length_ratio = task1_a.values["pole_length"] / base_pole_length
+    expected_inertia = base_inertia * (expected_mass / base_mass)[:, None, None]
+    expected_inertia[1, 0, 0] *= length_ratio * length_ratio
+    expected_inertia[1, 1, 1] *= length_ratio * length_ratio
     np.testing.assert_allclose(
         np.asarray(jax.device_get(new_sys.link.inertia.mass)),
         expected_mass,
@@ -157,9 +172,38 @@ def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
     )
     np.testing.assert_allclose(
         np.asarray(jax.device_get(new_sys.link.inertia.i)),
-        base_inertia * (expected_mass / base_mass)[:, None, None],
+        expected_inertia,
         rtol=1e-6,
         atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.gravity)),
+        np.array([0.0, 0.0, task1_a.values["gravity_z"]]),
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.dof.damping)),
+        np.array(
+            [
+                task1_a.values["dof_damping"]["slider"],
+                task1_a.values["dof_damping"]["hinge"],
+            ]
+        ),
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.link.inertia.transform.pos))[1],
+        base_pole_com * length_ratio,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.geom_size))[2, 1],
+        base_geom_size[2, 1] * length_ratio,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert new_sys.mj_model is not base_sys.mj_model
+    assert new_sys.mj_model.geom_size[2, 1] == pytest.approx(
+        base_geom_size[2, 1] * length_ratio
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -12,7 +13,14 @@ import numpy as np
 import yaml
 
 
-SUPPORTED_PARAMETERS = ("geom_friction_slide", "actuator_gear", "link_mass")
+SUPPORTED_PARAMETERS = (
+    "geom_friction_slide",
+    "actuator_gear",
+    "link_mass",
+    "gravity_z",
+    "dof_damping",
+    "pole_length",
+)
 HALFCHEETAH_ACTUATOR_NAMES = (
     "bthigh",
     "bshin",
@@ -38,6 +46,9 @@ ACTUATOR_NAMES_BY_ENV = {
     "halfcheetah": HALFCHEETAH_ACTUATOR_NAMES,
     "inverted_pendulum": ("slide",),
     "walker2d": WALKER2D_ACTUATOR_NAMES,
+}
+DOF_NAMES_BY_ENV = {
+    "inverted_pendulum": ("slider", "hinge"),
 }
 DEFAULT_TOLERANCE = 1e-4
 
@@ -161,6 +172,17 @@ def validate_continual_dynamics_config(
                 np.asarray(jax.device_get(base_sys.link.inertia.mass), dtype=np.float64),
                 "link_mass",
             )
+        elif name == "gravity_z":
+            _validate_gravity_z_config(param_config, base_sys)
+        elif name == "dof_damping":
+            _validate_named_vector_config(
+                param_config,
+                _dof_names(env_name),
+                np.asarray(jax.device_get(base_sys.dof.damping), dtype=np.float64),
+                "dof_damping",
+            )
+        elif name == "pole_length":
+            _validate_pole_length_config(param_config, env_name, base_sys)
 
     return config.switch_every_env_steps // rollout_env_steps
 
@@ -212,6 +234,24 @@ def make_dynamics_task(
                 tuple(base_sys.link_names),
                 param_config["ranges"],
             )
+        elif name == "gravity_z":
+            values[name] = _sample_uniform(
+                param_key,
+                float(param_config["min"]),
+                float(param_config["max"]),
+            )
+        elif name == "dof_damping":
+            values[name] = _sample_named_ranges(
+                param_key,
+                _dof_names(config.env_name),
+                param_config["ranges"],
+            )
+        elif name == "pole_length":
+            values[name] = _sample_uniform(
+                param_key,
+                float(param_config["min"]),
+                float(param_config["max"]),
+            )
 
     return DynamicsTask(task_index=task_index, is_default=False, values=values)
 
@@ -239,6 +279,17 @@ def default_task_values(
                 link_name: float(mass[i])
                 for i, link_name in enumerate(base_sys.link_names)
             }
+        elif name == "gravity_z":
+            gravity = np.asarray(jax.device_get(base_sys.gravity), dtype=np.float64)
+            values[name] = float(gravity[2])
+        elif name == "dof_damping":
+            damping = np.asarray(jax.device_get(base_sys.dof.damping), dtype=np.float64)
+            values[name] = {
+                dof_name: float(damping[i])
+                for i, dof_name in enumerate(_dof_names(config.env_name))
+            }
+        elif name == "pole_length":
+            values[name] = _default_pole_length(base_sys)
     return values
 
 
@@ -274,6 +325,26 @@ def apply_dynamics_task(base_sys: Any, task: DynamicsTask) -> Any:
             i=jnp.asarray(base_sys.link.inertia.i) * mass_ratio[:, None, None],
         )
         sys = sys.replace(link=sys.link.replace(inertia=inertia))
+
+    if "gravity_z" in task.values:
+        gravity = jnp.asarray(sys.gravity).at[2].set(float(task.values["gravity_z"]))
+        sys = sys.replace(gravity=gravity)
+
+    if "dof_damping" in task.values:
+        damping_values = _ordered_named_values(
+            task.values["dof_damping"],
+            _dof_names_for_task(task.values["dof_damping"]),
+            "dof_damping",
+        )
+        damping = jnp.asarray(damping_values, dtype=jnp.asarray(sys.dof.damping).dtype)
+        sys = sys.replace(dof=sys.dof.replace(damping=damping))
+
+    if "pole_length" in task.values:
+        sys = _apply_inverted_pendulum_pole_length(
+            sys,
+            base_sys,
+            float(task.values["pole_length"]),
+        )
 
     return sys
 
@@ -331,17 +402,64 @@ def _actuator_names(env_name: str) -> Tuple[str, ...]:
         raise ValueError(f"Unsupported continual dynamics env: {env_name!r}") from exc
 
 
+def _dof_names(env_name: str) -> Tuple[str, ...]:
+    try:
+        return DOF_NAMES_BY_ENV[env_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Continual dynamics dof_damping is not configured for env {env_name!r}."
+        ) from exc
+
+
 def _ordered_actuator_gear_values(values: Dict[str, Any]) -> Tuple[float, ...]:
     if not isinstance(values, dict):
         raise ValueError("actuator_gear task values must be a mapping.")
 
+    return _ordered_named_values(
+        values,
+        _actuator_names_for_task(values),
+        "actuator_gear",
+    )
+
+
+def _ordered_named_values(
+    values: Dict[str, Any],
+    names: Tuple[str, ...],
+    label: str,
+) -> Tuple[float, ...]:
+    if not isinstance(values, dict):
+        raise ValueError(f"{label} task values must be a mapping.")
+
+    value_keys = set(values)
+    if value_keys == set(names):
+        return tuple(float(values[name]) for name in names)
+
+    raise ValueError(
+        f"{label} task values keys do not match expected names; "
+        f"expected {sorted(names)}, got {sorted(value_keys)}."
+    )
+
+
+def _actuator_names_for_task(values: Dict[str, Any]) -> Tuple[str, ...]:
     value_keys = set(values)
     for names in ACTUATOR_NAMES_BY_ENV.values():
         if value_keys == set(names):
-            return tuple(float(values[name]) for name in names)
+            return names
 
     raise ValueError(
         "actuator_gear task values keys do not match any supported env; "
+        f"got {sorted(value_keys)}."
+    )
+
+
+def _dof_names_for_task(values: Dict[str, Any]) -> Tuple[str, ...]:
+    value_keys = set(values)
+    for names in DOF_NAMES_BY_ENV.values():
+        if value_keys == set(names):
+            return names
+
+    raise ValueError(
+        "dof_damping task values keys do not match any supported env; "
         f"got {sorted(value_keys)}."
     )
 
@@ -373,6 +491,33 @@ def _validate_geom_friction_config(param_config: Dict[str, Any], base_sys: Any) 
         float(param_config.get("default")),
         float(slide[0]),
         "geom_friction_slide.default",
+    )
+
+
+def _validate_gravity_z_config(param_config: Dict[str, Any], base_sys: Any) -> None:
+    _require_scalar_range(param_config, "gravity_z")
+    gravity = np.asarray(jax.device_get(base_sys.gravity), dtype=np.float64)
+    _assert_default_close(
+        float(param_config.get("default")),
+        float(gravity[2]),
+        "gravity_z.default",
+    )
+
+
+def _validate_pole_length_config(
+    param_config: Dict[str, Any],
+    env_name: str,
+    base_sys: Any,
+) -> None:
+    if env_name != "inverted_pendulum":
+        raise ValueError("pole_length is only configured for inverted_pendulum.")
+    _require_scalar_range(param_config, "pole_length")
+    if float(param_config["min"]) <= 0.0:
+        raise ValueError("pole_length min must be positive.")
+    _assert_default_close(
+        float(param_config.get("default")),
+        _default_pole_length(base_sys),
+        "pole_length.default",
     )
 
 
@@ -434,3 +579,90 @@ def _assert_default_close(config_value: float, actual_value: float, label: str) 
             f"Stale default for {label}: config has {config_value}, "
             f"loaded Brax system has {actual_value}."
         )
+
+
+def _link_index(sys: Any, link_name: str) -> int:
+    try:
+        return tuple(sys.link_names).index(link_name)
+    except ValueError as exc:
+        raise ValueError(f"Expected link {link_name!r} in system.") from exc
+
+
+def _pole_geom_index(sys: Any) -> int:
+    pole_idx = _link_index(sys, "pole")
+    geom_bodyid = np.asarray(sys.geom_bodyid)
+    matches = np.flatnonzero(geom_bodyid == pole_idx + 1)
+    if len(matches) != 1:
+        raise ValueError(
+            "Expected exactly one pole geom for inverted_pendulum; "
+            f"found {len(matches)}."
+        )
+    return int(matches[0])
+
+
+def _default_pole_length(sys: Any) -> float:
+    geom_idx = _pole_geom_index(sys)
+    geom_size = np.asarray(jax.device_get(sys.geom_size), dtype=np.float64)
+    return float(2.0 * geom_size[geom_idx, 1])
+
+
+def _apply_inverted_pendulum_pole_length(
+    sys: Any,
+    base_sys: Any,
+    pole_length: float,
+) -> Any:
+    if pole_length <= 0.0:
+        raise ValueError("pole_length must be positive.")
+
+    pole_idx = _link_index(base_sys, "pole")
+    geom_idx = _pole_geom_index(base_sys)
+    default_length = _default_pole_length(base_sys)
+    length_ratio = pole_length / default_length
+    inertia_length_scale = length_ratio * length_ratio
+
+    inertia = sys.link.inertia
+    inertia_pos = jnp.asarray(inertia.transform.pos)
+    new_pole_com = (
+        jnp.asarray(base_sys.link.inertia.transform.pos[pole_idx]) * length_ratio
+    )
+    inertia_transform = inertia.transform.replace(
+        pos=inertia_pos.at[pole_idx].set(new_pole_com)
+    )
+
+    inertia_i = jnp.asarray(inertia.i)
+    pole_i = inertia_i[pole_idx]
+    pole_i = pole_i.at[0, 0].set(pole_i[0, 0] * inertia_length_scale)
+    pole_i = pole_i.at[1, 1].set(pole_i[1, 1] * inertia_length_scale)
+    inertia_i = inertia_i.at[pole_idx].set(pole_i)
+    inertia = inertia.replace(transform=inertia_transform, i=inertia_i)
+
+    geom_pos = jnp.asarray(sys.geom_pos)
+    new_geom_pos = jnp.asarray(base_sys.geom_pos[geom_idx]) * length_ratio
+    geom_pos = geom_pos.at[geom_idx].set(new_geom_pos)
+
+    geom_size = jnp.asarray(sys.geom_size)
+    base_geom_size = jnp.asarray(base_sys.geom_size[geom_idx])
+    new_half_length = base_geom_size[1] * length_ratio
+    geom_size = geom_size.at[geom_idx, 1].set(new_half_length)
+
+    geom_rbound = jnp.asarray(sys.geom_rbound)
+    new_rbound = base_geom_size[0] + new_half_length
+    geom_rbound = geom_rbound.at[geom_idx].set(new_rbound)
+
+    mj_model = None
+    if sys.mj_model is not None:
+        mj_model = copy.copy(sys.mj_model)
+        mj_model.geom_pos[geom_idx] = np.asarray(jax.device_get(new_geom_pos))
+        mj_model.geom_size[geom_idx] = np.asarray(jax.device_get(geom_size[geom_idx]))
+        mj_model.geom_rbound[geom_idx] = float(jax.device_get(new_rbound))
+        body_id = int(np.asarray(base_sys.geom_bodyid)[geom_idx])
+        mj_model.body_ipos[body_id] = np.asarray(jax.device_get(new_pole_com))
+        mj_model.body_inertia[body_id] = np.diag(np.asarray(jax.device_get(pole_i)))
+
+    return sys.replace(
+        link=sys.link.replace(inertia=inertia),
+        geom_pos=geom_pos,
+        geom_size=geom_size,
+        geom_rbound=geom_rbound,
+        mj_model=mj_model,
+    )

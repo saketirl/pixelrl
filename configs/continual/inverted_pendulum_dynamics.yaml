@@ -15,28 +15,74 @@ seed: null
 # Task 0 always uses the loaded Brax defaults. Sampling starts at task_index=1.
 first_task_uses_defaults: true
 
+# Transition model:
+# - A task transition happens only between PPO rollouts. The optimizer,
+#   network, rollout length, and PPO hyperparameters are unchanged.
+# - Task 0 is the exact Brax XML. Tasks 1..N are independently sampled from the
+#   ranges below and are applied as a new Brax System.
+# - Some knobs are stronger than others. Actuator gear is mostly an input-gain
+#   change: the policy can often compensate by rescaling its action. Mass is
+#   somewhat stronger, but with fixed geometry it still gives a smooth family of
+#   cart-pole coefficients. Gravity, joint damping, and pole length change the
+#   falling time scale, velocity feedback, COM location, inertia, and rendered
+#   pole geometry, so they are better probes for loss of plasticity.
+# - Geom slide friction is kept here for documentation, but it is disabled by
+#   default because this inverted-pendulum XML has contact disabled on the
+#   default geoms; it is not expected to materially affect the joint dynamics.
 parameters:
   geom_friction_slide:
-    enabled: true
-    # default: 1.0, from sys.geom_friction[:, 0]
+    enabled: false
+    # Weak/no-op for this asset: geoms use contype="0", so contact friction is
+    # not the rail/joint damping that controls the cart-pole.
     default: 1.0
     min: 0.5
     max: 2.5
 
   actuator_gear:
     enabled: true
-    # default actuator gear from the inverted_pendulum slide motor.
+    # Mostly an action-scale/input-gain perturbation. Keep enabled as a mild
+    # control-authority change, but do not rely on it alone to create hard task
+    # transitions.
     defaults:
       slide: 100.0
     ranges:
-      slide: [50.0, 150.0]
+      slide: [40.0, 140.0]
 
   link_mass:
     enabled: true
-    # defaults from sys.link.inertia.mass: cart=10.4719753, pole=5.0185914
+    # Smooth dynamics coefficient change. This is more meaningful than gear,
+    # but still easier than changing the pole geometry or natural time scale.
     defaults:
       cart: 10.4719753
       pole: 5.0185914
     ranges:
-      cart: [7.3304, 13.6136]
-      pole: [3.5130, 6.5242]
+      cart: [6.0, 16.0]
+      pole: [2.5, 8.0]
+
+  gravity_z:
+    enabled: true
+    # Changes the unstable pole eigenvalue. More negative values make the pole
+    # fall faster; less negative values slow the system down.
+    default: -9.81
+    min: -18.0
+    max: -7.0
+
+  dof_damping:
+    enabled: true
+    # Directly changes velocity-dependent feedback terms. Hinge damping is a
+    # stronger angular-dynamics perturbation than contact friction here.
+    defaults:
+      slider: 1.0
+      hinge: 1.0
+    ranges:
+      slider: [0.25, 6.0]
+      hinge: [0.25, 4.0]
+
+  pole_length:
+    enabled: true
+    # Full capsule length. This changes pole COM, pole inertia, visual geometry,
+    # and the cart-pole coupling terms, so it should be harder than a scalar
+    # action-gain remap.
+    default: 0.6
+    min: 0.35
+    max: 0.9
