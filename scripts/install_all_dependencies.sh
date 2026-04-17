@@ -6,10 +6,6 @@ cd /home/ubuntu/pixelenvs/pixelrl
 git clone https://github.com/saketirl/pixelrl.git .
 git submodule update --init --recursive
 
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install python3.9 python3.9-venv
-
 uv add "jax[cuda12_pip]==0.4.30"
 
 uv add flax==0.8.2 \
@@ -25,7 +21,7 @@ uv add flax==0.8.2 \
 
 uv add mujoco==3.2.6 mujoco-mjx==3.2.6
 
-export PYTHONPATH="/home/ubuntu/pixelenvs/pixelrl/pixelbrax/brax:${PYTHONPATH}"
+export PYTHONPATH="/home/saket/pixelenvs/pixelrl/pixelbrax/brax:${PYTHONPATH}"
 
 uv run python -m wandb login 9fb4ba17a708de72496774b2e25d219f07de038d
 
