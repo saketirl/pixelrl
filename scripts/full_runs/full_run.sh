@@ -29,7 +29,7 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 

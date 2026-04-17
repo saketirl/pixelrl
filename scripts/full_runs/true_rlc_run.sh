@@ -170,7 +170,7 @@ else
 fi
 
 cd "${REPO_ROOT}"
-uv run python "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" \
+uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
   "${OPT_ARGS[@]}"
