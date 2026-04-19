@@ -1,10 +1,10 @@
 """Shared model components for PPO pixel experiments."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from flax import linen as nn
-from flax.linen.initializers import constant, orthogonal
+from flax.linen.initializers import constant, lecun_normal, orthogonal
 import jax.numpy as jnp
 import numpy as np
 
@@ -34,6 +34,141 @@ class ViTConfig:
     drq_apply_output_tanh: bool = False
     proj_dim: int = 512
 
+
+
+
+class HiddenActivation(nn.Module):
+    """Configurable encoder bottleneck activation."""
+
+    hidden_activation: str = "tanh"
+    tanh_scale: float = 0.5
+    alpha: float = 0.1
+    beta_init: float = 1.0
+
+    @nn.compact
+    def __call__(self, hidden: jnp.ndarray) -> jnp.ndarray:
+        act = self.hidden_activation.lower()
+        if act == "tanh":
+            return nn.tanh(self.tanh_scale * hidden)
+        if act in {"swish", "silu"}:
+            return nn.swish(hidden)
+        if act in {"swish_tanh", "swishtanh"}:
+            hidden = nn.swish(hidden)
+            hidden = nn.Dense(
+                hidden.shape[-1],
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name="swish_tanh_dense",
+            )(hidden)
+            hidden = nn.LayerNorm(name="swish_tanh_ln")(hidden)
+            return nn.tanh(self.tanh_scale * hidden)
+        if act in {"swish_ta", "swishta"}:
+            return nn.sigmoid(hidden) * (hidden + 2.0 * self.alpha) - self.alpha
+        if act in {"swish_tb", "swishtb"}:
+            beta = self.param("beta", lambda key, shape: jnp.full(shape, self.beta_init, dtype=hidden.dtype), (1,))
+            return nn.sigmoid(beta * hidden) * (hidden + 2.0 * self.alpha) - self.alpha
+        if act in {"swish_tc", "swishtc"}:
+            beta = self.param("beta", lambda key, shape: jnp.full(shape, self.beta_init, dtype=hidden.dtype), (1,))
+            return nn.sigmoid(beta * hidden) * (hidden + 2.0 * self.alpha / beta) - self.alpha / beta
+        raise ValueError(
+            f"Unsupported hidden_activation={self.hidden_activation!r}. Expected 'tanh', 'swish', 'silu', 'swish_tanh', 'swish_ta', 'swish_tb', or 'swish_tc'."
+        )
+
+
+class ResidualBlock(nn.Module):
+    """Residual block used by the IMPALA-style ResNet encoder."""
+
+    channels: int
+    kernel_init_fn: nn.initializers.Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        inputs = x
+        x = nn.relu(x)
+        x = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            kernel_init=self.kernel_init_fn,
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            kernel_init=self.kernel_init_fn,
+            bias_init=constant(0.0),
+        )(x)
+        return x + inputs
+
+
+class ConvSequence(nn.Module):
+    """Conv + pool + two residual blocks, matching the DEAC PPO encoder."""
+
+    channels: int
+    kernel_init_fn_conv: nn.initializers.Initializer = lecun_normal()
+    kernel_init_fn_resblock: nn.initializers.Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            kernel_init=self.kernel_init_fn_conv,
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
+        x = ResidualBlock(
+            self.channels,
+            kernel_init_fn=self.kernel_init_fn_resblock,
+        )(x)
+        x = ResidualBlock(
+            self.channels,
+            kernel_init_fn=self.kernel_init_fn_resblock,
+        )(x)
+        return x
+
+
+class ResNetBase(nn.Module):
+    """Shared IMPALA-style encoder adapted from DEAC's Brax PPO implementation."""
+
+    channels: Sequence[int] = (16, 32, 32)
+    hiddens: Sequence[int] = (256,)
+    conv_kernel_init: nn.initializers.Initializer = lecun_normal()
+    resblock_kernel_init: nn.initializers.Initializer = lecun_normal()
+    dense_kernel_init: nn.initializers.Initializer = orthogonal(np.sqrt(2))
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        for channels in self.channels:
+            x = ConvSequence(
+                channels=channels,
+                kernel_init_fn_conv=self.conv_kernel_init,
+                kernel_init_fn_resblock=self.resblock_kernel_init,
+            )(x)
+
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+
+        dense_pre_ln = None
+        for hidden in self.hiddens:
+            dense_pre_ln = nn.Dense(
+                hidden,
+                kernel_init=self.dense_kernel_init,
+                bias_init=constant(0.0),
+            )(x)
+            x = nn.relu(dense_pre_ln)
+
+        if return_intermediates:
+            return {
+                "hidden": x,
+                "dense_pre_ln": dense_pre_ln,
+            }
+        return x
 
 class AddPositionEmbs(nn.Module):
     """Adds learned positional embeddings to token embeddings."""
@@ -438,9 +573,10 @@ class CNNEncoder(nn.Module):
     """CNN encoder for pixel observations with LayerNorm for stability."""
 
     tanh_scale: float = 0.5
+    hidden_activation: str = "tanh"
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_intermediates: bool = False):
         x = x.astype(jnp.float32) / 255.0
 
         x = nn.Conv(
@@ -477,10 +613,613 @@ class CNNEncoder(nn.Module):
         x = nn.relu(x)
 
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        hidden = nn.LayerNorm()(dense_pre_ln)
+        hidden = HiddenActivation(
+            hidden_activation=self.hidden_activation,
+            tanh_scale=self.tanh_scale,
+            name="hidden_activation",
+        )(hidden)
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "dense_pre_ln": dense_pre_ln,
+            }
+        return hidden
+
+
+class CNNSwishTanhEncoder(nn.Module):
+    """CNN encoder with a two-stage swish-then-tanh bottleneck."""
+
+    tanh_scale: float = 0.5
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
         x = nn.LayerNorm()(x)
-        x = nn.tanh(self.tanh_scale * x)
-        return x
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        stage1_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_stage1",
+        )(x)
+        stage1_hidden = nn.LayerNorm(name="ln_stage1")(stage1_dense_pre_ln)
+        stage1_hidden = nn.swish(stage1_hidden)
+
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_stage2",
+        )(stage1_hidden)
+        hidden = nn.LayerNorm(name="ln_stage2")(dense_pre_ln)
+        hidden = nn.tanh(self.tanh_scale * hidden)
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "dense_pre_ln": dense_pre_ln,
+                "stage1_hidden": stage1_hidden,
+                "stage1_dense_pre_ln": stage1_dense_pre_ln,
+            }
+        return hidden
+
+
+
+class CNNSwishTanhResidualEncoder(nn.Module):
+    """CNN encoder with a stage-1 swish bottleneck and residual tanh correction."""
+
+    tanh_scale: float = 0.5
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        stage1_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_stage1",
+        )(x)
+        stage1_hidden = nn.LayerNorm(name="ln_stage1")(stage1_dense_pre_ln)
+        stage1_hidden = nn.swish(stage1_hidden)
+
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_stage2",
+        )(stage1_hidden)
+        stage2_tanh_hidden = nn.LayerNorm(name="ln_stage2")(dense_pre_ln)
+        stage2_tanh_hidden = nn.tanh(self.tanh_scale * stage2_tanh_hidden)
+        hidden = (stage1_hidden + stage2_tanh_hidden) / jnp.sqrt(2.0)
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "dense_pre_ln": dense_pre_ln,
+                "stage1_hidden": stage1_hidden,
+                "stage1_dense_pre_ln": stage1_dense_pre_ln,
+                "stage2_tanh_hidden": stage2_tanh_hidden,
+            }
+        return hidden
+
+
+class CNNSwishTanhResidualLearnedEncoder(nn.Module):
+    """CNN encoder with a stage-1 swish bottleneck and learned tanh residual gate."""
+
+    tanh_scale: float = 0.5
+    residual_gate_init: float = 0.25
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        stage1_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_stage1",
+        )(x)
+        stage1_hidden = nn.LayerNorm(name="ln_stage1")(stage1_dense_pre_ln)
+        stage1_hidden = nn.swish(stage1_hidden)
+
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_stage2",
+        )(stage1_hidden)
+        stage2_tanh_hidden = nn.LayerNorm(name="ln_stage2")(dense_pre_ln)
+        stage2_tanh_hidden = nn.tanh(self.tanh_scale * stage2_tanh_hidden)
+        gate_logit = self.param(
+            "residual_gate_logit",
+            constant(float(np.log(self.residual_gate_init / (1.0 - self.residual_gate_init)))),
+            (),
+        )
+        residual_gate = nn.sigmoid(gate_logit)
+        hidden = (stage1_hidden + residual_gate * stage2_tanh_hidden) / jnp.sqrt(
+            1.0 + residual_gate**2
+        )
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "dense_pre_ln": dense_pre_ln,
+                "stage1_hidden": stage1_hidden,
+                "stage1_dense_pre_ln": stage1_dense_pre_ln,
+                "stage2_tanh_hidden": stage2_tanh_hidden,
+                "residual_gate": residual_gate,
+            }
+        return hidden
+
+
+class SplitActorCriticCNNEncoder(nn.Module):
+    """CNN encoder with a shared trunk and separate actor/critic bottlenecks."""
+
+    tanh_scale: float = 0.5
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+
+        actor_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="actor_dense",
+        )(x)
+        actor_hidden = nn.LayerNorm(name="actor_ln")(actor_dense_pre_ln)
+        actor_hidden = nn.tanh(self.tanh_scale * actor_hidden)
+
+        critic_dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="critic_dense",
+        )(x)
+        critic_hidden = nn.LayerNorm(name="critic_ln")(critic_dense_pre_ln)
+        critic_hidden = nn.tanh(self.tanh_scale * critic_hidden)
+
+        if return_intermediates:
+            return {
+                "hidden": actor_hidden,
+                "dense_pre_ln": actor_dense_pre_ln,
+                "actor_hidden": actor_hidden,
+                "critic_hidden": critic_hidden,
+                "actor_dense_pre_ln": actor_dense_pre_ln,
+                "critic_dense_pre_ln": critic_dense_pre_ln,
+            }
+        return actor_hidden, critic_hidden
+
+
+class SeparateActorCriticCNNEncoder(nn.Module):
+    """Fully separate CNN encoders for actor and critic."""
+
+    tanh_scale: float = 0.5
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        actor_encoder = CNNEncoder(
+            tanh_scale=self.tanh_scale,
+            hidden_activation="tanh",
+            name="actor_encoder",
+        )
+        critic_encoder = CNNEncoder(
+            tanh_scale=self.tanh_scale,
+            hidden_activation="tanh",
+            name="critic_encoder",
+        )
+
+        if return_intermediates:
+            actor_debug = actor_encoder(x, return_intermediates=True)
+            critic_debug = critic_encoder(x, return_intermediates=True)
+            return {
+                "hidden": actor_debug["hidden"],
+                "dense_pre_ln": actor_debug["dense_pre_ln"],
+                "actor_hidden": actor_debug["hidden"],
+                "critic_hidden": critic_debug["hidden"],
+                "actor_dense_pre_ln": actor_debug["dense_pre_ln"],
+                "critic_dense_pre_ln": critic_debug["dense_pre_ln"],
+            }
+
+        actor_hidden = actor_encoder(x)
+        critic_hidden = critic_encoder(x)
+        return actor_hidden, critic_hidden
+
+
+class CRATEFeedForward(nn.Module):
+    """CRATE-style FeedForward layer implementing an ISTA step."""
+
+    dim: int
+    step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        weight = self.param(
+            "weight",
+            nn.initializers.kaiming_uniform(),
+            (self.dim, self.dim),
+        )
+        x1 = x @ weight.T
+        grad_1 = x1 @ weight
+        grad_2 = x @ weight
+        grad_update = self.step_size * (grad_2 - grad_1)
+        return nn.swish(x + grad_update)
+
+
+class CRATECNNEncoder(nn.Module):
+    """Compact CNN encoder with a CRATE policy-facing bottleneck."""
+
+    crate_step_size: float = 0.1
+    tanh_scale: float = 0.5
+    residual_scale: float = 0.0
+    apply_output_tanh: bool = False
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        pre_crate_hidden = nn.LayerNorm()(dense_pre_ln)
+        hidden = CRATEFeedForward(
+            dim=512,
+            step_size=self.crate_step_size,
+            name="crate_block",
+        )(pre_crate_hidden)
+        crate_hidden = hidden
+        tanh_hidden = None
+        residual_hidden = None
+        if self.apply_output_tanh:
+            tanh_hidden = nn.LayerNorm(name="post_crate_ln")(hidden)
+            tanh_hidden = nn.tanh(self.tanh_scale * tanh_hidden)
+            hidden = tanh_hidden
+            if self.residual_scale != 0.0:
+                residual_hidden = nn.LayerNorm(name="residual_ln")(crate_hidden)
+                hidden = tanh_hidden + self.residual_scale * residual_hidden
+
+        if return_intermediates:
+            intermediates = {
+                "hidden": hidden,
+                "crate_hidden": crate_hidden,
+                "pre_crate_hidden": pre_crate_hidden,
+                "dense_pre_ln": dense_pre_ln,
+            }
+            if tanh_hidden is not None:
+                intermediates["tanh_hidden"] = tanh_hidden
+            if residual_hidden is not None:
+                intermediates["residual_hidden"] = residual_hidden
+                intermediates["residual_scale"] = jnp.asarray(self.residual_scale)
+            return intermediates
+        return hidden
+
+
+class ProjectedSIGRegCNNEncoder(nn.Module):
+    """CNN encoder with optional CRATE block before a learned projector."""
+
+    tanh_scale: float = 0.5
+    proj_dim: int = 64
+    use_crate_block: bool = False
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        dense_pre_ln = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        z_raw = nn.LayerNorm()(dense_pre_ln)
+        z_raw = nn.tanh(self.tanh_scale * z_raw)
+
+        z_structured = z_raw
+        if self.use_crate_block:
+            z_structured = CRATEFeedForward(
+                dim=512,
+                step_size=self.crate_step_size,
+                name="crate_block",
+            )(z_structured)
+
+        projector_pre_ln = nn.Dense(
+            self.proj_dim,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="projector",
+        )(z_structured)
+        u = nn.LayerNorm(name="projector_ln")(projector_pre_ln)
+
+        if return_intermediates:
+            return {
+                "hidden": u,
+                "dense_pre_ln": dense_pre_ln,
+                "z_raw": z_raw,
+                "z_structured": z_structured,
+                "projector_pre_ln": projector_pre_ln,
+                "u": u,
+            }
+        return u
+
+
+class InnovationCNNEncoder(nn.Module):
+    """CNN encoder with an auxiliary innovation projector branch."""
+
+    tanh_scale: float = 0.5
+    innovation_proj_dim: int = 64
+    use_crate_block: bool = False
+    crate_step_size: float = 0.1
+    policy_on_projected: bool = False
+    hidden_activation: str = "tanh"
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        x = x.astype(jnp.float32) / 255.0
+
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.LayerNorm()(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))
+        dense_pre_ln = nn.Dense(
+            512,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        hidden = nn.LayerNorm()(dense_pre_ln)
+        hidden = HiddenActivation(hidden_activation=self.hidden_activation, tanh_scale=self.tanh_scale, name="hidden_activation")(hidden)
+
+        structured_hidden = hidden
+        if self.use_crate_block:
+            structured_hidden = CRATEFeedForward(
+                dim=512,
+                step_size=self.crate_step_size,
+                name="crate_block",
+            )(structured_hidden)
+
+        projector_pre_ln = nn.Dense(
+            self.innovation_proj_dim,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="innovation_projector",
+        )(structured_hidden)
+        u = projector_pre_ln
+        policy_hidden = u if self.policy_on_projected else hidden
+
+        if return_intermediates:
+            return {
+                "hidden": hidden,
+                "structured_hidden": structured_hidden,
+                "policy_hidden": policy_hidden,
+                "dense_pre_ln": dense_pre_ln,
+                "u": u,
+                "projector_pre_ln": projector_pre_ln,
+            }
+        return policy_hidden
 
 
 class MLPEncoder(nn.Module):
@@ -504,15 +1243,82 @@ class MLPEncoder(nn.Module):
         return x
 
 
+
 def build_encoder(
     encoder_type: str,
     tanh_scale: float = 0.5,
     vit_config: Optional[ViTConfig] = None,
+    sigreg_proj_dim: int = 64,
+    innovation_proj_dim: int = 64,
+    use_crate_block: bool = False,
+    crate_step_size: float = 0.1,
+    innovation_hidden_activation: str = "tanh",
+    residual_scale: float = 0.1,
 ) -> nn.Module:
     """Build an encoder module by name."""
     kind = encoder_type.lower()
+    if kind == "resnet":
+        return ResNetBase()
     if kind == "cnn":
-        return CNNEncoder(tanh_scale=tanh_scale)
+        return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="tanh")
+    if kind == "cnn_swish":
+        return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="swish")
+    if kind == "cnn_swish_ta":
+        return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="swish_ta")
+    if kind == "cnn_swish_tb":
+        return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="swish_tb")
+    if kind == "cnn_swish_tc":
+        return CNNEncoder(tanh_scale=tanh_scale, hidden_activation="swish_tc")
+    if kind in {"crate_cnn", "cratecnn"}:
+        return CRATECNNEncoder(crate_step_size=crate_step_size)
+    if kind in {"crate_cnn_tanh", "cratecnn_tanh", "cratecnntanh"}:
+        return CRATECNNEncoder(
+            crate_step_size=crate_step_size,
+            tanh_scale=tanh_scale,
+            apply_output_tanh=True,
+        )
+    if kind in {"crate_cnn_tanh_resid", "cratecnn_tanh_resid", "cratecnntanhresid"}:
+        return CRATECNNEncoder(
+            crate_step_size=crate_step_size,
+            tanh_scale=tanh_scale,
+            residual_scale=residual_scale,
+            apply_output_tanh=True,
+        )
+    if kind == "cnn_swish_tanh":
+        return CNNSwishTanhEncoder(tanh_scale=tanh_scale)
+    if kind == "cnn_swish_tanh_resid":
+        return CNNSwishTanhResidualEncoder(tanh_scale=tanh_scale)
+    if kind == "cnn_swish_tanh_resid_learned":
+        return CNNSwishTanhResidualLearnedEncoder(tanh_scale=tanh_scale)
+    if kind == "split_cnn":
+        return SplitActorCriticCNNEncoder(tanh_scale=tanh_scale)
+    if kind == "separate_cnn":
+        return SeparateActorCriticCNNEncoder(tanh_scale=tanh_scale)
+    if kind == "sigreg_cnn":
+        return ProjectedSIGRegCNNEncoder(
+            tanh_scale=tanh_scale,
+            proj_dim=sigreg_proj_dim,
+            use_crate_block=use_crate_block,
+            crate_step_size=crate_step_size,
+        )
+    if kind == "innovation_cnn":
+        return InnovationCNNEncoder(
+            tanh_scale=tanh_scale,
+            innovation_proj_dim=innovation_proj_dim,
+            use_crate_block=use_crate_block,
+            crate_step_size=crate_step_size,
+            policy_on_projected=False,
+            hidden_activation=innovation_hidden_activation,
+        )
+    if kind == "innovation_direct_cnn":
+        return InnovationCNNEncoder(
+            tanh_scale=tanh_scale,
+            innovation_proj_dim=innovation_proj_dim,
+            use_crate_block=use_crate_block,
+            crate_step_size=crate_step_size,
+            policy_on_projected=True,
+            hidden_activation=innovation_hidden_activation,
+        )
     if kind == "mlp":
         return MLPEncoder(tanh_scale=tanh_scale)
     if kind == "vit":
@@ -565,5 +1371,5 @@ def build_encoder(
             apply_output_tanh=cfg.drq_apply_output_tanh,
         )
     raise ValueError(
-        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
+        f"Unknown encoder_type='{encoder_type}'. Expected one of: ['resnet', 'cnn', 'cnn_swish', 'cnn_swish_ta', 'cnn_swish_tb', 'cnn_swish_tc', 'crate_cnn', 'crate_cnn_tanh', 'crate_cnn_tanh_resid', 'cnn_swish_tanh', 'cnn_swish_tanh_resid', 'cnn_swish_tanh_resid_learned', 'split_cnn', 'separate_cnn', 'sigreg_cnn', 'innovation_cnn', 'innovation_direct_cnn', 'mlp', 'vit', 'hybrid_vit', 'drq_vit']"
     )

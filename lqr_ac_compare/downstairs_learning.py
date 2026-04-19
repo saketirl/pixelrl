@@ -5,17 +5,23 @@ from typing import Dict
 Array = np.ndarray
 
 
-def cayley_retract_stiefel(X: Array, G: Array, eta: float) -> Array:
+def cayley_retract_stiefel(X: Array, G: Array, eta: float, eps: float = 1e-8) -> Array:
     """
     Cayley retraction for Stiefel X ∈ R^{n×p} with X^T X = I_p.
       A = G X^T - X G^T ∈ R^{n×n} skew-symmetric
       X+ = (I + (eta/2)A)^{-1} (I - (eta/2)A) X
+
+    Added regularization for numerical stability.
     """
     n, _ = X.shape
     I = np.eye(n, dtype=X.dtype)
     A = G @ X.T - X @ G.T
-    B = (I - 0.5 * eta * A) @ X
-    return np.linalg.solve(I + 0.5 * eta * A, B)
+    lhs = I + 0.5 * eta * A + eps * I
+    rhs = (I - 0.5 * eta * A) @ X
+    try:
+        return np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(lhs, rhs, rcond=None)[0]
 
 
 def td_error(phi_t: float, phi_tp1: float, r_t: float, psi_t: float, beta: float, dt: float) -> float:

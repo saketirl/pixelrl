@@ -1,27 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=cnn-muon-vs-stiefel
-#SBATCH --output=slurm_logs/cnn_builtin_muon_vs_stiefel_muon_%A_%a.out
+#SBATCH --job-name=stg-cratecnn-boundstd-plain-adam-allenv4
+#SBATCH --output=slurm_logs/staging_crate_cnn_meanbound_boundedstd_plainheads_adam_allenv_4seeds_%A_%a.out
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=08:00:00
 #SBATCH --mem=64GB
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-107%8
+#SBATCH --array=0-35%8
 
 set -euo pipefail
 
-# Sweep CNN PPO runs across all PixelBrax environments and 6 seeds,
-# comparing Optax built-in Muon against the existing manifold/Stiefel Muon.
+# Plain-head Adam ablation of the successful staging run.
+# Keeps the CRATECNN encoder and policy-bound setup, but does not pass
+# --use-crate-head, so actor/critic use the standard MLP heads.
 #
 # Swept:
-#   env         in {halfcheetah, walker2d, ant, humanoid, reacher, swimmer, pusher, hopper, inverted_pendulum}
-#   head_opt    in {muon, stiefel_muon}
-#   seed        in {0, 1, 2, 3, 4, 5}
+#   env  in {halfcheetah, walker2d, ant, humanoid, reacher, swimmer, pusher, hopper, inverted_pendulum}
+#   seed in {0, 1, 2, 3}
 #
-# 9 x 1 x 2 x 6 = 108 configs
+# 9 x 4 = 36 configs
 
-WANDB_PROJECT="${1:-benchmark}"
+WANDB_PROJECT="${1:-encoder}"
 WANDB_ENTITY="${2:-}"
 TOTAL_TIMESTEPS="${3:-10000000}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
@@ -42,23 +42,27 @@ else
 fi
 export PYTHONPATH="${BRAX_PYTHONPATH}:${PYTHONPATH:-}"
 
+ALT_REPO_ROOT="${REPO_ROOT}"
+if [[ "${REPO_ROOT}" == *"/.worktrees/"* ]]; then
+  ALT_REPO_ROOT="$(cd "${REPO_ROOT}/../.." && pwd)"
+fi
+
 WANDB_KEY_FILE="${REPO_ROOT}/secrets/wandb_api_key.txt"
+if [[ ! -f "${WANDB_KEY_FILE}" && -f "${ALT_REPO_ROOT}/secrets/wandb_api_key.txt" ]]; then
+  WANDB_KEY_FILE="${ALT_REPO_ROOT}/secrets/wandb_api_key.txt"
+fi
 if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
   export WANDB_API_KEY="$(cat "${WANDB_KEY_FILE}")"
 fi
 
 ENVS=(halfcheetah walker2d ant humanoid reacher swimmer pusher hopper inverted_pendulum)
 BACKENDS=(spring spring spring spring generalized generalized generalized positional generalized)
-ENCODER_TYPES=(cnn)
-OPT_CONDITIONS=(muon stiefel_muon)
-SEEDS=(0 1 2 3 4 5)
+SEEDS=(0 1 2 3)
 
 NUM_ENVS=${#ENVS[@]}
 NUM_BACKENDS=${#BACKENDS[@]}
-NUM_ENCODERS=${#ENCODER_TYPES[@]}
-NUM_OPTS=${#OPT_CONDITIONS[@]}
 NUM_SEEDS=${#SEEDS[@]}
-NUM_CONFIGS=$((NUM_ENVS * NUM_ENCODERS * NUM_OPTS * NUM_SEEDS))
+NUM_CONFIGS=$((NUM_ENVS * NUM_SEEDS))
 
 if (( NUM_ENVS != NUM_BACKENDS )); then
   echo "ENVS/BACKENDS length mismatch: ${NUM_ENVS} vs ${NUM_BACKENDS}" >&2
@@ -71,25 +75,27 @@ if (( TASK_ID < 0 || TASK_ID >= NUM_CONFIGS )); then
 fi
 
 SEED_IDX=$((TASK_ID % NUM_SEEDS))
-OPT_IDX=$(((TASK_ID / NUM_SEEDS) % NUM_OPTS))
-ENC_IDX=$(((TASK_ID / (NUM_SEEDS * NUM_OPTS)) % NUM_ENCODERS))
-ENV_IDX=$((TASK_ID / (NUM_SEEDS * NUM_OPTS * NUM_ENCODERS)))
+ENV_IDX=$((TASK_ID / NUM_SEEDS))
 
 SEED="${SEEDS[$SEED_IDX]}"
-OPT_CONDITION="${OPT_CONDITIONS[$OPT_IDX]}"
-ENCODER_TYPE="${ENCODER_TYPES[$ENC_IDX]}"
 ENV_NAME="${ENVS[$ENV_IDX]}"
 BACKEND="${BACKENDS[$ENV_IDX]}"
 
-GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="cnn_builtin_muon_vs_stiefel_muon_${GROUP_ID}"
-export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="cnn_builtin_muon_vs_stiefel_muon,encoder_${ENCODER_TYPE},opt_${OPT_CONDITION},env_${ENV_NAME},backend_${BACKEND},seed_${SEED},sweep6seeds,neurips_baselines"
+ENCODER_CRATE_STEP_SIZE="0.1"
+ACTOR_MEAN_SCALE="1.0"
+ACTOR_LOGSTD_INIT="-2.0"
+ACTOR_LOGSTD_MIN="-5.0"
+ACTOR_LOGSTD_MAX="-1.4"
 
-EXP_NAME="ppo_cmp_${ENCODER_TYPE}_${OPT_CONDITION}_${ENV_NAME}_b${BACKEND}_s${SEED}_t${TASK_ID}"
+GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
+GROUP_NAME="staging_crate_cnn_meanbound_boundedstd_plainheads_adam_allenv4_${GROUP_ID}"
+export WANDB_RUN_GROUP="${GROUP_NAME}"
+export WANDB_TAGS="staging,crate_cnn_meanbound_boundedstd,env_${ENV_NAME},backend_${BACKEND},seed_${SEED},encoder_crate_cnn,actor_mean_tanh,actor_mean_scale_${ACTOR_MEAN_SCALE},bounded_global_logstd,actor_logstd_init_${ACTOR_LOGSTD_INIT},actor_logstd_min_${ACTOR_LOGSTD_MIN},actor_logstd_max_${ACTOR_LOGSTD_MAX},opt_adam,headarch_plain,sigreg_off,encoder_crate_step_${ENCODER_CRATE_STEP_SIZE},allenv9,seeds0123,ablate_crate_head"
+
+EXP_NAME="ppo_staging_cratecnn_meanbound_boundedstd_plainheads_adam_${ENV_NAME}_b${BACKEND}_s${SEED}_t${TASK_ID}"
 
 echo "Running TASK_ID=${TASK_ID}/${NUM_CONFIGS} group=${GROUP_NAME}"
-echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=${ENCODER_TYPE} opt=${OPT_CONDITION} seed=${SEED}"
+echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=crate_cnn encoder_crate_step_size=${ENCODER_CRATE_STEP_SIZE} actor_mean_tanh=true actor_mean_scale=${ACTOR_MEAN_SCALE} bounded_global_logstd=true actor_logstd_init=${ACTOR_LOGSTD_INIT} actor_logstd_min=${ACTOR_LOGSTD_MIN} actor_logstd_max=${ACTOR_LOGSTD_MAX} crate_head=false heads_optimizer=adam sigreg=off seed=${SEED}"
 echo "Exp: ${EXP_NAME}"
 
 COMMON_ARGS=(
@@ -118,9 +124,12 @@ COMMON_ARGS=(
   --stiefel-dual-steps 5
   --actor-stiefel-max-grad-norm 100
   --critic-stiefel-max-grad-norm 1
-  --muon-ns-steps 5
-  --actor-muon-max-grad-norm 100
-  --critic-muon-max-grad-norm 1
+  --actor-mean-tanh
+  --actor-mean-scale "${ACTOR_MEAN_SCALE}"
+  --bounded-global-logstd
+  --actor-logstd-init="${ACTOR_LOGSTD_INIT}"
+  --actor-logstd-min="${ACTOR_LOGSTD_MIN}"
+  --actor-logstd-max="${ACTOR_LOGSTD_MAX}"
   --exp-name "${EXP_NAME}"
 )
 
@@ -129,38 +138,17 @@ if [[ -n "${WANDB_ENTITY}" ]]; then
 fi
 
 ARCH_ARGS=(
-  --encoder-type cnn
+  --encoder-type crate_cnn
   --encoder-lr 3e-4
   --heads-adam-lr 3e-4
-  --heads-muon-lr 0.001
   --heads-stiefel-lr 0.001
   --max-grad-norm 0.05
-  --encoder-tanh-scale 0.5
+  --encoder-crate-step-size "${ENCODER_CRATE_STEP_SIZE}"
+  --sigreg-mode off
 )
-
-OPT_ARGS=()
-if [[ "${OPT_CONDITION}" == "muon" ]]; then
-  OPT_ARGS+=(--heads-optimizer muon)
-elif [[ "${OPT_CONDITION}" == "stiefel_muon" ]]; then
-  OPT_ARGS+=(--heads-optimizer stiefel)
-else
-  echo "Unknown OPT_CONDITION=${OPT_CONDITION}" >&2
-  exit 1
-fi
 
 cd "${REPO_ROOT}"
 uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
-  "${OPT_ARGS[@]}"
-
-"""
-  - OPT_CONDITION=muon passes --heads-optimizer muon
-      - actor/critic 2D matrix params with ndim == 2 and min(shape) > 1 use Optax Muon
-      - actor/critic vectors/scalars use Adam
-      - encoder params use Adam
-  - OPT_CONDITION=stiefel_muon passes --heads-optimizer stiefel
-      - actor/critic matrix params with ndim >= 2 and min(shape) > 1 use manifold Stiefel
-      - actor/critic vectors/scalars use Adam
-      - encoder params use Adam
-"""
+  --heads-optimizer adam

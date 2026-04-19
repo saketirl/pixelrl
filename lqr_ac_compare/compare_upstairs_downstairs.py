@@ -50,15 +50,24 @@ def run_downstairs(
     eta_actor: float,
     eta_critic: float,
     exploration_std: float,
-    seed: int,
+    init_seed: int,
+    exploration_seed: int,
     return_init: bool = False,  # Return init params for upstairs matching
     use_generator: bool = False,  # Use generator-based TD error
+    use_sgd: bool = False,  # Use standard SGD instead of Cayley retraction
+    csv_path: str = None,  # Path to write intermediate results
+    log_every: int = 1,  # Write to CSV every N iterations
 ) -> Dict[str, List[float]]:
     """Run downstairs learning and return metrics."""
+    import csv
     ds, da = env.ds, env.da
 
-    actor = DownstairsActorShallowT2(ds=ds, da=da, seed=seed)
-    critic = DownstairsCriticShallowT2(ds=ds, da=da, seed=seed + 100)
+    # Use init_seed for initialization (same across runs with same LQR)
+    actor = DownstairsActorShallowT2(ds=ds, da=da, seed=init_seed)
+    critic = DownstairsCriticShallowT2(ds=ds, da=da, seed=init_seed + 100)
+
+    # Reseed env RNG for exploration (varies across runs)
+    env.rng = np.random.default_rng(exploration_seed)
 
     # Initialize Zb to H direction (compatible with Stiefel LQR)
     # H has orthonormal columns, so it's already on Stiefel
@@ -83,6 +92,16 @@ def run_downstairs(
         "mse": [],
     }
 
+    # Open CSV file for incremental writing
+    csv_file = None
+    csv_writer = None
+    if csv_path:
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['iter', 'down_reward', 'down_cos', 'down_mse'])
+
+    buffer = []  # Buffer for batch writing
+
     for it in range(iters):
         # Rollout using downstairs policy
         def policy(obs):
@@ -100,6 +119,7 @@ def run_downstairs(
             eta_actor=eta_actor,
             eta_critic=eta_critic,
             use_generator=use_generator,
+            use_sgd=use_sgd,
         )
 
         # Metrics
@@ -110,6 +130,19 @@ def run_downstairs(
         metrics["rewards"].append(mean_r)
         metrics["cos_to_opt"].append(cos)
         metrics["mse"].append(stats["mse"])
+
+        # Buffer row for CSV
+        if csv_writer:
+            buffer.append([it, mean_r, cos, stats["mse"]])
+            # Write every log_every iterations
+            if (it + 1) % log_every == 0 or it == iters - 1:
+                for row in buffer:
+                    csv_writer.writerow(row)
+                csv_file.flush()
+                buffer = []
+
+    if csv_file:
+        csv_file.close()
 
     if return_init:
         return metrics, init_params
@@ -127,7 +160,8 @@ def run_upstairs(
     eta_actor: float,
     eta_critic: float,
     exploration_std: float,
-    seed: int,
+    init_seed: int,
+    exploration_seed: int,
     init_from_downstairs: dict = None,  # For matched initialization
     use_generator: bool = False,  # Use generator-based TD error
     use_cayley: bool = True,  # Use Cayley retraction (False = standard gradient descent)
@@ -137,8 +171,12 @@ def run_upstairs(
     d, da = env.d, env.da
     ds = env.ds
 
-    actor = ActorDLN_L3(d=d, da=da, seed=seed, balanced=balanced)
-    critic = CriticDLN_L3(d=d, da=da, seed=seed + 100, balanced=balanced)
+    # Use init_seed for initialization (same across runs with same LQR)
+    actor = ActorDLN_L3(d=d, da=da, seed=init_seed, balanced=balanced)
+    critic = CriticDLN_L3(d=d, da=da, seed=init_seed + 100, balanced=balanced)
+
+    # Reseed env RNG for exploration (varies across runs)
+    env.rng = np.random.default_rng(exploration_seed)
 
     # Optimal Weff = -K @ M.T for upstairs
     Weff_opt = -K_opt @ M.T
@@ -294,20 +332,27 @@ def main():
     parser.add_argument("--dt", type=float, default=0.02)
     parser.add_argument("--T", type=float, default=10.0)
     parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument("--L", type=int, default=10, help="Multi-step horizon")
+    parser.add_argument("--n_steps", type=int, default=30, help="Multi-step horizon for bootstrapping")
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--eta_actor", type=float, default=0.01)
     parser.add_argument("--eta_critic", type=float, default=0.05)
     parser.add_argument("--exploration_std", type=float, default=0.1)
     parser.add_argument("--transition_noise", type=float, default=0.1)
     parser.add_argument("--alpha", type=float, default=0.5, help="Stability parameter (smaller = harder)")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0, help="Seed for LQR problem construction")
+    parser.add_argument("--init_seed", type=int, default=None, help="Seed for policy initialization (default: seed+1)")
+    parser.add_argument("--noise_seed", type=int, default=None, help="Seed for exploration/env noise (default: seed+2)")
     parser.add_argument("--save_plot", type=str, default="comparison_plot.png", help="Path to save plot")
     parser.add_argument("--save_csv", type=str, default="comparison_results.csv", help="Path to save CSV")
     parser.add_argument("--use_generator", action="store_true", help="Use generator-based TD error instead of multi-step")
-    parser.add_argument("--no_cayley", action="store_true", help="Disable Cayley retraction for upstairs (use standard gradient descent)")
+    parser.add_argument("--use_sgd", action="store_true", help="Use standard SGD instead of Cayley retraction (for both upstairs and downstairs)")
     parser.add_argument("--balanced", action="store_true", help="Use balanced DLN initialization (arXiv:2411.09004)")
+    parser.add_argument("--downstairs_only", action="store_true", help="Only run downstairs learning (skip upstairs)")
     args = parser.parse_args()
+
+    # Separate seeds for: LQR problem, policy init, exploration noise
+    init_seed = args.init_seed if args.init_seed is not None else args.seed + 1
+    noise_seed = args.noise_seed if args.noise_seed is not None else args.seed + 2
 
     d, ds, da = args.d, args.ds, args.da
 
@@ -326,7 +371,7 @@ def main():
     print("=" * 60)
     print("Upstairs vs Downstairs Comparison (Stiefel_Ascent_RLC.pdf)")
     print("=" * 60)
-    print(f"d={d}, ds={ds}, da={da}, dt={args.dt}, T={args.T}, L={args.L}")
+    print(f"d={d}, ds={ds}, da={da}, dt={args.dt}, T={args.T}, n_steps={args.n_steps}")
     print(f"beta={args.beta}, exploration_std={args.exploration_std}")
     print(f"eta_actor={args.eta_actor}, eta_critic={args.eta_critic}")
     print(f"\nOptimal K (latent): {K_opt.flatten()}")
@@ -339,43 +384,65 @@ def main():
     print("\n--- Running Downstairs Learning ---")
     if args.use_generator:
         print("  (Using generator-based TD error)")
+    if args.use_sgd:
+        print("  (Using standard SGD, no Cayley retraction)")
+    # Pass csv_path for incremental logging when downstairs_only
+    down_csv = args.save_csv if args.downstairs_only else None
     down_metrics, init_params = run_downstairs(
         env, K_opt,
         iters=args.iters,
-        L=args.L,
+        L=args.n_steps,
         beta=args.beta,
         dt=args.dt,
         eta_actor=args.eta_actor,
         eta_critic=args.eta_critic,
         exploration_std=args.exploration_std,
-        seed=args.seed + 1,
+        init_seed=init_seed,  # Different from LQR seed to avoid correlation
+        exploration_seed=noise_seed,  # Varies for different exploration noise
         return_init=True,
         use_generator=args.use_generator,
+        use_sgd=args.use_sgd,
+        csv_path=down_csv,
+        log_every=1,
     )
     print(f"Final reward: {down_metrics['rewards'][-1]:.4f}")
     print(f"Final cos(policy, optimal): {down_metrics['cos_to_opt'][-1]:.4f}")
+
+    if args.downstairs_only:
+        # Summary already printed, CSV already written incrementally
+        print("\n" + "=" * 60)
+        print("DOWNSTAIRS ONLY SUMMARY")
+        print("=" * 60)
+        down_final_r = np.mean(down_metrics["rewards"][-50:])
+        down_final_cos = np.mean(down_metrics["cos_to_opt"][-50:])
+        print(f"Final 50-iter average reward: {down_final_r:.4f}")
+        print(f"Final 50-iter average cos: {down_final_cos:.4f}")
+        if args.save_csv:
+            print(f"Results saved incrementally to {args.save_csv}")
+        return
 
     # Run upstairs with MATCHED initialization from downstairs
     print("\n--- Running Upstairs Learning (matched init) ---")
     if args.use_generator:
         print("  (Using generator-based TD error)")
-    if args.no_cayley:
-        print("  (Using standard gradient descent, no Cayley retraction)")
+    if args.use_sgd:
+        print("  (Using standard SGD, no Cayley retraction)")
     if args.balanced:
         print("  (Using balanced DLN initialization)")
     up_metrics = run_upstairs(
         env, K_opt, M,
         iters=args.iters,
-        L=args.L,
+        L=args.n_steps,
         beta=args.beta,
         dt=args.dt,
         eta_actor=args.eta_actor,
         eta_critic=args.eta_critic,
         exploration_std=args.exploration_std,
-        seed=args.seed + 1,
+        init_seed=init_seed,  # Different from LQR seed to avoid correlation
+        exploration_seed=noise_seed,  # Varies for different exploration noise
         init_from_downstairs=init_params if not args.balanced else None,  # balanced uses its own init
         use_generator=args.use_generator,
-        use_cayley=not args.no_cayley,
+        use_cayley=not args.use_sgd,
         balanced=args.balanced,
     )
     print(f"Final reward: {up_metrics['rewards'][-1]:.4f}")
@@ -427,7 +494,7 @@ def main():
     # Plot
     plot_comparison(down_metrics, up_metrics, save_path=args.save_plot)
 
-    # Save CSV
+    # Save CSV (every 10 steps + final)
     if args.save_csv:
         import csv
         with open(args.save_csv, 'w', newline='') as f:

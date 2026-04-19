@@ -21,7 +21,7 @@ from typing import Dict
 Array = np.ndarray
 
 
-def cayley_retract(X: Array, G: Array, eta: float) -> Array:
+def cayley_retract(X: Array, G: Array, eta: float, eps: float = 1e-8) -> Array:
     """
     Cayley retraction for matrices on Stiefel manifold.
     Moves X in direction of G (Riemannian gradient).
@@ -29,7 +29,25 @@ def cayley_retract(X: Array, G: Array, eta: float) -> Array:
     n, p = X.shape
     I = np.eye(n)
     A = G @ X.T - X @ G.T  # skew-symmetric
-    return np.linalg.solve(I + 0.5 * eta * A, (I - 0.5 * eta * A) @ X)
+    lhs = I + 0.5 * eta * A
+    # Add small regularization if needed
+    try:
+        return np.linalg.solve(lhs, (I - 0.5 * eta * A) @ X)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(lhs + eps * I, (I - 0.5 * eta * A) @ X, rcond=None)[0]
+
+
+def sgd_update(X: Array, G: Array, eta: float) -> Array:
+    """Standard gradient descent update: X <- X + eta * G"""
+    return X + eta * G
+
+
+def matrix_update(X: Array, G: Array, eta: float, use_sgd: bool = False) -> Array:
+    """Update matrix using either Cayley retraction or standard SGD."""
+    if use_sgd:
+        return sgd_update(X, G, eta)
+    else:
+        return cayley_retract(X, G, eta)
 
 
 def batch_multistep_update(
@@ -45,6 +63,7 @@ def batch_multistep_update(
     eta_actor: float,
     eta_critic: float,
     use_generator: bool = False,  # Use generator-based TD error instead of multi-step
+    use_sgd: bool = False,  # Use standard SGD instead of Cayley retraction
 ) -> Dict[str, float]:
     """
     Batch multi-step actor-critic update.
@@ -125,12 +144,12 @@ def batch_multistep_update(
         mse /= N
 
         # Apply updates
-        critic.Ub = cayley_retract(critic.Ub, G_Ub, eta_critic)
-        critic.Uc_col = cayley_retract(critic.Uc_col, G_Uc, eta_critic)
+        critic.Ub = matrix_update(critic.Ub, G_Ub, eta_critic, use_sgd)
+        critic.Uc_col = matrix_update(critic.Uc_col, G_Uc, eta_critic, use_sgd)
         critic.c = critic.c + eta_critic * G_c
-        critic.Zb = cayley_retract(critic.Zb, G_Zb, eta_critic)
+        critic.Zb = matrix_update(critic.Zb, G_Zb, eta_critic, use_sgd)
         critic.Zc_row = critic.Zc_row + eta_critic * G_Zc
-        actor.Wc_col = cayley_retract(actor.Wc_col, G_Wc, eta_actor)
+        actor.Wc_col = matrix_update(actor.Wc_col, G_Wc, eta_actor, use_sgd)
 
         return {
             "mse": float(mse),
@@ -199,9 +218,19 @@ def batch_multistep_update(
     G_c /= n_samples
     mse /= n_samples
 
-    # Update critic using Cayley retraction (for Stiefel-constrained Ub, Uc)
-    critic.Ub = cayley_retract(critic.Ub, G_Ub, eta_critic)
-    critic.Uc_col = cayley_retract(critic.Uc_col, G_Uc, eta_critic)
+    # Clip gradients to prevent overflow
+    max_grad = 1e6
+    G_Ub = np.clip(G_Ub, -max_grad, max_grad)
+    G_Uc = np.clip(G_Uc, -max_grad, max_grad)
+    G_c = np.clip(G_c, -max_grad, max_grad)
+
+    # Skip update if gradients contain NaN/Inf
+    if not (np.isfinite(G_Ub).all() and np.isfinite(G_Uc).all() and np.isfinite(G_c)):
+        return {"mse": float('inf'), "mean_advantage": 0.0, "skipped": True}
+
+    # Update critic using Cayley retraction or SGD
+    critic.Ub = matrix_update(critic.Ub, G_Ub, eta_critic, use_sgd)
+    critic.Uc_col = matrix_update(critic.Uc_col, G_Uc, eta_critic, use_sgd)
     critic.c = critic.c + eta_critic * G_c
 
     # Actor update using deterministic policy gradient (DPG):
@@ -231,8 +260,13 @@ def batch_multistep_update(
 
     G_Wc /= n_samples
 
+    # Clip actor gradient
+    G_Wc = np.clip(G_Wc, -max_grad, max_grad)
+    if not np.isfinite(G_Wc).all():
+        return {"mse": float(mse) if np.isfinite(mse) else float('inf'), "mean_advantage": 0.0, "skipped": True}
+
     # Update actor
-    actor.Wc_col = cayley_retract(actor.Wc_col, G_Wc, eta_actor)
+    actor.Wc_col = matrix_update(actor.Wc_col, G_Wc, eta_actor, use_sgd)
 
     # Also update advantage network (Zb, Zc) - learn to predict advantage
     # Psi(s, a) = s^T Zb a + Zc a
@@ -263,7 +297,7 @@ def batch_multistep_update(
     G_Zb /= n_samples
     G_Zc /= n_samples
 
-    critic.Zb = cayley_retract(critic.Zb, G_Zb, eta_critic)
+    critic.Zb = matrix_update(critic.Zb, G_Zb, eta_critic, use_sgd)
     critic.Zc_row = critic.Zc_row + eta_critic * G_Zc
 
     return {
