@@ -95,7 +95,7 @@ export WANDB_TAGS="staging,crate_cnn_meanbound_boundedstd,env_${ENV_NAME},backen
 EXP_NAME="ppo_staging_cratecnn_meanbound_boundedstd_plainheads_stiefel_${ENV_NAME}_b${BACKEND}_s${SEED}_t${TASK_ID}"
 
 echo "Running TASK_ID=${TASK_ID}/${NUM_CONFIGS} group=${GROUP_NAME}"
-echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=crate_cnn encoder_crate_step_size=${ENCODER_CRATE_STEP_SIZE} actor_mean_tanh=true actor_mean_scale=${ACTOR_MEAN_SCALE} bounded_global_logstd=true actor_logstd_init=${ACTOR_LOGSTD_INIT} actor_logstd_min=${ACTOR_LOGSTD_MIN} actor_logstd_max=${ACTOR_LOGSTD_MAX} crate_head=false heads_stiefel=true sigreg=off seed=${SEED}"
+echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=crate_cnn encoder_crate_step_size=${ENCODER_CRATE_STEP_SIZE} actor_mean_tanh=true actor_mean_scale=${ACTOR_MEAN_SCALE} bounded_global_logstd=true actor_logstd_init=${ACTOR_LOGSTD_INIT} actor_logstd_min=${ACTOR_LOGSTD_MIN} actor_logstd_max=${ACTOR_LOGSTD_MAX} crate_head=false heads_optimizer=stiefel sigreg=off seed=${SEED}"
 echo "Exp: ${EXP_NAME}"
 
 COMMON_ARGS=(
@@ -151,4 +151,4 @@ cd "${REPO_ROOT}"
 uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
-  --use-heads-stiefel
+  --heads-optimizer stiefel

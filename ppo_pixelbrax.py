@@ -42,7 +42,7 @@ os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
 
-HeadsOptimizer = Literal["auto", "adam", "stiefel", "muon"]
+HeadsOptimizer = Literal["adam", "stiefel", "muon"]
 
 
 class CRATEFeedForward(nn.Module):
@@ -115,8 +115,8 @@ class Args:
     # Learning rates
     encoder_lr: float = 3e-4
     """learning rate for encoder (Adam/AdamW)"""
-    heads_optimizer: HeadsOptimizer = "auto"
-    """head matrix optimizer: auto preserves use_heads_stiefel, or choose adam/stiefel/muon explicitly"""
+    heads_optimizer: HeadsOptimizer = "stiefel"
+    """head matrix optimizer for actor/critic matrices"""
     heads_stiefel_lr: float = 0.02
     """learning rate for actor/critic head matrices (Stiefel)"""
     heads_muon_lr: float = 1e-3
@@ -164,8 +164,6 @@ class Args:
     """logging interval (in updates)"""
 
     # Manifold Stiefel optimizer arguments
-    use_heads_stiefel: bool = True
-    """if True, use manifold Stiefel for actor/critic weight matrices; if False, use Adam for all head params"""
     use_encoder_final_stiefel: bool = False
     """if True, use manifold Stiefel for the encoder's final Dense kernel only"""
     use_encoder_upstream_stiefel: bool = False
@@ -878,18 +876,13 @@ def split_actor_critic_hiddens(encoded):
     return encoded, encoded
 
 
-def resolve_heads_optimizer(
-    heads_optimizer: str,
-    use_heads_stiefel: bool,
-) -> str:
-    """Resolve the head optimizer, preserving legacy use_heads_stiefel behavior."""
+def resolve_heads_optimizer(heads_optimizer: str) -> str:
+    """Validate and normalize the selected head matrix optimizer."""
     optimizer = heads_optimizer.lower()
-    if optimizer == "auto":
-        return "stiefel" if use_heads_stiefel else "adam"
     if optimizer not in {"adam", "stiefel", "muon"}:
         raise ValueError(
             f"Unsupported heads_optimizer='{heads_optimizer}'. "
-            "Expected one of: auto, adam, stiefel, muon."
+            "Expected one of: adam, stiefel, muon."
         )
     return optimizer
 
@@ -1143,8 +1136,7 @@ def create_optimizer(
     encoder_upstream_stiefel_lr: float = -1.0,
     encoder_stiefel_max_grad_norm: float = 1.0,
     weight_decay: float = 0.0,
-    heads_optimizer: str = "auto",
-    use_heads_stiefel: bool = True,
+    heads_optimizer: str = "stiefel",
     use_encoder_final_stiefel: bool = False,
     use_encoder_upstream_stiefel: bool = False,
     muon_ns_steps: int = 5,
@@ -1165,7 +1157,7 @@ def create_optimizer(
 
     Uses AdamW when weight_decay > 0, otherwise uses Adam.
     """
-    resolved_heads_optimizer = resolve_heads_optimizer(heads_optimizer, use_heads_stiefel)
+    resolved_heads_optimizer = resolve_heads_optimizer(heads_optimizer)
 
     # Choose Adam or AdamW based on weight_decay
     if weight_decay > 0:
@@ -1364,10 +1356,7 @@ if __name__ == "__main__":
         args.init_seed = args.seed
     if args.data_seed < 0:
         args.data_seed = args.seed
-    args.heads_optimizer = resolve_heads_optimizer(
-        args.heads_optimizer,
-        args.use_heads_stiefel,
-    )
+    args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
 
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -1418,7 +1407,6 @@ if __name__ == "__main__":
     print(f"\nOptimizer config:")
     print(f"  encoder_lr ({adam_type}): {args.encoder_lr}")
     print(f"  heads_optimizer: {args.heads_optimizer}")
-    print(f"  use_heads_stiefel (legacy auto flag): {args.use_heads_stiefel}")
     print(f"  heads_stiefel_lr (Stiefel for actor/critic matrices): {args.heads_stiefel_lr}")
     print(f"  heads_muon_lr (Optax Muon for actor/critic matrices): {args.heads_muon_lr}")
     print(f"  heads_adam_lr ({adam_type} for actor/critic vectors): {args.heads_adam_lr}")
@@ -1759,7 +1747,6 @@ if __name__ == "__main__":
         encoder_stiefel_max_grad_norm=args.encoder_stiefel_max_grad_norm,
         weight_decay=args.weight_decay,
         heads_optimizer=args.heads_optimizer,
-        use_heads_stiefel=args.use_heads_stiefel,
         use_encoder_final_stiefel=args.use_encoder_final_stiefel,
         use_encoder_upstream_stiefel=use_encoder_upstream_stiefel,
         muon_ns_steps=args.muon_ns_steps,

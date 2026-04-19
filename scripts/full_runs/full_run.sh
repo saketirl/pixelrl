@@ -16,7 +16,7 @@ set -euo pipefail
 #
 # Swept:
 #   env         in {halfcheetah, walker2d, ant, humanoid, reacher, swimmer, pusher, hopper, inverted_pendulum}
-#   head_opt    in {stiefel, adam}  (use_heads_stiefel true/false)
+#   head_opt    in {stiefel, adam}
 #   seed        in {0, 1, 2, 3, 4, 5}
 #
 # 9 x 1 x 2 x 6 = 108 configs
@@ -136,9 +136,9 @@ ARCH_ARGS=(
 
 OPT_ARGS=()
 if [[ "${OPT_CONDITION}" == "stiefel" ]]; then
-  OPT_ARGS+=(--use-heads-stiefel)
+  OPT_ARGS+=(--heads-optimizer stiefel)
 else
-  OPT_ARGS+=(--no-use-heads-stiefel)
+  OPT_ARGS+=(--heads-optimizer adam)
 fi
 
 cd "${REPO_ROOT}"

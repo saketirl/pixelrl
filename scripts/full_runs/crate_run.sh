@@ -131,4 +131,4 @@ uv run python -m wandb login 9fb4ba17a708de72496774b2e25d219f07de038d
 uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
   "${ARCH_ARGS[@]}" \
-  --no-use-heads-stiefel
+  --heads-optimizer adam
