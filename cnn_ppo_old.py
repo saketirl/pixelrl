@@ -31,7 +31,7 @@ import pixelbrax
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold MUON optimizer
-from manifold_muon_optax import manifold_muon
+from manifold_stiefel_optax import manifold_stiefel
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -506,7 +506,7 @@ def create_encoder_adam_heads_muon_optimizer(
     # MUON for actor head matrices (with separate grad clipping)
     actor_muon_tx = optax.chain(
         optax.clip_by_global_norm(actor_muon_max_grad_norm),
-        manifold_muon(
+        manifold_stiefel(
             learning_rate=heads_muon_lr,
             dual_lr=muon_dual_lr,
             dual_steps=muon_dual_steps,
@@ -518,7 +518,7 @@ def create_encoder_adam_heads_muon_optimizer(
     # MUON for critic head matrices (with separate grad clipping)
     critic_muon_tx = optax.chain(
         optax.clip_by_global_norm(critic_muon_max_grad_norm),
-        manifold_muon(
+        manifold_stiefel(
             learning_rate=heads_muon_lr,
             dual_lr=muon_dual_lr,
             dual_steps=muon_dual_steps,

@@ -36,3 +36,6 @@
 ## Security & Configuration Tips
 - Keep secrets and machine-specific settings out of committed code.
 - Pass `WANDB_API_KEY`, `PYTHONPATH`, and cluster-specific paths via environment variables or local shell config.
+
+# Full runs and hyperparameters
+The full runs and gold-standard hyperparameters are found in scripts/full_runs. Note in general, the CNN with manifold-muon on the actor/critic heads was optimal. For Humanoid and Ant which have high-dimensional underlying state space, CRATE was also needed on the actor/critic.
