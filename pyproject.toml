@@ -14,6 +14,7 @@ dependencies = [
     "jaxlib==0.4.30",
     "jaxopt>=0.8.5",
     "jaxtyping==0.2.0",
+    "matplotlib>=3.9.4",
     "mujoco==3.2.6",
     "mujoco-mjx==3.2.6",
     "navix>=0.7.4",

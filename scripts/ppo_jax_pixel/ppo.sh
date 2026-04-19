@@ -1,17 +1,21 @@
 #!/bin/bash
-
-#SBATCH --output=slurm_logs/ppo_%j.out
+#SBATCH --job-name=ppo-le-jepa-sweep
+#SBATCH --output=slurm_logs/le_jepa_%A_%a.out
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=24:00:00
+#SBATCH --time=08:00:00
 #SBATCH --mem=64GB
-#SBATCH --partition=gpu-he
 #SBATCH --gres=gpu:1
+#SBATCH --array=0-7%8
 
-# Load Python module
-module load python/3.9
-export PYTHONPATH="/users/apraka15/arjun/pixelrl/pixelbrax/brax:${PYTHONPATH}"
+set -euo pipefail
+
+export PYTHONPATH="/home/guests/arjun/pixelrl/pixelbrax/brax:${PYTHONPATH:-}"
+WANDB_KEY_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../secrets/wandb_api_key.txt"
+if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
+  export WANDB_API_KEY="$(cat "${WANDB_KEY_FILE}")"
+fi
 
 # Environment (change as needed: halfcheetah, walker2d, hopper, ant, humanoid)
 ENV_NAME=${1:-"halfcheetah"}
