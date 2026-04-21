@@ -1,6 +1,6 @@
 enabled: true
 env_name: inverted_pendulum
-backend: generalized
+backend: spring
 
 # Must be an exact multiple of n_envs * num_steps so task switches happen
 # between PPO rollouts. This is the closest aligned value to 1,000,000 for
@@ -61,28 +61,31 @@ parameters:
 
   gravity_z:
     enabled: true
-    # Changes the unstable pole eigenvalue. More negative values make the pole
-    # fall faster; less negative values slow the system down.
+    # Changes the unstable pole eigenvalue. This range is intentionally wider
+    # than the original [-18, -7] schedule: high magnitude makes the pole fall
+    # much faster, while low magnitude changes the natural time scale.
     default: -9.81
-    min: -18.0
-    max: -7.0
+    min: -30.0
+    max: -3.0
 
   dof_damping:
     enabled: true
-    # Directly changes velocity-dependent feedback terms. Hinge damping is a
-    # stronger angular-dynamics perturbation than contact friction here.
+    sampler: log_uniform
+    # Directly changes velocity-dependent feedback terms. Hinge damping is the
+    # stronger angular-dynamics perturbation here, so it gets a wider range.
     defaults:
       slider: 1.0
       hinge: 1.0
     ranges:
       slider: [0.25, 6.0]
-      hinge: [0.25, 4.0]
+      hinge: [0.05, 12.0]
 
   pole_length:
     enabled: true
+    sampler: log_uniform
     # Full capsule length. This changes pole COM, pole inertia, visual geometry,
-    # and the cart-pole coupling terms, so it should be harder than a scalar
-    # action-gain remap.
+    # and cart-pole coupling; the wider range should force more distinct control
+    # regimes than the original [0.35, 0.9] schedule.
     default: 0.6
-    min: 0.35
-    max: 0.9
+    min: 0.2
+    max: 1.4

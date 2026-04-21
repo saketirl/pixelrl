@@ -4,8 +4,15 @@ backend: spring
 
 # Must be an exact multiple of n_envs * num_steps so task switches happen
 # between PPO rollouts. This is the closest aligned value to 2,000,000 for
-# the launcher/full_run hyperparameters (128 envs * 10 steps = 1,280), giving
-# five tasks over 9,996,800 env steps.
+# the launcher/full_run hyperparameters (128 envs * 10 steps = 1,280). The
+# Brax debug launcher defaults to 25 tasks for 49,984,000 env steps.
+
+#Good defaults:
+# switch_every_env_steps = 1,999,360
+# num_tasks = 25
+# total_timesteps = 49,984,000
+# seed = 0
+
 switch_every_env_steps: 1999360
 
 # null means use the training --seed. Set an integer to reuse the same dynamics
@@ -15,16 +22,51 @@ seed: null
 # Task 0 always uses the loaded Brax defaults. Sampling starts at task_index=1.
 first_task_uses_defaults: true
 
+task_sampler:
+  type: halfcheetah_structured_asymmetric
+  # Each non-default task chooses the next mode in this cycle. Within a mode,
+  # targeted quantities are sampled close to the relevant range boundary, while
+  # untargeted quantities stay near default with small jitter.
+  mode_cycle:
+    - rear_long_front_short
+    - front_long_rear_short
+    - rear_strong_front_weak
+    - front_strong_rear_weak
+    - long_thigh_short_shin
+    - short_thigh_long_shin
+    - heavy_torso_weak_legs
+    - light_torso_strong_legs
+    - low_friction_high_gravity
+    - high_friction_low_gravity
+  intensity_range: [0.75, 1.0]
+  jitter_fraction: 0.08
+
+# Transition model:
+# - HalfCheetah has enough actuation that small gear and mass perturbations can
+#   be absorbed by action rescaling. To make task switches visibly nontrivial
+#   for the policy, sample structured asymmetric task families rather than
+#   independent per-joint noise.
+# - Positive physical quantities use log-uniform sampling within the configured
+#   absolute bounds, so 0.5x and 2.0x style changes are symmetric in log space.
+# - Contact friction changes foot-ground coupling and slip. Actuator gear
+#   changes control authority. Link mass changes inertia and body coupling.
+#   Gravity changes stance timing and ballistic phases. Limb length changes
+#   the kinematic chain itself, moving downstream joint anchors and changing
+#   segment collision geometry/COM/inertia, so it should directly affect gait.
+# - DOF damping is not enabled here because the continual dynamics helper only
+#   has named damping metadata for inverted_pendulum.
 parameters:
   geom_friction_slide:
     enabled: true
+    sampler: log_uniform
     # default: 0.4, from sys.geom_friction[:, 0]
     default: 0.4
-    min: 0.2
-    max: 1.0
+    min: 0.05
+    max: 2.5
 
   actuator_gear:
     enabled: true
+    sampler: log_uniform
     # defaults after HalfCheetah spring override, action order:
     # bthigh=120, bshin=90, bfoot=60, fthigh=120, fshin=100, ffoot=100
     defaults:
@@ -35,15 +77,16 @@ parameters:
       fshin: 100.0
       ffoot: 100.0
     ranges:
-      bthigh: [90.0, 150.0]
-      bshin: [67.5, 112.5]
-      bfoot: [45.0, 75.0]
-      fthigh: [90.0, 150.0]
-      fshin: [75.0, 125.0]
-      ffoot: [75.0, 125.0]
+      bthigh: [45.0, 210.0]
+      bshin: [35.0, 160.0]
+      bfoot: [25.0, 120.0]
+      fthigh: [45.0, 210.0]
+      fshin: [35.0, 175.0]
+      ffoot: [35.0, 175.0]
 
   link_mass:
     enabled: true
+    sampler: log_uniform
     # defaults from sys.link.inertia.mass:
     # torso=6.2502093, bthigh=1.5435146, bshin=1.5874476, bfoot=1.0953975,
     # fthigh=1.4380753, fshin=1.2008368, ffoot=0.8845188
@@ -56,10 +99,36 @@ parameters:
       fshin: 1.2008368
       ffoot: 0.8845188
     ranges:
-      torso: [5.3127, 7.1877]
-      bthigh: [1.3120, 1.7750]
-      bshin: [1.3493, 1.8256]
-      bfoot: [0.9311, 1.2597]
-      fthigh: [1.2224, 1.6538]
-      fshin: [1.0207, 1.3810]
-      ffoot: [0.7518, 1.0172]
+      torso: [3.1251, 12.5004]
+      bthigh: [0.7718, 3.0870]
+      bshin: [0.7937, 3.1749]
+      bfoot: [0.5477, 2.1908]
+      fthigh: [0.7190, 2.8762]
+      fshin: [0.6004, 2.4017]
+      ffoot: [0.4423, 1.7690]
+
+  gravity_z:
+    enabled: true
+    default: -9.81
+    min: -18.0
+    max: -4.0
+
+  limb_length:
+    enabled: true
+    sampler: log_uniform
+    # Full capsule lengths. These values alter the leg morphology, not just
+    # scalar dynamics, and are expected to force different gait timing.
+    defaults:
+      bthigh: 0.29
+      bshin: 0.30
+      bfoot: 0.188
+      fthigh: 0.266
+      fshin: 0.212
+      ffoot: 0.14
+    ranges:
+      bthigh: [0.16, 0.50]
+      bshin: [0.16, 0.52]
+      bfoot: [0.09, 0.36]
+      fthigh: [0.14, 0.48]
+      fshin: [0.11, 0.40]
+      ffoot: [0.07, 0.30]

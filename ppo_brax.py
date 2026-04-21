@@ -3,13 +3,15 @@
 PPO for Brax environments with state observations - CleanRL style adaptation.
 Adapted from CleanRL's PPO implementation for continuous control with state observations.
 This serves as a baseline to verify the algorithm works before testing pixel observations.
+#To continue this session, run codex resume 019dac51-812f-7023-bfdd-553feaa73809
 """
+import json
 import os
 import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Sequence
+from typing import Optional
 
 import flax
 import flax.linen as nn
@@ -26,6 +28,14 @@ from flax.training.train_state import TrainState
 import sys
 sys.path.insert(0, "/users/apraka15/arjun/pixelrl/pixelbrax/brax")
 from brax import envs as brax_envs
+from pixelbrax.continual_dynamics import (
+    apply_dynamics_task,
+    continual_log_metrics,
+    load_continual_dynamics_config,
+    make_dynamics_task,
+    resolve_schedule_seed,
+    validate_continual_dynamics_config,
+)
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -44,7 +54,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "benchmark"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
 
     # Environment arguments
@@ -88,10 +98,16 @@ class Args:
     """maximum action value for clipping"""
     log_interval: int = 10
     """logging interval (in updates)"""
+    actor_critic_activation: str = "swish"
+    """Activation for actor and critic hidden layers: swish or relu"""
 
     # Action repeat
     action_repeat: int = 1
     """Number of times to repeat each action (frame skip)"""
+
+    # Continual dynamics
+    continual_dynamics_config: Optional[str] = None
+    """Path to a YAML continual dynamics config"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -109,33 +125,48 @@ class Network(nn.Module):
     def __call__(self, x):
         # x: (B, obs_dim) - 1D state observations
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+        x = nn.swish(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+        x = nn.swish(x)
         return x
+
+
+def actor_critic_activation_fn(name: str):
+    if name == "swish":
+        return nn.swish
+    if name == "relu":
+        return nn.relu
+    raise ValueError(
+        f"Unsupported actor_critic_activation={name!r}. Expected 'swish' or 'relu'."
+    )
 
 
 class Critic(nn.Module):
     """Value network with 2 hidden layers for sufficient capacity."""
+    activation: str = "swish"
+
     @nn.compact
     def __call__(self, x):
+        activation = actor_critic_activation_fn(self.activation)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+        x = activation(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+        x = activation(x)
         return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
 
 
 class Actor(nn.Module):
     """Continuous action actor with 2 hidden layers using Gaussian distribution."""
     action_dim: int
+    activation: str = "swish"
 
     @nn.compact
     def __call__(self, x):
+        activation = actor_critic_activation_fn(self.activation)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+        x = activation(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
+        x = activation(x)
         actor_mean = nn.Dense(
             self.action_dim, 
             kernel_init=orthogonal(0.01), 
@@ -254,6 +285,11 @@ def make_brax_envs(args):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if args.actor_critic_activation not in {"swish", "relu"}:
+        raise ValueError(
+            "actor_critic_activation must be one of: swish, relu; "
+            f"got {args.actor_critic_activation!r}"
+        )
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
@@ -286,11 +322,62 @@ if __name__ == "__main__":
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
+    print(f"actor_critic_activation: {args.actor_critic_activation}")
     
     envs, action_dim, obs_dim = make_brax_envs(args)
     print(f"action_dim: {action_dim}")
     print(f"obs_dim: {obs_dim}")
     print(f"action_repeat: {args.action_repeat}")
+
+    base_sys = envs.unwrapped.sys
+    current_sys = base_sys
+    continual_config = None
+    current_task = None
+    task_start_step = 0
+    updates_per_task = 0
+    schedule_seed = args.seed
+
+    def env_with_sys(sys):
+        envs.unwrapped.sys = sys
+        return envs
+
+    def reset_with_sys(sys, rng):
+        return env_with_sys(sys).reset(rng)
+
+    def step_with_sys(sys, state, action):
+        return env_with_sys(sys).step(state, action)
+
+    if args.continual_dynamics_config is not None:
+        loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
+        if loaded_config.enabled:
+            updates_per_task = validate_continual_dynamics_config(
+                loaded_config,
+                env_name=args.env_name,
+                backend=args.backend,
+                n_envs=args.n_envs,
+                num_steps=args.num_steps,
+                base_sys=base_sys,
+            )
+            continual_config = loaded_config
+            schedule_seed = resolve_schedule_seed(continual_config, args.seed)
+            current_task = make_dynamics_task(
+                continual_config,
+                base_sys,
+                task_index=0,
+                schedule_seed=schedule_seed,
+            )
+            current_sys = apply_dynamics_task(base_sys, current_task)
+            print("\nContinual dynamics: ENABLED")
+            print(f"  config: {continual_config.path}")
+            print(f"  switch_every_env_steps: {continual_config.switch_every_env_steps}")
+            print(f"  updates_per_task: {updates_per_task}")
+            print(f"  schedule_seed: {schedule_seed}")
+            print(
+                "  task=0 step=0 default=True values="
+                f"{json.dumps(current_task.values, sort_keys=True)}"
+            )
+        else:
+            print("\nContinual dynamics: config disabled; using fixed dynamics")
     
     # Observation shape is 1D for state-based observations
     obs_shape = (obs_dim,)
@@ -309,8 +396,11 @@ if __name__ == "__main__":
 
     # Initialize networks
     network = Network()
-    actor = Actor(action_dim=action_dim)
-    critic = Critic()
+    actor = Actor(
+        action_dim=action_dim,
+        activation=args.actor_critic_activation,
+    )
+    critic = Critic(activation=args.actor_critic_activation)
     
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
@@ -461,8 +551,8 @@ if __name__ == "__main__":
                 x = jnp.reshape(x, (args.num_minibatches, -1) + x.shape[1:])
                 return x
 
-            flatten_storage = jax.tree_map(flatten, storage)
-            shuffled_storage = jax.tree_map(convert_data, flatten_storage)
+            flatten_storage = jax.tree_util.tree_map(flatten, storage)
+            shuffled_storage = jax.tree_util.tree_map(convert_data, flatten_storage)
 
             def update_minibatch(carry, minibatch):
                 agent_state = carry
@@ -494,7 +584,7 @@ if __name__ == "__main__":
 
     # Reset environment
     key, reset_key = jax.random.split(key)
-    env_state = envs.reset(reset_key)
+    env_state = reset_with_sys(current_sys, reset_key)
     
     # For state-based observations, directly use env_state.obs
     next_obs = env_state.obs
@@ -503,12 +593,12 @@ if __name__ == "__main__":
     # Initialize reward normalizer (discounted return-based, like CleanRL)
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
-    def step_once(carry, step):
+    def step_once(current_sys, carry, step):
         agent_state, episode_stats, reward_norm, env_state, obs, done, key = carry
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
         # Step environment
-        env_state = envs.step(env_state, action)
+        env_state = step_with_sys(current_sys, env_state, action)
         next_obs = env_state.obs  # State-based observation
         raw_reward = env_state.reward
         next_done = env_state.done.astype(jnp.bool_)  # Ensure bool type
@@ -544,9 +634,21 @@ if __name__ == "__main__":
         )
         return (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage
 
-    def rollout(agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key, max_steps):
+    def rollout(
+        current_sys,
+        agent_state,
+        episode_stats,
+        reward_norm,
+        env_state,
+        next_obs,
+        next_done,
+        key,
+        max_steps,
+    ):
         (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage = jax.lax.scan(
-            step_once, (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), jnp.arange(max_steps)
+            partial(step_once, current_sys),
+            (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key),
+            jnp.arange(max_steps),
         )
         return agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, storage, key
 
@@ -555,9 +657,63 @@ if __name__ == "__main__":
 
     print("Starting training...")
     for iteration in range(1, args.num_updates + 1):
+        if (
+            continual_config is not None
+            and iteration > 1
+            and (iteration - 1) % updates_per_task == 0
+        ):
+            task_index = (iteration - 1) // updates_per_task
+            current_task = make_dynamics_task(
+                continual_config,
+                base_sys,
+                task_index=task_index,
+                schedule_seed=schedule_seed,
+            )
+            current_sys = apply_dynamics_task(base_sys, current_task)
+            task_start_step = global_step
+
+            key, reset_key = jax.random.split(key)
+            env_state = reset_with_sys(current_sys, reset_key)
+            next_obs = env_state.obs
+            next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
+            episode_stats = EpisodeStatistics(
+                episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
+                episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
+                returned_episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
+                returned_episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
+            )
+            reward_normalizer = reward_normalizer.replace(
+                discounted_return=jnp.zeros(args.n_envs),
+            )
+
+            print(
+                f"continual_switch task={task_index} step={global_step} "
+                f"default={current_task.is_default} values="
+                f"{json.dumps(current_task.values, sort_keys=True)}"
+            )
+
+            if args.track:
+                import wandb
+                wandb.log(
+                    continual_log_metrics(
+                        current_task,
+                        switch_every_env_steps=continual_config.switch_every_env_steps,
+                        task_start_step=task_start_step,
+                        global_step=global_step,
+                    ),
+                    step=global_step,
+                )
+
         iteration_time_start = time.time()
         agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, storage, key = rollout(
-            agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, key
+            current_sys,
+            agent_state,
+            episode_stats,
+            reward_normalizer,
+            env_state,
+            next_obs,
+            next_done,
+            key,
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
@@ -583,7 +739,7 @@ if __name__ == "__main__":
             
             if args.track:
                 lr = agent_state.opt_state[1].hyperparams["learning_rate"].item()
-                wandb.log({
+                log_dict = {
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,
                     "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
@@ -595,7 +751,19 @@ if __name__ == "__main__":
                     "losses/entropy": entropy_loss[-1, -1].item(),
                     "losses/approx_kl": approx_kl[-1, -1].item(),
                     "losses/loss": loss[-1, -1].item(),
-                }, step=global_step)
+                }
+
+                if continual_config is not None:
+                    log_dict.update(
+                        continual_log_metrics(
+                            current_task,
+                            switch_every_env_steps=continual_config.switch_every_env_steps,
+                            task_start_step=task_start_step,
+                            global_step=global_step,
+                        )
+                    )
+
+                wandb.log(log_dict, step=global_step)
 
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed:.1f}s")

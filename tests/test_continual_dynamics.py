@@ -35,7 +35,7 @@ def _halfcheetah_sys():
 def _inverted_pendulum_sys():
     return envs.create(
         env_name="inverted_pendulum",
-        backend="generalized",
+        backend="spring",
         action_repeat=1,
     ).sys
 
@@ -85,6 +85,8 @@ def test_task_zero_uses_defaults_and_sampling_is_repeatable():
     assert task0.values["geom_friction_slide"] == pytest.approx(0.4)
     assert task0.values["actuator_gear"]["bthigh"] == pytest.approx(120.0)
     assert task0.values["link_mass"]["torso"] == pytest.approx(6.2502093)
+    assert task0.values["gravity_z"] == pytest.approx(-9.81)
+    assert task0.values["limb_length"]["bthigh"] == pytest.approx(0.29)
     assert apply_dynamics_task(base_sys, task0) is base_sys
 
     task1_a = make_dynamics_task(config, base_sys, task_index=1, schedule_seed=7)
@@ -94,9 +96,41 @@ def test_task_zero_uses_defaults_and_sampling_is_repeatable():
     assert task1_a == task1_b
     assert task1_a != task2
     assert not task1_a.is_default
-    assert 0.2 <= task1_a.values["geom_friction_slide"] <= 1.0
-    assert 90.0 <= task1_a.values["actuator_gear"]["bthigh"] <= 150.0
-    assert 5.3127 <= task1_a.values["link_mass"]["torso"] <= 7.1877
+    assert 0.05 <= task1_a.values["geom_friction_slide"] <= 2.5
+    assert 45.0 <= task1_a.values["actuator_gear"]["bthigh"] <= 210.0
+    assert 3.1251 <= task1_a.values["link_mass"]["torso"] <= 12.5004
+    assert -18.0 <= task1_a.values["gravity_z"] <= -4.0
+    assert 0.16 <= task1_a.values["limb_length"]["bthigh"] <= 0.50
+
+
+def test_halfcheetah_structured_sampler_uses_asymmetric_patterns():
+    base_sys = _halfcheetah_sys()
+    config = _template_config()
+
+    validate_continual_dynamics_config(
+        config,
+        env_name="halfcheetah",
+        backend="spring",
+        n_envs=2,
+        num_steps=2,
+        base_sys=base_sys,
+    )
+
+    task1 = make_dynamics_task(config, base_sys, task_index=1, schedule_seed=7)
+    assert task1.values["actuator_gear"]["bthigh"] > 120.0
+    assert task1.values["actuator_gear"]["fthigh"] < 120.0
+    assert task1.values["link_mass"]["bthigh"] > 1.5435146
+    assert task1.values["link_mass"]["fthigh"] < 1.4380753
+    assert task1.values["limb_length"]["bthigh"] > 0.29
+    assert task1.values["limb_length"]["fthigh"] < 0.266
+
+    task2 = make_dynamics_task(config, base_sys, task_index=2, schedule_seed=7)
+    assert task2.values["actuator_gear"]["bthigh"] < 120.0
+    assert task2.values["actuator_gear"]["fthigh"] > 120.0
+    assert task2.values["link_mass"]["bthigh"] < 1.5435146
+    assert task2.values["link_mass"]["fthigh"] > 1.4380753
+    assert task2.values["limb_length"]["bthigh"] < 0.29
+    assert task2.values["limb_length"]["fthigh"] > 0.266
 
 
 def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
@@ -111,7 +145,7 @@ def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
     updates_per_task = validate_continual_dynamics_config(
         config,
         env_name="inverted_pendulum",
-        backend="generalized",
+        backend="spring",
         n_envs=2,
         num_steps=2,
         base_sys=base_sys,
@@ -138,10 +172,10 @@ def test_inverted_pendulum_config_uses_defaults_and_samples_tasks():
     assert 40.0 <= task1_a.values["actuator_gear"]["slide"] <= 140.0
     assert 6.0 <= task1_a.values["link_mass"]["cart"] <= 16.0
     assert 2.5 <= task1_a.values["link_mass"]["pole"] <= 8.0
-    assert -18.0 <= task1_a.values["gravity_z"] <= -7.0
+    assert -30.0 <= task1_a.values["gravity_z"] <= -3.0
     assert 0.25 <= task1_a.values["dof_damping"]["slider"] <= 6.0
-    assert 0.25 <= task1_a.values["dof_damping"]["hinge"] <= 4.0
-    assert 0.35 <= task1_a.values["pole_length"] <= 0.9
+    assert 0.05 <= task1_a.values["dof_damping"]["hinge"] <= 12.0
+    assert 0.2 <= task1_a.values["pole_length"] <= 1.4
 
     new_sys = apply_dynamics_task(base_sys, task1_a)
     assert new_sys.q_size() == base_sys.q_size()
@@ -289,6 +323,11 @@ def test_apply_sampled_task_changes_only_dynamics_shapes():
     base_sys = _halfcheetah_sys()
     base_mass = np.asarray(jax.device_get(base_sys.link.inertia.mass))
     base_inertia = np.asarray(jax.device_get(base_sys.link.inertia.i))
+    base_inertia_pos = np.asarray(jax.device_get(base_sys.link.inertia.transform.pos))
+    base_geom_pos = np.asarray(jax.device_get(base_sys.geom_pos))
+    base_geom_size = np.asarray(jax.device_get(base_sys.geom_size))
+    base_geom_rbound = np.asarray(jax.device_get(base_sys.geom_rbound))
+    base_link_pos = np.asarray(jax.device_get(base_sys.link.transform.pos))
 
     new_masses = {
         name: float(base_mass[i] * 1.1)
@@ -308,6 +347,15 @@ def test_apply_sampled_task_changes_only_dynamics_shapes():
                 "ffoot": 102.0,
             },
             "link_mass": new_masses,
+            "gravity_z": -12.0,
+            "limb_length": {
+                "bthigh": 0.58,
+                "bshin": 0.30,
+                "bfoot": 0.188,
+                "fthigh": 0.266,
+                "fshin": 0.212,
+                "ffoot": 0.14,
+            },
         },
     )
 
@@ -329,9 +377,51 @@ def test_apply_sampled_task_changes_only_dynamics_shapes():
         base_mass * 1.1,
         rtol=1e-6,
     )
+    expected_inertia = base_inertia * 1.1
+    expected_inertia[1] *= 4.0
     np.testing.assert_allclose(
         np.asarray(jax.device_get(new_sys.link.inertia.i)),
-        base_inertia * 1.1,
+        expected_inertia,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.gravity)),
+        np.array([0.0, 0.0, -12.0]),
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.geom_size))[3, 1],
+        0.29,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.geom_pos))[3],
+        base_geom_pos[3] * 2.0,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.geom_rbound))[3],
+        base_geom_size[3, 0] + 0.29,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.link.inertia.transform.pos))[1],
+        base_inertia_pos[1] * 2.0,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.link.inertia.i))[1],
+        expected_inertia[1],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.link.transform.pos))[2],
+        base_link_pos[2] * 2.0,
         rtol=1e-6,
         atol=1e-6,
     )

@@ -7,12 +7,13 @@ Optimizer split:
 - selectable Adam, Optax Muon, or manifold Stiefel for actor/critic head matrices
 - Adam/AdamW for actor/critic vectors/scalars
 """
+import json
 import os
 import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal
+from typing import Literal, Optional
 
 import flax
 import flax.linen as nn
@@ -28,6 +29,14 @@ from flax.training.train_state import TrainState
 import sys
 sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/brax")
 import pixelbrax
+from pixelbrax.continual_dynamics import (
+    apply_dynamics_task,
+    continual_log_metrics,
+    load_continual_dynamics_config,
+    make_dynamics_task,
+    resolve_schedule_seed,
+    validate_continual_dynamics_config,
+)
 from pixelbrax.env_utils import make_pixel_brax
 
 # Import manifold Stiefel optimizer
@@ -95,7 +104,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "benchmark"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
 
     # Environment arguments
@@ -210,6 +219,10 @@ class Args:
     # Action repeat
     action_repeat: int = 1
     """Number of times to repeat each action (frame skip)"""
+
+    # Continual dynamics
+    continual_dynamics_config: Optional[str] = None
+    """Path to a YAML continual dynamics config"""
 
     # Debug/analysis flags
     debug_repr: bool = False
@@ -1488,9 +1501,49 @@ if __name__ == "__main__":
     envs, action_dim = make_pixelbrax_envs(args)
     print(f"action_dim: {action_dim}")
 
+    base_sys = envs.base_sys
+    current_sys = base_sys
+    continual_config = None
+    current_task = None
+    task_start_step = 0
+    updates_per_task = 0
+    schedule_seed = args.data_seed
+
+    if args.continual_dynamics_config is not None:
+        loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
+        if loaded_config.enabled:
+            updates_per_task = validate_continual_dynamics_config(
+                loaded_config,
+                env_name=args.env_name,
+                backend=args.backend,
+                n_envs=args.n_envs,
+                num_steps=args.num_steps,
+                base_sys=base_sys,
+            )
+            continual_config = loaded_config
+            schedule_seed = resolve_schedule_seed(continual_config, args.data_seed)
+            current_task = make_dynamics_task(
+                continual_config,
+                base_sys,
+                task_index=0,
+                schedule_seed=schedule_seed,
+            )
+            current_sys = apply_dynamics_task(base_sys, current_task)
+            print("\nContinual dynamics: ENABLED")
+            print(f"  config: {continual_config.path}")
+            print(f"  switch_every_env_steps: {continual_config.switch_every_env_steps}")
+            print(f"  updates_per_task: {updates_per_task}")
+            print(f"  schedule_seed: {schedule_seed}")
+            print(
+                "  task=0 step=0 default=True values="
+                f"{json.dumps(current_task.values, sort_keys=True)}"
+            )
+        else:
+            print("\nContinual dynamics: config disabled; using fixed dynamics")
+
     # Get observation shape
     reset_rng = jax.random.split(jax.random.PRNGKey(args.data_seed), args.n_envs)
-    init_env_state = envs.reset(reset_rng)
+    init_env_state = envs.reset_with_sys(current_sys, reset_rng)
     raw_obs_shape = init_env_state.pixels.shape[1:]  # (H, W, C)
     obs_shape = (raw_obs_shape[0], raw_obs_shape[1], raw_obs_shape[2] * args.frame_stack)
     print(f"raw_obs_shape: {raw_obs_shape}")
@@ -2429,7 +2482,7 @@ if __name__ == "__main__":
     # Reset environment
     key, reset_key = jax.random.split(key)
     reset_rngs = jax.random.split(reset_key, args.n_envs)
-    env_state = envs.reset(reset_rngs)
+    env_state = envs.reset_with_sys(current_sys, reset_rngs)
 
     # Initialize frame stack with initial observation
     frame_stack = FrameStack.create(args.n_envs, args.frame_stack, raw_obs_shape)
@@ -2440,11 +2493,11 @@ if __name__ == "__main__":
     # Initialize reward normalizer
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
-    def step_once(carry, step):
+    def step_once(current_sys, carry, step):
         agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
-        env_state = envs.step(env_state, action)
+        env_state = envs.step_with_sys(current_sys, env_state, action)
         raw_obs = env_state.pixels
         raw_reward = env_state.reward
         next_done_local = env_state.done.astype(jnp.bool_)
@@ -2497,7 +2550,18 @@ if __name__ == "__main__":
             key,
         ), storage
 
-    def rollout(agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key, max_steps):
+    def rollout(
+        current_sys,
+        agent_state,
+        episode_stats,
+        reward_norm,
+        fs,
+        env_state,
+        next_obs,
+        next_done,
+        key,
+        max_steps,
+    ):
         (
             agent_state,
             episode_stats,
@@ -2508,7 +2572,7 @@ if __name__ == "__main__":
             next_done,
             key,
         ), storage = jax.lax.scan(
-            step_once,
+            partial(step_once, current_sys),
             (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key),
             jnp.arange(max_steps),
         )
@@ -2579,6 +2643,55 @@ if __name__ == "__main__":
             wandb.log({**probe_init_metrics, **probe_init_media}, step=0)
 
     for iteration in range(1, args.num_updates + 1):
+        if (
+            continual_config is not None
+            and iteration > 1
+            and (iteration - 1) % updates_per_task == 0
+        ):
+            task_index = (iteration - 1) // updates_per_task
+            current_task = make_dynamics_task(
+                continual_config,
+                base_sys,
+                task_index=task_index,
+                schedule_seed=schedule_seed,
+            )
+            current_sys = apply_dynamics_task(base_sys, current_task)
+            task_start_step = global_step
+
+            key, reset_key = jax.random.split(key)
+            reset_rngs = jax.random.split(reset_key, args.n_envs)
+            env_state = envs.reset_with_sys(current_sys, reset_rngs)
+            frame_stack = frame_stack.reset(env_state.pixels)
+            next_obs = frame_stack.get_stacked()
+            next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
+            episode_stats = EpisodeStatistics(
+                episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
+                episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
+                returned_episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
+                returned_episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
+            )
+            reward_normalizer = reward_normalizer.replace(
+                discounted_return=jnp.zeros(args.n_envs),
+            )
+
+            print(
+                f"continual_switch task={task_index} step={global_step} "
+                f"default={current_task.is_default} values="
+                f"{json.dumps(current_task.values, sort_keys=True)}"
+            )
+
+            if args.track:
+                import wandb
+                wandb.log(
+                    continual_log_metrics(
+                        current_task,
+                        switch_every_env_steps=continual_config.switch_every_env_steps,
+                        task_start_step=task_start_step,
+                        global_step=global_step,
+                    ),
+                    step=global_step,
+                )
+
         iteration_time_start = time.time()
         (
             agent_state,
@@ -2591,6 +2704,7 @@ if __name__ == "__main__":
             storage,
             key,
         ) = rollout(
+            current_sys,
             agent_state,
             episode_stats,
             reward_normalizer,
@@ -2809,6 +2923,16 @@ if __name__ == "__main__":
                     "actor_noise/max_std": args.actor_noise_max_std,
                     "actor_noise/stop_updates": args.actor_noise_stop_updates,
                 }
+
+                if continual_config is not None:
+                    log_dict.update(
+                        continual_log_metrics(
+                            current_task,
+                            switch_every_env_steps=continual_config.switch_every_env_steps,
+                            task_start_step=task_start_step,
+                            global_step=global_step,
+                        )
+                    )
 
                 traj_metrics = rollout_trajectory_metrics(
                     storage,
