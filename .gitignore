@@ -176,11 +176,24 @@ clean_rl_reference/
 #slurm
 *.out
 slurm_logs/
+<<<<<<< HEAD
 lqr_ac_compare/*.csv
 lqr_ac_compare/*.png
 lqr_ac_compare/*.gif
+
+lqr_ac_compare/*.csv
+*.gif
+
 run_data/*
 .DS_Store
 #wandb
 wandb/
 *.json
+lqr_ac_compare/Stiefel_Ascent_RLC.pdf
+
+# secrets
+secrets/
+*.pkl 
+node_modules/ 
+*.csv
+
