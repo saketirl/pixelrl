@@ -23,6 +23,7 @@ import tyro
 import distrax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
+from manifold_stiefel_optax import manifold_stiefel
 
 # Import Brax from local source (pixelbrax/brax/brax)
 import sys
@@ -70,6 +71,22 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
+    adam_eps: float = 1e-5
+    """epsilon parameter for Adam"""
+    heads_optimizer: str = "adam"
+    """Optimizer for actor/critic matrix params: adam or stiefel"""
+    heads_stiefel_lr: float = 0.001
+    """Learning rate for actor/critic matrix params when using Stiefel"""
+    stiefel_dual_lr: float = 0.01
+    """Dual learning rate for manifold Stiefel"""
+    stiefel_dual_steps: int = 5
+    """Number of dual optimization steps for manifold Stiefel"""
+    stiefel_msign_steps: int = 5
+    """Number of matrix-sign iterations for manifold Stiefel"""
+    actor_stiefel_max_grad_norm: float = 100.0
+    """Maximum gradient norm for actor Stiefel params"""
+    critic_stiefel_max_grad_norm: float = 1.0
+    """Maximum gradient norm for critic Stiefel params"""
     num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = False
@@ -99,7 +116,9 @@ class Args:
     log_interval: int = 10
     """logging interval (in updates)"""
     actor_critic_activation: str = "swish"
-    """Activation for actor and critic hidden layers: swish or relu"""
+    """Activation for all MLP hidden layers: swish or relu"""
+    reward_normalize: bool = True
+    """Normalize rewards using discounted-return RMS statistics"""
 
     # Action repeat
     action_repeat: int = 1
@@ -120,14 +139,16 @@ class Args:
 
 class Network(nn.Module):
     """MLP encoder for state observations."""
+    activation: str = "swish"
     
     @nn.compact
     def __call__(self, x):
         # x: (B, obs_dim) - 1D state observations
+        activation = actor_critic_activation_fn(self.activation)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
+        x = activation(x)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
+        x = activation(x)
         return x
 
 
@@ -139,6 +160,111 @@ def actor_critic_activation_fn(name: str):
     raise ValueError(
         f"Unsupported actor_critic_activation={name!r}. Expected 'swish' or 'relu'."
     )
+
+
+def resolve_heads_optimizer(heads_optimizer: str) -> str:
+    optimizer = heads_optimizer.lower()
+    if optimizer not in {"adam", "stiefel"}:
+        raise ValueError(
+            f"Unsupported heads_optimizer={heads_optimizer!r}. "
+            "Expected one of: adam, stiefel."
+        )
+    return optimizer
+
+
+def is_stiefel_matrix_param(param) -> bool:
+    return param.ndim >= 2 and min(param.shape) > 1
+
+
+def optimizer_label_for_param(path, param, heads_optimizer: str) -> str:
+    top_level = path[0]
+    if top_level == "network":
+        return "network_adam"
+    if top_level == "actor":
+        if heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
+            return "actor_stiefel"
+        return "heads_adam"
+    if top_level == "critic":
+        if heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
+            return "critic_stiefel"
+        return "heads_adam"
+    return "heads_adam"
+
+
+def create_optimizer(
+    learning_rate,
+    *,
+    adam_eps: float,
+    max_grad_norm: float,
+    heads_optimizer: str,
+    heads_stiefel_lr: float,
+    stiefel_dual_lr: float,
+    stiefel_dual_steps: int,
+    stiefel_msign_steps: int,
+    actor_stiefel_max_grad_norm: float,
+    critic_stiefel_max_grad_norm: float,
+):
+    heads_optimizer = resolve_heads_optimizer(heads_optimizer)
+
+    def make_adam_tx():
+        return optax.chain(
+            optax.clip_by_global_norm(max_grad_norm),
+            optax.inject_hyperparams(optax.adam)(
+                learning_rate=learning_rate,
+                eps=adam_eps,
+            ),
+        )
+
+    actor_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
+        manifold_stiefel(
+            learning_rate=heads_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            dual_steps=stiefel_dual_steps,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+    critic_stiefel_tx = optax.chain(
+        optax.clip_by_global_norm(critic_stiefel_max_grad_norm),
+        manifold_stiefel(
+            learning_rate=heads_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            dual_steps=stiefel_dual_steps,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+
+    transforms = {
+        "network_adam": make_adam_tx(),
+        "heads_adam": make_adam_tx(),
+        "actor_stiefel": actor_stiefel_tx,
+        "critic_stiefel": critic_stiefel_tx,
+    }
+
+    def label_fn(params):
+        flat = flax.traverse_util.flatten_dict(params)
+        labels = {
+            path: optimizer_label_for_param(path, param, heads_optimizer)
+            for path, param in flat.items()
+        }
+        return flax.core.freeze(flax.traverse_util.unflatten_dict(labels))
+
+    return optax.multi_transform(transforms=transforms, param_labels=label_fn)
+
+
+def count_optimizer_params(params, heads_optimizer: str) -> dict:
+    flat = flax.traverse_util.flatten_dict(params)
+    counts = {
+        "network_adam": 0,
+        "heads_adam": 0,
+        "actor_stiefel": 0,
+        "critic_stiefel": 0,
+    }
+    for path, param in flat.items():
+        counts[optimizer_label_for_param(path, param, heads_optimizer)] += int(param.size)
+    return counts
 
 
 class Critic(nn.Module):
@@ -290,6 +416,7 @@ if __name__ == "__main__":
             "actor_critic_activation must be one of: swish, relu; "
             f"got {args.actor_critic_activation!r}"
         )
+    args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
@@ -319,10 +446,19 @@ if __name__ == "__main__":
     print(f"num steps per rollout: {args.num_steps}")
     print(f"num envs: {args.n_envs}")
     print(f"learning rate: {args.learning_rate}")
+    print(f"adam_eps: {args.adam_eps}")
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
     print(f"actor_critic_activation: {args.actor_critic_activation}")
+    print(f"reward_normalize: {args.reward_normalize}")
+    print(f"heads_optimizer: {args.heads_optimizer}")
+    print(f"heads_stiefel_lr: {args.heads_stiefel_lr}")
+    print(f"stiefel_dual_lr: {args.stiefel_dual_lr}")
+    print(f"stiefel_dual_steps: {args.stiefel_dual_steps}")
+    print(f"stiefel_msign_steps: {args.stiefel_msign_steps}")
+    print(f"actor_stiefel_max_grad_norm: {args.actor_stiefel_max_grad_norm}")
+    print(f"critic_stiefel_max_grad_norm: {args.critic_stiefel_max_grad_norm}")
     
     envs, action_dim, obs_dim = make_brax_envs(args)
     print(f"action_dim: {action_dim}")
@@ -395,7 +531,7 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     # Initialize networks
-    network = Network()
+    network = Network(activation=args.actor_critic_activation)
     actor = Actor(
         action_dim=action_dim,
         activation=args.actor_critic_activation,
@@ -405,20 +541,32 @@ if __name__ == "__main__":
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
     dummy_hidden = network.apply(network_params, dummy_obs)
+    all_params = flax.core.freeze({
+        "network": network_params,
+        "actor": actor.init(actor_key, dummy_hidden),
+        "critic": critic.init(critic_key, dummy_hidden),
+    })
+    optimizer_counts = count_optimizer_params(all_params, args.heads_optimizer)
+    print("\nParameter breakdown by optimizer:")
+    print(f"  network_adam: {optimizer_counts['network_adam']:,}")
+    print(f"  heads_adam: {optimizer_counts['heads_adam']:,}")
+    print(f"  actor_stiefel: {optimizer_counts['actor_stiefel']:,}")
+    print(f"  critic_stiefel: {optimizer_counts['critic_stiefel']:,}")
     
     agent_state = TrainState.create(
         apply_fn=None,
-        params=flax.core.freeze({
-            'network': network_params,
-            'actor': actor.init(actor_key, dummy_hidden),
-            'critic': critic.init(critic_key, dummy_hidden),
-        }),
-        tx=optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate, 
-                eps=1e-5
-            ),
+        params=all_params,
+        tx=create_optimizer(
+            linear_schedule if args.anneal_lr else args.learning_rate,
+            adam_eps=args.adam_eps,
+            max_grad_norm=args.max_grad_norm,
+            heads_optimizer=args.heads_optimizer,
+            heads_stiefel_lr=args.heads_stiefel_lr,
+            stiefel_dual_lr=args.stiefel_dual_lr,
+            stiefel_dual_steps=args.stiefel_dual_steps,
+            stiefel_msign_steps=args.stiefel_msign_steps,
+            actor_stiefel_max_grad_norm=args.actor_stiefel_max_grad_norm,
+            critic_stiefel_max_grad_norm=args.critic_stiefel_max_grad_norm,
         ),
     )
     network.apply = jax.jit(network.apply)
@@ -603,9 +751,12 @@ if __name__ == "__main__":
         raw_reward = env_state.reward
         next_done = env_state.done.astype(jnp.bool_)  # Ensure bool type
 
-        # Update reward normalizer and normalize reward (discounted return-based)
-        reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
-        reward = reward_norm.normalize(raw_reward)
+        # Update reward statistics only when normalization is enabled.
+        if args.reward_normalize:
+            reward_norm = reward_norm.update(raw_reward, next_done.astype(jnp.float32))
+            reward = reward_norm.normalize(raw_reward)
+        else:
+            reward = raw_reward
 
         # Update episode statistics (use raw reward for tracking true returns)
         new_episode_return = episode_stats.episode_returns + raw_reward
@@ -738,7 +889,7 @@ if __name__ == "__main__":
             )
             
             if args.track:
-                lr = agent_state.opt_state[1].hyperparams["learning_rate"].item()
+                lr = float(linear_schedule(iteration * args.num_minibatches * args.update_epochs)) if args.anneal_lr else args.learning_rate
                 log_dict = {
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,

@@ -11,10 +11,10 @@
 
 set -euo pipefail
 
-# Continual InvertedPendulum launcher using the same PPO/MUON hyperparameters as
-# scripts/full_run.sh, restricted to InvertedPendulum generalized dynamics. This
-# runs one seed for each head optimizer condition: MUON heads on and MUON heads
-# off. Each run sees ten tasks total by default: task 0 uses default Brax
+# Continual InvertedPendulum launcher using the same PPO/Stiefel hyperparameters as
+# scripts/full_runs/full_run.sh, restricted to InvertedPendulum generalized dynamics. This
+# runs one seed for each head optimizer condition: Stiefel heads and Adam heads.
+# Each run sees ten tasks total by default: task 0 uses default Brax
 # dynamics, then nine sampled tasks.
 
 WANDB_PROJECT="${1:-continual_pixelbrax}"
@@ -26,7 +26,7 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 
@@ -45,8 +45,8 @@ if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
 fi
 
 SEED=0
-HEADS_CONDITIONS=(muon_on muon_off)
-NUM_RUNS=${#HEADS_CONDITIONS[@]}
+OPT_CONDITIONS=(stiefel adam)
+NUM_RUNS=${#OPT_CONDITIONS[@]}
 
 if (( TASK_ID < 0 || TASK_ID >= NUM_RUNS )); then
   echo "Invalid TASK_ID=${TASK_ID}. Expected 0..$((NUM_RUNS - 1))." >&2
@@ -65,26 +65,26 @@ if (( SWITCH_EVERY_ENV_STEPS % ROLLOUT_ENV_STEPS != 0 )); then
   exit 1
 fi
 
-HEADS_CONDITION="${HEADS_CONDITIONS[$TASK_ID]}"
-HEADS_MUON_ARGS=()
-if [[ "${HEADS_CONDITION}" == "muon_on" ]]; then
-  HEADS_MUON_ARGS+=(--use-heads-muon)
+OPT_CONDITION="${OPT_CONDITIONS[$TASK_ID]}"
+OPT_ARGS=()
+if [[ "${OPT_CONDITION}" == "stiefel" ]]; then
+  OPT_ARGS+=(--heads-optimizer stiefel)
 else
-  HEADS_MUON_ARGS+=(--no-use-heads-muon)
+  OPT_ARGS+=(--heads-optimizer adam)
 fi
 
 ENV_NAME="inverted_pendulum"
 BACKEND="generalized"
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="cl_inverted_pendulum_${NUM_TASKS}tasks_heads_${GROUP_ID}"
+GROUP_NAME="cl_inverted_pendulum_${NUM_TASKS}tasks_${GROUP_ID}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="continual_rl,continual_dynamics,inverted_pendulum,backend_${BACKEND},seed_${SEED},tasks_${NUM_TASKS},switch_${SWITCH_EVERY_ENV_STEPS},heads_${HEADS_CONDITION},cnn_heads_muon_me_hparams"
+export WANDB_TAGS="continual_rl,continual_dynamics,inverted_pendulum,backend_${BACKEND},seed_${SEED},tasks_${NUM_TASKS},switch_${SWITCH_EVERY_ENV_STEPS},opt_${OPT_CONDITION},cnn_heads_stiefel_me_hparams"
 
-EXP_NAME="ppo_cl_inverted_pendulum_${NUM_TASKS}tasks_heads_${HEADS_CONDITION}_s${SEED}_t${TASK_ID}"
+EXP_NAME="ppo_cl_inverted_pendulum_${NUM_TASKS}tasks_${OPT_CONDITION}_s${SEED}_t${TASK_ID}"
 
 BASE_CONFIG="${REPO_ROOT}/configs/continual/inverted_pendulum_dynamics.yaml"
-RUN_CONFIG="${REPO_ROOT}/slurm_logs/continual_inverted_pendulum_${NUM_TASKS}tasks_${GROUP_ID}_${HEADS_CONDITION}_${TASK_ID}.yaml"
+RUN_CONFIG="${REPO_ROOT}/slurm_logs/continual_inverted_pendulum_${NUM_TASKS}tasks_${GROUP_ID}_${OPT_CONDITION}_${TASK_ID}.yaml"
 if [[ ! -f "${BASE_CONFIG}" ]]; then
   echo "Missing continual dynamics config: ${BASE_CONFIG}" >&2
   exit 1
@@ -92,7 +92,7 @@ fi
 sed "s/^switch_every_env_steps:.*/switch_every_env_steps: ${SWITCH_EVERY_ENV_STEPS}/" "${BASE_CONFIG}" > "${RUN_CONFIG}"
 
 echo "Running TASK_ID=${TASK_ID}/${NUM_RUNS} group=${GROUP_NAME}"
-echo "Config: env=${ENV_NAME} backend=${BACKEND} seed=${SEED} heads=${HEADS_CONDITION} tasks=${NUM_TASKS} switch_every_env_steps=${SWITCH_EVERY_ENV_STEPS} total_timesteps=${TOTAL_TIMESTEPS}"
+echo "Config: env=${ENV_NAME} backend=${BACKEND} seed=${SEED} opt=${OPT_CONDITION} tasks=${NUM_TASKS} switch_every_env_steps=${SWITCH_EVERY_ENV_STEPS} total_timesteps=${TOTAL_TIMESTEPS}"
 echo "W&B: entity=${WANDB_ENTITY} project=${WANDB_PROJECT}"
 echo "Exp: ${EXP_NAME}"
 echo "Continual config: ${RUN_CONFIG}"
@@ -104,7 +104,6 @@ COMMON_ARGS=(
   --track
   --debug-repr
   --wandb-project-name "${WANDB_PROJECT}"
-  --wandb-entity "${WANDB_ENTITY}"
   --hw 84
   --total-timesteps "${TOTAL_TIMESTEPS}"
   --num-steps 10
@@ -120,24 +119,29 @@ COMMON_ARGS=(
   --frame-stack 4
   --action-repeat 4
   --anneal-lr
-  --muon-dual-lr 0.01
-  --muon-dual-steps 5
-  --actor-muon-max-grad-norm 100
-  --critic-muon-max-grad-norm 1
+  --stiefel-dual-lr 0.01
+  --stiefel-dual-steps 5
+  --actor-stiefel-max-grad-norm 100
+  --critic-stiefel-max-grad-norm 1
   --continual-dynamics-config "${RUN_CONFIG}"
   --exp-name "${EXP_NAME}"
-  "${HEADS_MUON_ARGS[@]}"
 )
 
+if [[ -n "${WANDB_ENTITY}" ]]; then
+  COMMON_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
+fi
+
 ARCH_ARGS=(
+  --encoder-type cnn
   --encoder-lr 3e-4
   --heads-adam-lr 3e-4
-  --heads-muon-lr 0.001
+  --heads-stiefel-lr 0.001
   --max-grad-norm 0.05
   --encoder-tanh-scale 0.5
 )
 
 cd "${REPO_ROOT}"
-uv run python "${REPO_ROOT}/ppo_pixelbrax_jax2_muon.py" \
+uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   "${COMMON_ARGS[@]}" \
-  "${ARCH_ARGS[@]}"
+  "${ARCH_ARGS[@]}" \
+  "${OPT_ARGS[@]}"

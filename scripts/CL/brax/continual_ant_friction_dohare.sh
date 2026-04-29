@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=cl-brax-halfcheetah
-#SBATCH --output=slurm_logs/cl_brax_halfcheetah_%j.out
+#SBATCH --job-name=cl-brax-ant-friction
+#SBATCH --output=slurm_logs/cl_brax_ant_friction_%j.out
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
@@ -10,18 +10,19 @@
 
 set -euo pipefail
 
-# State-observation Brax continual HalfCheetah launcher. This uses the stronger
-# HalfCheetah dynamics schedule to test whether task switches force nontrivial
-# policy adaptation before adding pixels.
+# State-observation Brax continual Ant launcher using the Dohare-style
+# friction-only continual schedule. Backend defaults to spring, but can be
+# overridden with the eighth argument.
 
 WANDB_PROJECT="${1:-continual_brax}"
 WANDB_ENTITY="${2:-rl-power}"
 SWITCH_EVERY_ENV_STEPS="${3:-1999360}"
-NUM_TASKS="${4:-25}"
+NUM_TASKS="${4:-10}"
 TOTAL_TIMESTEPS_OVERRIDE="${5:-}"
 SEED="${6:-${SEED:-0}}"
 ACTOR_CRITIC_ACTIVATION="${7:-${ACTOR_CRITIC_ACTIVATION:-swish}}"
-HEADS_OPTIMIZER="${8:-${HEADS_OPTIMIZER:-adam}}"
+BACKEND="${8:-${BACKEND:-spring}}"
+HEADS_OPTIMIZER="${9:-${HEADS_OPTIMIZER:-adam}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -44,8 +45,8 @@ if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
   export WANDB_API_KEY="$(cat "${WANDB_KEY_FILE}")"
 fi
 
-ENV_NAME="halfcheetah"
-BACKEND="spring"
+ENV_NAME="ant"
+CONFIG_BASENAME="ant_friction_dohare"
 
 if (( NUM_TASKS < 1 )); then
   echo "NUM_TASKS must be >= 1; got ${NUM_TASKS}." >&2
@@ -69,21 +70,24 @@ fi
 EFFECTIVE_NUM_TASKS=$(((TOTAL_TIMESTEPS + SWITCH_EVERY_ENV_STEPS - 1) / SWITCH_EVERY_ENV_STEPS))
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="cl_brax_halfcheetah_${EFFECTIVE_NUM_TASKS}tasks_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_${GROUP_ID}"
+GROUP_NAME="cl_brax_${ENV_NAME}_friction_${BACKEND}_${EFFECTIVE_NUM_TASKS}tasks_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_${GROUP_ID}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="continual_rl,continual_dynamics,brax_state,halfcheetah,backend_${BACKEND},seed_${SEED},tasks_${EFFECTIVE_NUM_TASKS},switch_${SWITCH_EVERY_ENV_STEPS},actorcritic_${ACTOR_CRITIC_ACTIVATION},headopt_${HEADS_OPTIMIZER},constant_lr,state_ppo_debug,strong_dynamics,morphology,structured_asymmetric,log_uniform"
+export WANDB_TAGS="continual_rl,continual_dynamics,brax_state,${ENV_NAME},backend_${BACKEND},seed_${SEED},tasks_${EFFECTIVE_NUM_TASKS},switch_${SWITCH_EVERY_ENV_STEPS},actorcritic_${ACTOR_CRITIC_ACTIVATION},headopt_${HEADS_OPTIMIZER},constant_lr,state_ppo_debug,dohare_friction,shared_scalar,log_uniform"
 
-EXP_NAME="ppo_brax_cl_halfcheetah_${EFFECTIVE_NUM_TASKS}tasks_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_constantlr_s${SEED}"
+EXP_NAME="ppo_brax_cl_${ENV_NAME}_friction_dohare_${BACKEND}_${EFFECTIVE_NUM_TASKS}tasks_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_constantlr_s${SEED}"
 
-BASE_CONFIG="${REPO_ROOT}/configs/continual/halfcheetah_dynamics.yaml"
-RUN_CONFIG="${REPO_ROOT}/slurm_logs/continual_brax_halfcheetah_${EFFECTIVE_NUM_TASKS}tasks_${GROUP_ID}.yaml"
+BASE_CONFIG="${REPO_ROOT}/configs/continual/${CONFIG_BASENAME}.yaml"
+RUN_CONFIG="${REPO_ROOT}/slurm_logs/continual_brax_${CONFIG_BASENAME}_${EFFECTIVE_NUM_TASKS}tasks_${GROUP_ID}.yaml"
 if [[ ! -f "${BASE_CONFIG}" ]]; then
   echo "Missing continual dynamics config: ${BASE_CONFIG}" >&2
   exit 1
 fi
-sed "s/^switch_every_env_steps:.*/switch_every_env_steps: ${SWITCH_EVERY_ENV_STEPS}/" "${BASE_CONFIG}" > "${RUN_CONFIG}"
+sed \
+  -e "s/^backend:.*/backend: ${BACKEND}/" \
+  -e "s/^switch_every_env_steps:.*/switch_every_env_steps: ${SWITCH_EVERY_ENV_STEPS}/" \
+  "${BASE_CONFIG}" > "${RUN_CONFIG}"
 
-echo "Running Brax HalfCheetah continual debug group=${GROUP_NAME}"
+echo "Running Brax ${ENV_NAME} continual friction group=${GROUP_NAME}"
 echo "Config: env=${ENV_NAME} backend=${BACKEND} seed=${SEED} tasks=${EFFECTIVE_NUM_TASKS} switch_every_env_steps=${SWITCH_EVERY_ENV_STEPS} total_timesteps=${TOTAL_TIMESTEPS} actor_critic_activation=${ACTOR_CRITIC_ACTIVATION} heads_optimizer=${HEADS_OPTIMIZER}"
 echo "W&B: entity=${WANDB_ENTITY} project=${WANDB_PROJECT}"
 echo "Exp: ${EXP_NAME}"

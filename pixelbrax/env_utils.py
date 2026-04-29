@@ -136,8 +136,8 @@ def make_pixel_brax(
         HFOV = 50.0
 
     elif env_name == "halfcheetah":
-        if backend != "spring":
-            raise AttributeError(f"Physics backend needs to be spring.")
+        if backend not in ("spring", "generalized"):
+            raise AttributeError("Physics backend needs to be spring or generalized.")
         # [7, 3]
         CAMERA_TARGET = 0
         CAM_EYE = 0
@@ -147,8 +147,8 @@ def make_pixel_brax(
         HFOV = 55.0
 
     elif env_name == "hopper":
-        if backend != "positional":
-            raise AttributeError(f"Physics backend needs to be positional.")
+        if backend not in ("positional", "generalized"):
+            raise AttributeError("Physics backend needs to be positional or generalized.")
         CAMERA_TARGET = 0
         CAM_EYE = 0
         CAM_OFF = jnp.array([0.0, -2.1, -0.2])
@@ -177,8 +177,8 @@ def make_pixel_brax(
         CAM_Z = 3.5
         HFOV = 40.0
     elif env_name == "walker2d":
-        if backend != "spring":
-            raise AttributeError(f"Physics backend needs to be generalized.")
+        if backend not in ("spring", "generalized"):
+            raise AttributeError("Physics backend needs to be spring or generalized.")
         # [7, 3]
         CAMERA_TARGET = 0
         CAM_EYE = 0

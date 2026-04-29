@@ -12,6 +12,7 @@ per-environment plots into:
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -43,11 +44,24 @@ ENV_MAX_STEP = {
     "walker2d": 2_000_000.0,
 }
 
+MUON_DATA_FILES = {
+    "halfcheetah": "half_cheetah_muon.csv",
+    "walker2d": "walker2d_muon.csv",
+    "ant": "ant_muon.csv",
+    "humanoid": "humanoid_muon.csv",
+    "reacher": "reacher_muon.csv",
+    "swimmer": "swimmer_muon.csv",
+    "pusher": "pusher_muon.csv",
+    "hopper": "hopper_muon.csv",
+    "inverted_pendulum": "pendulum_muon.csv",
+}
+
 CONDITION_META = {
     "cnn_adam": {"label": "CNN Encoder + Adam", "color": "tab:blue"},
     "cnn_muon": {"label": "CNN Encoder + Manifold Muon (ours)", "color": "tab:orange"},
     "vit_adam": {"label": "ViT Encoder + Adam", "color": "tab:green"},
     "vit_muon": {"label": "ViT Encoder + Manifold Muon (ours)", "color": "tab:red"},
+    "external_muon": {"label": "_nolegend_", "color": "tab:purple"},
 }
 
 FIGSIZE = (10, 6)  # default/wide aspect ratio
@@ -71,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         help="Output root directory for plots.",
     )
     parser.add_argument(
+        "--muon-data-dir",
+        default=None,
+        help="Optional directory containing new-convention *_muon.csv files.",
+    )
+    parser.add_argument(
         "--metric-key",
         default=DEFAULT_METRIC_KEY,
         help=f"Wandb history metric to plot (default: {DEFAULT_METRIC_KEY}).",
@@ -92,6 +111,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Minimum valid runs required to aggregate a condition.",
+    )
+    parser.add_argument(
+        "--envs",
+        default=None,
+        help="Optional comma-separated environment subset to plot.",
     )
     parser.add_argument(
         "--timeout",
@@ -131,7 +155,9 @@ def _condition_from_config(config: Dict) -> Optional[str]:
     return "vit_muon" if use_heads_muon else "vit_adam"
 
 
-def _extract_rows(history, metric_key: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def _extract_rows(
+    history, metric_key: str
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     # wandb may return pandas DataFrame or list[dict].
     if hasattr(history, "dropna"):
         history = history.dropna(subset=[metric_key])
@@ -204,10 +230,81 @@ def aggregate_condition(
         return None, None, None, valid_count
 
     common_steps = np.linspace(min_step, max_step, num_points)
-    interp = np.array([np.interp(common_steps, s, v) for s, v in zip(all_steps, all_values)])
+    interp = np.array(
+        [np.interp(common_steps, s, v) for s, v in zip(all_steps, all_values)]
+    )
     mean = np.mean(interp, axis=0)
     stderr = np.std(interp, axis=0) / np.sqrt(len(interp))
     return common_steps, mean, stderr, valid_count
+
+
+def parse_external_muon_csv(
+    path: str,
+    metric_key: str,
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing Muon CSV: {path}")
+
+    mean_col = f"heads_optimizer: muon - {metric_key}"
+    min_col = f"{mean_col}__MIN"
+    max_col = f"{mean_col}__MAX"
+
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = [col.strip().strip('"') for col in next(reader)]
+        except StopIteration:
+            return None, None, None, None
+
+        required = {"Step": None, mean_col: None, min_col: None, max_col: None}
+        for i, col in enumerate(header):
+            if col in required:
+                required[col] = i
+
+        missing = [col for col, idx in required.items() if idx is None]
+        if missing:
+            raise ValueError(f"Missing columns in {path}: {', '.join(missing)}")
+
+        steps = []
+        means = []
+        lowers = []
+        uppers = []
+        for row in reader:
+            try:
+                step = float(row[required["Step"]])
+                mean = float(row[required[mean_col]])
+                lower = float(row[required[min_col]])
+                upper = float(row[required[max_col]])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not (
+                np.isfinite(step)
+                and np.isfinite(mean)
+                and np.isfinite(lower)
+                and np.isfinite(upper)
+            ):
+                continue
+            steps.append(step)
+            means.append(mean)
+            lowers.append(lower)
+            uppers.append(upper)
+
+    if not steps:
+        return None, None, None, None
+
+    step_arr = np.asarray(steps, dtype=float)
+    order = np.argsort(step_arr)
+    return (
+        step_arr[order],
+        np.asarray(means, dtype=float)[order],
+        np.asarray(lowers, dtype=float)[order],
+        np.asarray(uppers, dtype=float)[order],
+    )
 
 
 def metric_to_ylabel(metric_key: str) -> str:
@@ -219,18 +316,26 @@ def metric_to_ylabel(metric_key: str) -> str:
 
 def plot_curves(
     output_path: str,
-    curves: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    curves: List[Tuple],
     y_label: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=FIGSIZE)
 
-    for condition_key, steps, mean, stderr in curves:
+    for curve in curves:
+        if len(curve) == 4:
+            condition_key, steps, mean, stderr = curve
+            lower = mean - stderr
+            upper = mean + stderr
+        else:
+            condition_key, steps, mean, lower, upper = curve
         meta = CONDITION_META[condition_key]
-        ax.plot(steps, mean, label=meta["label"], color=meta["color"], linewidth=LINEWIDTH)
+        ax.plot(
+            steps, mean, label=meta["label"], color=meta["color"], linewidth=LINEWIDTH
+        )
         ax.fill_between(
             steps,
-            mean - stderr,
-            mean + stderr,
+            lower,
+            upper,
             color=meta["color"],
             alpha=0.25,
         )
@@ -298,13 +403,30 @@ def ensure_output_dirs(plots_root: str) -> Dict[str, str]:
 def main() -> None:
     args = parse_args()
     api = wandb.Api(timeout=args.timeout)
+    env_order = ENV_ORDER
+    if args.envs:
+        requested_envs = [
+            env.strip().lower() for env in args.envs.split(",") if env.strip()
+        ]
+        unknown_envs = [env for env in requested_envs if env not in ENV_ORDER]
+        if unknown_envs:
+            raise SystemExit(f"Unknown envs in --envs: {', '.join(unknown_envs)}")
+        env_order = requested_envs
 
     grouped_runs = collect_runs(api, args.prefix)
     if not grouped_runs:
         raise SystemExit("No runs matched required filters and config fields.")
 
+    external_muon = {}
+    if args.muon_data_dir:
+        for env_name in env_order:
+            muon_path = os.path.join(args.muon_data_dir, MUON_DATA_FILES[env_name])
+            external_muon[env_name] = parse_external_muon_csv(
+                muon_path, args.metric_key
+            )
+
     print("\nRun counts by env/condition:")
-    for env_name in ENV_ORDER:
+    for env_name in env_order:
         counts = grouped_runs.get(env_name, {})
         print(
             f"  {env_name:18s} "
@@ -316,8 +438,10 @@ def main() -> None:
 
     aggregated = defaultdict(dict)
     print("\nAggregating conditions...")
-    for env_name in ENV_ORDER:
+    for env_name in env_order:
         for condition in CONDITION_META:
+            if condition == "external_muon":
+                continue
             runs = grouped_runs.get(env_name, {}).get(condition, [])
             steps, mean, stderr, valid_count = aggregate_condition(
                 runs=runs,
@@ -347,6 +471,7 @@ def main() -> None:
         },
         "cnn_only": {
             "required_conditions": ["cnn_muon", "cnn_adam"],
+            "optional_conditions": ["external_muon"],
             "filename_template": "{env}_cnn_muon_vs_adam.png",
         },
         "vit_only": {
@@ -361,7 +486,7 @@ def main() -> None:
 
     for folder_name, spec in folder_specs.items():
         required = spec["required_conditions"]
-        for env_name in ENV_ORDER:
+        for env_name in env_order:
             env_data = aggregated.get(env_name, {})
             missing = [cond for cond in required if cond not in env_data]
             if missing:
@@ -382,8 +507,27 @@ def main() -> None:
                 curves.append((cond, steps, mean, stderr))
 
             if len(curves) != len(required):
-                skipped[folder_name].append((env_name, ["step_cutoff_removed_condition"]))
+                skipped[folder_name].append(
+                    (env_name, ["step_cutoff_removed_condition"])
+                )
                 continue
+
+            for cond in spec.get("optional_conditions", []):
+                if cond != "external_muon":
+                    continue
+                muon_curve = external_muon.get(env_name)
+                if not muon_curve or muon_curve[0] is None:
+                    continue
+                steps, mean, lower, upper = muon_curve
+                if max_step is not None:
+                    keep = steps <= max_step
+                    if not np.any(keep):
+                        continue
+                    steps = steps[keep]
+                    mean = mean[keep]
+                    lower = lower[keep]
+                    upper = upper[keep]
+                curves.append((cond, steps, mean, lower, upper))
 
             filename = spec["filename_template"].format(env=env_name)
             output_path = os.path.join(output_dirs[folder_name], filename)

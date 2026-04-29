@@ -57,10 +57,13 @@ HALFCHEETAH_STRUCTURED_MODES = (
     "high_friction_low_gravity",
 )
 SUPPORTED_RANGE_SAMPLERS = ("linear_uniform", "uniform", "log_uniform")
+SUPPORTED_GEOM_FRICTION_APPLY_MODES = ("uniform_defaults", "shared_scalar")
 SUPPORTED_ENV_BACKENDS = {
-    "halfcheetah": ("spring",),
+    "ant": ("spring", "generalized"),
+    "halfcheetah": ("spring", "generalized"),
+    "hopper": ("spring", "generalized"),
     "inverted_pendulum": ("spring", "generalized"),
-    "walker2d": ("spring",),
+    "walker2d": ("spring", "generalized"),
 }
 ACTUATOR_NAMES_BY_ENV = {
     "halfcheetah": HALFCHEETAH_ACTUATOR_NAMES,
@@ -176,7 +179,6 @@ def validate_continual_dynamics_config(
         raise ValueError("At least one continual dynamics parameter must be enabled.")
     _validate_task_sampler_config(config)
 
-    actuator_names = _actuator_names(env_name)
     for name in enabled:
         param_config = _parameter_config(config, name)
         if name == "geom_friction_slide":
@@ -184,7 +186,7 @@ def validate_continual_dynamics_config(
         elif name == "actuator_gear":
             _validate_named_vector_config(
                 param_config,
-                actuator_names,
+                _actuator_names(env_name),
                 np.asarray(jax.device_get(base_sys.actuator.gear), dtype=np.float64),
                 "actuator_gear",
             )
@@ -245,7 +247,6 @@ def make_dynamics_task(
         return DynamicsTask(task_index=task_index, is_default=False, values=values)
 
     values: Dict[str, Any] = {}
-    actuator_names = _actuator_names(config.env_name)
 
     for name in _enabled_parameters(config):
         key, param_key = jax.random.split(key)
@@ -260,7 +261,7 @@ def make_dynamics_task(
         elif name == "actuator_gear":
             values[name] = _sample_named_ranges(
                 param_key,
-                actuator_names,
+                _actuator_names(config.env_name),
                 param_config["ranges"],
                 _range_sampler(param_config),
             )
@@ -309,16 +310,18 @@ def default_task_values(
 ) -> Dict[str, Any]:
     """Returns default values for the enabled config parameters."""
     values: Dict[str, Any] = {}
-    actuator_names = _actuator_names(config.env_name)
     for name in _enabled_parameters(config):
+        param_config = _parameter_config(config, name)
         if name == "geom_friction_slide":
+            if _geom_friction_apply_mode(param_config) == "shared_scalar":
+                continue
             friction = np.asarray(jax.device_get(base_sys.geom_friction), dtype=np.float64)
             values[name] = float(friction[0, 0])
         elif name == "actuator_gear":
             gear = np.asarray(jax.device_get(base_sys.actuator.gear), dtype=np.float64)
             values[name] = {
                 actuator_name: float(gear[i])
-                for i, actuator_name in enumerate(actuator_names)
+                for i, actuator_name in enumerate(_actuator_names(config.env_name))
             }
         elif name == "link_mass":
             mass = np.asarray(jax.device_get(base_sys.link.inertia.mass), dtype=np.float64)
@@ -826,6 +829,16 @@ def _range_sampler(param_config: Dict[str, Any]) -> str:
     return sampler
 
 
+def _geom_friction_apply_mode(param_config: Dict[str, Any]) -> str:
+    mode = str(param_config.get("apply_mode", "uniform_defaults"))
+    if mode not in SUPPORTED_GEOM_FRICTION_APPLY_MODES:
+        raise ValueError(
+            "geom_friction_slide.apply_mode must be one of "
+            f"{SUPPORTED_GEOM_FRICTION_APPLY_MODES}; got {mode!r}."
+        )
+    return mode
+
+
 def _validate_range_sampler(
     sampler: str,
     minval: float,
@@ -844,13 +857,32 @@ def _validate_geom_friction_config(param_config: Dict[str, Any], base_sys: Any) 
     _require_scalar_range(param_config, "geom_friction_slide")
     friction = np.asarray(jax.device_get(base_sys.geom_friction), dtype=np.float64)
     slide = friction[:, 0]
-    if not np.allclose(slide, slide[0], atol=DEFAULT_TOLERANCE, rtol=0.0):
-        raise ValueError("Expected one default slide friction value across all geoms.")
-    _assert_default_close(
-        float(param_config.get("default")),
-        float(slide[0]),
-        "geom_friction_slide.default",
-    )
+    mode = _geom_friction_apply_mode(param_config)
+    has_uniform_defaults = np.allclose(slide, slide[0], atol=DEFAULT_TOLERANCE, rtol=0.0)
+
+    if mode == "uniform_defaults":
+        if not has_uniform_defaults:
+            raise ValueError("Expected one default slide friction value across all geoms.")
+        if "default" not in param_config:
+            raise ValueError("geom_friction_slide.default must be set.")
+        _assert_default_close(
+            float(param_config.get("default")),
+            float(slide[0]),
+            "geom_friction_slide.default",
+        )
+        return
+
+    if "default" in param_config:
+        if not has_uniform_defaults:
+            raise ValueError(
+                "geom_friction_slide.default must be omitted for shared_scalar "
+                "when base geom frictions are nonuniform."
+            )
+        _assert_default_close(
+            float(param_config.get("default")),
+            float(slide[0]),
+            "geom_friction_slide.default",
+        )
 
 
 def _validate_gravity_z_config(param_config: Dict[str, Any], base_sys: Any) -> None:

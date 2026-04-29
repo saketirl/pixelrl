@@ -52,3 +52,80 @@ Interpretation / next checks:
 - Because LR annealing was disabled for both runs, the collapse is not explained by global LR decay.
 - Since task schedule, seed, PPO settings, and dynamics config match, the key controlled difference is actor/critic hidden activation.
 - A useful follow-up is to inspect when the ReLU collapse begins relative to `continual_switch` task indices, then compare task-local adaptation curves against swish.
+
+## 2026-04-25: SlipperyAnt throughput winner
+
+Experiment: state-observation SlipperyAnt Brax wrapper, using
+`scripts/CL/brax/slippery_ant_wrapper_lr1e4.sh` / `ppo_slippery_brax.py`.
+
+Goal:
+- Maximize GPU throughput while still reaching roughly `2000` episodic return by about `5M` global steps.
+
+Current winning config:
+- Optimizer: Adam
+- Actor/critic activation: `swish`
+- `N_ENVS=128`
+- `NUM_STEPS=10`
+- `NUM_MINIBATCHES=32`
+- `UPDATE_EPOCHS=4`
+- Batch size: `1280`
+- Minibatch size: `40`
+- Learning rate: `1e-4`
+- Action repeat: `4`
+
+Observed at about `5M` steps in throughput sweep group
+`slippery_ant_throughput_swish_adam_stiefel_71774`:
+- SPS: about `12,890`
+- Episodic return: about `2,343`
+
+Interpretation:
+- This baseline-shape Adam/swish config is the fastest tested config that still clears the `~2000` return target by `5M`.
+- Larger vectorized Adam/swish configs were faster but failed the performance gate:
+  - `256 envs x 10 steps`: about `22,773` SPS, return about `1,278`
+  - `256 envs x 20 steps`: about `26,572` SPS, return about `-37`
+  - `256 envs x 40 steps`: about `28,870` SPS, return about `-85`
+- The high-throughput `256 x 40` Adam/relu hyperparameter sweep did not recover learning; tested LR/epoch variants stayed strongly negative by `5M`.
+- Multi-process GPU packing fits in memory but does not improve aggregate SPS; it mainly trades per-run speed for breadth.
+
+Recommended command:
+
+```bash
+ACTOR_CRITIC_ACTIVATION=swish HEADS_OPTIMIZER=adam \
+N_ENVS=128 NUM_STEPS=10 NUM_MINIBATCHES=32 UPDATE_EPOCHS=4 \
+sbatch scripts/CL/brax/slippery_ant_wrapper_lr1e4.sh
+```
+
+## 2026-04-26: PixelBrax SlipperyAnt first batch plan
+
+Goal:
+- Replicate the state-observation SlipperyAnt setup in PixelBrax without wasting the first full GPU on eight identical baseline seeds.
+- Use the same slippery schedule semantics as `scripts/CL/brax/slippery_ant_wrapper_lr1e4.sh`:
+  - `PHASE_EVERY_ENV_STEPS=4999936`
+  - `NUM_PHASES=20`
+  - `N_ENVS=128`
+  - `NUM_STEPS=10`
+  - `ACTION_REPEAT=4`
+  - `SLIPPERY_CHANGE_EVERY=(PHASE_EVERY_ENV_STEPS / N_ENVS) * ACTION_REPEAT = 156248`
+
+Implementation status:
+- `ppo_pixelbrax.py` now has optional `--slippery-ant` support using the CSV schedule from `configs/continual/slippery_ant_wrapper.py`.
+- New PixelBrax launchers live in `scripts/CL/pixelbrax/`.
+- `--debug-repr` should not be used for packed training runs; it caused large extra allocations and made pack-2 fail artificially.
+
+Packing probe:
+- Short probes used `total_timesteps=12800` per child, so SPS is compile-dominated.
+- Pack 2 without debug metrics completed: per-run SPS about `107-108`.
+- Pack 4 without debug metrics completed: per-run SPS about `61-65`.
+- Pack 8 without debug metrics completed: per-run SPS about `43-47`.
+- Pack 12 failed during GPU library initialization with cuSolver/cuBLAS allocation errors.
+- Practical setting for the current default PixelBrax config: `RUNS_PER_GPU=8`.
+
+Recommended first 8-run batch:
+- Run one GPU with 8 packed jobs for a clean plain-head Adam LR comparison.
+- Proposed jobs:
+  - plain-head Adam, LR `1e-4`, seeds `0,1,2,3`
+  - plain-head Adam, LR `3e-4`, seeds `0,1,2,3`
+
+Interpretation:
+- This directly validates the PixelBrax analogue of the state-Brax winner while giving a fair LR comparison.
+- It avoids optimizer/head-architecture confounds in the first batch; test Stiefel and CRATE heads only after seeing which Adam LR is alive.

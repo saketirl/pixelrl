@@ -38,6 +38,10 @@ from pixelbrax.continual_dynamics import (
     validate_continual_dynamics_config,
 )
 from pixelbrax.env_utils import make_pixel_brax
+from configs.continual.slippery_ant_wrapper import (
+    DEFAULT_SLIPPERY_FRICTIONS_CSV,
+    load_seeded_friction_schedule_table,
+)
 
 # Import manifold Stiefel optimizer
 from manifold_stiefel_optax import manifold_stiefel
@@ -45,7 +49,7 @@ from encoders import build_encoder
 from sigreg import sigreg_loss, sigreg_loss_masked
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 # Fix CUDNN non-determinism
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
@@ -223,6 +227,14 @@ class Args:
     # Continual dynamics
     continual_dynamics_config: Optional[str] = None
     """Path to a YAML continual dynamics config"""
+
+    # SlipperyAnt friction schedule
+    slippery_ant: bool = False
+    """Use the CSV-backed SlipperyAnt friction schedule."""
+    slippery_change_every: int = 100_000
+    """Number of underlying per-env timesteps between SlipperyAnt friction changes."""
+    slippery_schedule_seed: int = 0
+    """CSV row used for SlipperyAnt friction phases."""
 
     # Debug/analysis flags
     debug_repr: bool = False
@@ -1362,6 +1374,47 @@ def random_shift(key: jax.random.PRNGKey, x: jnp.ndarray, pad: int = 4) -> jnp.n
     return jax.vmap(crop_single)(x_padded, crop_h, crop_w)
 
 
+def slippery_phase_from_timestep(
+    timestep: int,
+    change_every: int,
+    num_seeded_phases: int,
+) -> int:
+    """Map a 1-indexed post-step timestep to the default-plus-CSV regime index."""
+    zero_based_timestep = max(int(timestep) - 1, 0)
+    phase = zero_based_timestep // change_every
+    total_phases = num_seeded_phases + 1
+    return min(phase, total_phases - 1)
+
+
+def latest_slippery_pixel_metrics(
+    global_step: int,
+    args: Args,
+    default_geom_friction: np.ndarray,
+    friction_schedule: np.ndarray,
+) -> dict[str, float]:
+    timestep = int((global_step // args.n_envs) * args.action_repeat)
+    phase = slippery_phase_from_timestep(
+        timestep=timestep,
+        change_every=args.slippery_change_every,
+        num_seeded_phases=int(friction_schedule.shape[0]),
+    )
+    if phase == 0:
+        geom_friction = default_geom_friction
+    else:
+        friction = float(friction_schedule[min(phase - 1, friction_schedule.shape[0] - 1)])
+        geom_friction = default_geom_friction.copy()
+        geom_friction[:, 0] = friction
+
+    slide_friction = geom_friction[:, 0]
+    return {
+        "slippery/friction_slide_mean": float(np.mean(slide_friction)),
+        "slippery/friction_slide_first_env": float(slide_friction[0]),
+        "slippery/timestep_first_env": timestep,
+        "slippery/phase_first_env": phase,
+        "slippery/change_every": int(args.slippery_change_every),
+    }
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -1370,6 +1423,13 @@ if __name__ == "__main__":
     if args.data_seed < 0:
         args.data_seed = args.seed
     args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
+    if args.slippery_ant:
+        if args.env_name != "ant":
+            raise ValueError("--slippery-ant currently supports only --env-name ant.")
+        if args.slippery_change_every <= 0:
+            raise ValueError("--slippery-change-every must be positive.")
+        if args.continual_dynamics_config is not None:
+            raise ValueError("--slippery-ant cannot be combined with --continual-dynamics-config.")
 
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -1508,6 +1568,8 @@ if __name__ == "__main__":
     task_start_step = 0
     updates_per_task = 0
     schedule_seed = args.data_seed
+    slippery_friction_schedule = None
+    slippery_default_geom_friction = None
 
     if args.continual_dynamics_config is not None:
         loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
@@ -1540,6 +1602,33 @@ if __name__ == "__main__":
             )
         else:
             print("\nContinual dynamics: config disabled; using fixed dynamics")
+
+    if args.slippery_ant:
+        friction_table = load_seeded_friction_schedule_table(
+            str(DEFAULT_SLIPPERY_FRICTIONS_CSV.resolve())
+        )
+        if args.slippery_schedule_seed < 0 or args.slippery_schedule_seed >= friction_table.shape[0]:
+            raise ValueError(
+                f"slippery_schedule_seed={args.slippery_schedule_seed} is out of range "
+                f"for {friction_table.shape[0]} seeded friction rows."
+            )
+        slippery_friction_schedule = friction_table[args.slippery_schedule_seed].astype(np.float32)
+        slippery_default_geom_friction = np.asarray(
+            jax.device_get(base_sys.geom_friction),
+            dtype=np.float32,
+        )
+        print("\nSlipperyAnt friction schedule: ENABLED")
+        print(f"  source: {DEFAULT_SLIPPERY_FRICTIONS_CSV}")
+        print(f"  change_every: {args.slippery_change_every}")
+        print(f"  schedule_seed: {args.slippery_schedule_seed}")
+        print(f"  num_csv_phases: {slippery_friction_schedule.shape[0]}")
+        print("  phase friction_first_geom")
+        for phase in range(min(6, slippery_friction_schedule.shape[0] + 1)):
+            if phase == 0:
+                friction = float(slippery_default_geom_friction[0, 0])
+            else:
+                friction = float(slippery_friction_schedule[phase - 1])
+            print(f"  {phase:5d} {friction:.6g}")
 
     # Get observation shape
     reset_rng = jax.random.split(jax.random.PRNGKey(args.data_seed), args.n_envs)
@@ -2493,11 +2582,38 @@ if __name__ == "__main__":
     # Initialize reward normalizer
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
-    def step_once(current_sys, carry, step):
+    if args.slippery_ant:
+        slippery_friction_schedule_jnp = jnp.asarray(slippery_friction_schedule, dtype=jnp.float32)
+        slippery_default_geom_friction_jnp = jnp.asarray(
+            slippery_default_geom_friction,
+            dtype=jnp.float32,
+        )
+
+        def sys_for_rollout_step(current_sys, rollout_start_policy_step, step):
+            physical_timestep = (rollout_start_policy_step + step) * args.action_repeat
+            phase = physical_timestep // args.slippery_change_every
+            schedule_phase = jnp.minimum(
+                jnp.maximum(phase - 1, 0),
+                slippery_friction_schedule_jnp.shape[0] - 1,
+            )
+            friction = slippery_friction_schedule_jnp[schedule_phase]
+            scheduled_geom_friction = slippery_default_geom_friction_jnp.at[:, 0].set(friction)
+            new_geom_friction = jax.lax.select(
+                phase > 0,
+                scheduled_geom_friction,
+                slippery_default_geom_friction_jnp,
+            )
+            return current_sys.replace(geom_friction=new_geom_friction)
+    else:
+        def sys_for_rollout_step(current_sys, rollout_start_policy_step, step):
+            return current_sys
+
+    def step_once(current_sys, rollout_start_policy_step, carry, step):
         agent_state, episode_stats, reward_norm, fs, env_state, obs, done, key = carry
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
-        env_state = envs.step_with_sys(current_sys, env_state, action)
+        step_sys = sys_for_rollout_step(current_sys, rollout_start_policy_step, step)
+        env_state = envs.step_with_sys(step_sys, env_state, action)
         raw_obs = env_state.pixels
         raw_reward = env_state.reward
         next_done_local = env_state.done.astype(jnp.bool_)
@@ -2552,6 +2668,7 @@ if __name__ == "__main__":
 
     def rollout(
         current_sys,
+        rollout_start_policy_step,
         agent_state,
         episode_stats,
         reward_norm,
@@ -2572,7 +2689,7 @@ if __name__ == "__main__":
             next_done,
             key,
         ), storage = jax.lax.scan(
-            partial(step_once, current_sys),
+            partial(step_once, current_sys, rollout_start_policy_step),
             (agent_state, episode_stats, reward_norm, fs, env_state, next_obs, next_done, key),
             jnp.arange(max_steps),
         )
@@ -2705,6 +2822,7 @@ if __name__ == "__main__":
             key,
         ) = rollout(
             current_sys,
+            global_step // args.n_envs,
             agent_state,
             episode_stats,
             reward_normalizer,
@@ -2841,6 +2959,14 @@ if __name__ == "__main__":
             cumulative_episodic_return += avg_episodic_return
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
+            slippery_metrics = None
+            if args.slippery_ant:
+                slippery_metrics = latest_slippery_pixel_metrics(
+                    global_step,
+                    args,
+                    slippery_default_geom_friction,
+                    slippery_friction_schedule,
+                )
 
             base_msg = (
                 f"update={iteration} step={global_step} "
@@ -2849,6 +2975,11 @@ if __name__ == "__main__":
                 f"loss={loss[-1, -1].item():.4f} "
                 f"SPS={sps}"
             )
+            if slippery_metrics is not None:
+                base_msg += (
+                    f" friction={slippery_metrics['slippery/friction_slide_first_env']:.4g}"
+                    f" phase={slippery_metrics['slippery/phase_first_env']}"
+                )
             print(base_msg)
 
             if args.track:
@@ -2933,6 +3064,8 @@ if __name__ == "__main__":
                             global_step=global_step,
                         )
                     )
+                if slippery_metrics is not None:
+                    log_dict.update(slippery_metrics)
 
                 traj_metrics = rollout_trajectory_metrics(
                     storage,

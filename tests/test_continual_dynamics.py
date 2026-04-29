@@ -24,10 +24,26 @@ from pixelbrax.continual_dynamics import (
 )
 
 
-def _halfcheetah_sys():
+def _halfcheetah_sys(backend="spring"):
     return envs.create(
         env_name="halfcheetah",
-        backend="spring",
+        backend=backend,
+        action_repeat=1,
+    ).sys
+
+
+def _ant_sys(backend="spring"):
+    return envs.create(
+        env_name="ant",
+        backend=backend,
+        action_repeat=1,
+    ).sys
+
+
+def _hopper_sys(backend="spring"):
+    return envs.create(
+        env_name="hopper",
+        backend=backend,
         action_repeat=1,
     ).sys
 
@@ -40,10 +56,10 @@ def _inverted_pendulum_sys():
     ).sys
 
 
-def _walker2d_sys():
+def _walker2d_sys(backend="spring"):
     return envs.create(
         env_name="walker2d",
-        backend="spring",
+        backend=backend,
         action_repeat=1,
     ).sys
 
@@ -51,6 +67,24 @@ def _walker2d_sys():
 def _template_config():
     return load_continual_dynamics_config(
         str(REPO_ROOT / "configs" / "continual" / "halfcheetah_dynamics.yaml")
+    )
+
+
+def _halfcheetah_friction_dohare_config():
+    return load_continual_dynamics_config(
+        str(REPO_ROOT / "configs" / "continual" / "halfcheetah_friction_dohare.yaml")
+    )
+
+
+def _ant_friction_dohare_config():
+    return load_continual_dynamics_config(
+        str(REPO_ROOT / "configs" / "continual" / "ant_friction_dohare.yaml")
+    )
+
+
+def _hopper_friction_dohare_config():
+    return load_continual_dynamics_config(
+        str(REPO_ROOT / "configs" / "continual" / "hopper_friction_dohare.yaml")
     )
 
 
@@ -63,6 +97,12 @@ def _inverted_pendulum_config():
 def _walker2d_config():
     return load_continual_dynamics_config(
         str(REPO_ROOT / "configs" / "continual" / "walker2d_dynamics.yaml")
+    )
+
+
+def _walker2d_friction_dohare_config():
+    return load_continual_dynamics_config(
+        str(REPO_ROOT / "configs" / "continual" / "walker2d_friction_dohare.yaml")
     )
 
 
@@ -425,6 +465,57 @@ def test_apply_sampled_task_changes_only_dynamics_shapes():
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+@pytest.mark.parametrize("backend", ["spring", "generalized"])
+@pytest.mark.parametrize(
+    ("env_name", "sys_fn", "config_fn"),
+    [
+        ("halfcheetah", _halfcheetah_sys, _halfcheetah_friction_dohare_config),
+        ("ant", _ant_sys, _ant_friction_dohare_config),
+        ("hopper", _hopper_sys, _hopper_friction_dohare_config),
+        ("walker2d", _walker2d_sys, _walker2d_friction_dohare_config),
+    ],
+)
+def test_shared_scalar_friction_configs_validate_and_apply(env_name, sys_fn, config_fn, backend):
+    base_sys = sys_fn(backend=backend)
+    base_geom_friction = np.asarray(jax.device_get(base_sys.geom_friction))
+    config = replace(config_fn(), backend=backend)
+
+    updates_per_task = validate_continual_dynamics_config(
+        config,
+        env_name=env_name,
+        backend=backend,
+        n_envs=128,
+        num_steps=10,
+        base_sys=base_sys,
+    )
+    assert updates_per_task == config.switch_every_env_steps // (128 * 10)
+
+    task0 = make_dynamics_task(config, base_sys, task_index=0, schedule_seed=7)
+    assert task0.is_default
+    assert "geom_friction_slide" not in task0.values
+    assert apply_dynamics_task(base_sys, task0) is base_sys
+
+    task1_a = make_dynamics_task(config, base_sys, task_index=1, schedule_seed=7)
+    task1_b = make_dynamics_task(config, base_sys, task_index=1, schedule_seed=7)
+    assert task1_a == task1_b
+    assert not task1_a.is_default
+    assert 0.02 <= task1_a.values["geom_friction_slide"] <= 2.0
+
+    new_sys = apply_dynamics_task(base_sys, task1_a)
+    sampled_friction = task1_a.values["geom_friction_slide"]
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.geom_friction))[:, 0],
+        np.full(base_geom_friction.shape[0], sampled_friction),
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(new_sys.geom_friction))[:, 1:],
+        base_geom_friction[:, 1:],
+    )
+    assert new_sys.q_size() == base_sys.q_size()
+    assert new_sys.qd_size() == base_sys.qd_size()
+    assert new_sys.act_size() == base_sys.act_size()
 
 
 def test_validation_rejects_non_divisible_switch_steps():

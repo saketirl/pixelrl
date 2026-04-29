@@ -26,12 +26,17 @@ import wandb
 DEFAULT_METRIC_KEY = "charts/avg_episodic_return"
 REQUIRED_TAGS = {"allenv9", "sweep6seeds", "cnn_vit_heads_muon_me"}
 TARGET_ENVS = ["ant", "humanoid"]
+MUON_DATA_FILES = {
+    "ant": "ant_muon.csv",
+    "humanoid": "humanoid_muon.csv",
+}
 
 LABELS = {
     "baseline_cnn_adam": "CNN Encoder + Adam",
     "baseline_cnn_muon": "CNN Encoder + Manifold Muon (ours)",
     "crate_muon": "CNN CRATE Encoder + Manifold Muon (ours)",
     "crate_adam": "CNN CRATE Encoder + Adam",
+    "external_muon": "_nolegend_",
 }
 
 COLORS = {
@@ -39,6 +44,7 @@ COLORS = {
     "baseline_cnn_muon": "tab:orange",
     "crate_muon": "tab:red",
     "crate_adam": "tab:green",
+    "external_muon": "tab:purple",
 }
 
 FIGSIZE = (10, 6)  # default/wide aspect ratio
@@ -65,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         "--plots-dir",
         default=".worktrees/vit-muon/plots/crate",
         help="Directory where plot PNGs are written.",
+    )
+    parser.add_argument(
+        "--muon-data-dir",
+        default=None,
+        help="Optional directory containing new-convention *_muon.csv files.",
     )
     parser.add_argument(
         "--metric-key",
@@ -115,7 +126,9 @@ def _coerce_bool(value) -> Optional[bool]:
     return None
 
 
-def _extract_rows(history, metric_key: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def _extract_rows(
+    history, metric_key: str
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     # wandb may return pandas DataFrame or list[dict].
     if hasattr(history, "dropna"):
         history = history.dropna(subset=[metric_key])
@@ -188,7 +201,9 @@ def aggregate_wandb_runs(
         return None, None, None, valid_count
 
     common_steps = np.linspace(min_step, max_step, num_points)
-    interp = np.array([np.interp(common_steps, s, v) for s, v in zip(all_steps, all_values)])
+    interp = np.array(
+        [np.interp(common_steps, s, v) for s, v in zip(all_steps, all_values)]
+    )
     mean = np.mean(interp, axis=0)
     stderr = np.std(interp, axis=0) / np.sqrt(len(interp))
     return common_steps, mean, stderr, valid_count
@@ -289,6 +304,75 @@ def parse_crate_csv(
     )
 
 
+def parse_external_muon_csv(
+    path: str,
+    metric_key: str,
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing Muon CSV: {path}")
+
+    mean_col = f"heads_optimizer: muon - {metric_key}"
+    min_col = f"{mean_col}__MIN"
+    max_col = f"{mean_col}__MAX"
+
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = [col.strip().strip('"') for col in next(reader)]
+        except StopIteration:
+            return None, None, None, None
+
+        required = {"Step": None, mean_col: None, min_col: None, max_col: None}
+        for i, col in enumerate(header):
+            if col in required:
+                required[col] = i
+
+        missing = [col for col, idx in required.items() if idx is None]
+        if missing:
+            raise ValueError(f"Missing columns in {path}: {', '.join(missing)}")
+
+        steps = []
+        means = []
+        lowers = []
+        uppers = []
+        for row in reader:
+            try:
+                step = float(row[required["Step"]])
+                mean = float(row[required[mean_col]])
+                lower = float(row[required[min_col]])
+                upper = float(row[required[max_col]])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not (
+                np.isfinite(step)
+                and np.isfinite(mean)
+                and np.isfinite(lower)
+                and np.isfinite(upper)
+            ):
+                continue
+            steps.append(step)
+            means.append(mean)
+            lowers.append(lower)
+            uppers.append(upper)
+
+    if not steps:
+        return None, None, None, None
+
+    step_arr = np.asarray(steps, dtype=float)
+    order = np.argsort(step_arr)
+    return (
+        step_arr[order],
+        np.asarray(means, dtype=float)[order],
+        np.asarray(lowers, dtype=float)[order],
+        np.asarray(uppers, dtype=float)[order],
+    )
+
+
 def _baseline_condition_from_config(config: Dict) -> Optional[str]:
     encoder_type = str(config.get("encoder_type", "")).strip().lower()
     use_heads_muon = _coerce_bool(config.get("use_heads_muon"))
@@ -342,19 +426,27 @@ def metric_to_ylabel(metric_key: str) -> str:
 
 def plot_curves(
     output_path: str,
-    curves: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]],
+    curves: List[Tuple],
     y_label: str,
     color_overrides: Optional[Dict[str, str]] = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=FIGSIZE)
 
-    for key, steps, mean, stderr in curves:
-        color = color_overrides.get(key, COLORS[key]) if color_overrides else COLORS[key]
+    for curve in curves:
+        if len(curve) == 4:
+            key, steps, mean, stderr = curve
+            lower = mean - stderr
+            upper = mean + stderr
+        else:
+            key, steps, mean, lower, upper = curve
+        color = (
+            color_overrides.get(key, COLORS[key]) if color_overrides else COLORS[key]
+        )
         ax.plot(steps, mean, label=LABELS[key], color=color, linewidth=LINEWIDTH)
         ax.fill_between(
             steps,
-            mean - stderr,
-            mean + stderr,
+            lower,
+            upper,
             color=color,
             alpha=0.25,
         )
@@ -377,6 +469,13 @@ def main() -> None:
 
     api = wandb.Api(timeout=args.timeout)
     baseline_runs = collect_baseline_runs(api, args.prefix)
+    external_muon = {}
+    if args.muon_data_dir:
+        for env_name in TARGET_ENVS:
+            muon_path = os.path.join(args.muon_data_dir, MUON_DATA_FILES[env_name])
+            external_muon[env_name] = parse_external_muon_csv(
+                muon_path, args.metric_key
+            )
 
     y_label = metric_to_ylabel(args.metric_key)
     summary = []
@@ -411,8 +510,12 @@ def main() -> None:
         else:
             print(f"  baseline_cnn_muon: aggregated {baseline_muon[3]} runs")
 
-        crate_muon_path = os.path.join(args.crate_data_dir, f"{env_name}_crate_muon.csv")
-        crate_adam_path = os.path.join(args.crate_data_dir, f"{env_name}_crate_adam.csv")
+        crate_muon_path = os.path.join(
+            args.crate_data_dir, f"{env_name}_crate_muon.csv"
+        )
+        crate_adam_path = os.path.join(
+            args.crate_data_dir, f"{env_name}_crate_adam.csv"
+        )
 
         crate_muon = parse_crate_csv(crate_muon_path, args.min_runs_per_condition)
         if crate_muon[0] is None:
@@ -428,15 +531,42 @@ def main() -> None:
         else:
             print(f"  crate_adam: aggregated {crate_adam[3]} runs")
 
+        muon_curve = external_muon.get(env_name)
+        if muon_curve and muon_curve[0] is not None:
+            print(f"  external_muon: loaded {len(muon_curve[0])} points")
+        else:
+            env_summary["skipped"].append("external_muon")
+
         # Plot 1: baseline vs crate muon
         if baseline_adam[0] is not None and crate_muon[0] is not None:
-            output_1 = os.path.join(args.plots_dir, f"{env_name}_cnn_adam_vs_crate_muon.png")
+            output_1 = os.path.join(
+                args.plots_dir, f"{env_name}_cnn_adam_vs_crate_muon.png"
+            )
             curves_1 = [
                 ("crate_muon", crate_muon[0], crate_muon[1], crate_muon[2]),
-                ("baseline_cnn_adam", baseline_adam[0], baseline_adam[1], baseline_adam[2]),
+                (
+                    "baseline_cnn_adam",
+                    baseline_adam[0],
+                    baseline_adam[1],
+                    baseline_adam[2],
+                ),
             ]
-            color_overrides_1 = {"crate_muon": "tab:orange"} if env_name == "humanoid" else None
-            plot_curves(output_1, curves_1, y_label=y_label, color_overrides=color_overrides_1)
+            if muon_curve and muon_curve[0] is not None:
+                curves_1.append(
+                    (
+                        "external_muon",
+                        muon_curve[0],
+                        muon_curve[1],
+                        muon_curve[2],
+                        muon_curve[3],
+                    )
+                )
+            color_overrides_1 = (
+                {"crate_muon": "tab:orange"} if env_name == "humanoid" else None
+            )
+            plot_curves(
+                output_1, curves_1, y_label=y_label, color_overrides=color_overrides_1
+            )
             env_summary["written"].append(os.path.basename(output_1))
         else:
             env_summary["skipped"].append("plot_baseline_vs_crate_muon")
@@ -453,8 +583,23 @@ def main() -> None:
             curves_2 = [
                 ("crate_muon", crate_muon[0], crate_muon[1], crate_muon[2]),
                 ("crate_adam", crate_adam[0], crate_adam[1], crate_adam[2]),
-                ("baseline_cnn_adam", baseline_adam[0], baseline_adam[1], baseline_adam[2]),
+                (
+                    "baseline_cnn_adam",
+                    baseline_adam[0],
+                    baseline_adam[1],
+                    baseline_adam[2],
+                ),
             ]
+            if muon_curve and muon_curve[0] is not None:
+                curves_2.append(
+                    (
+                        "external_muon",
+                        muon_curve[0],
+                        muon_curve[1],
+                        muon_curve[2],
+                        muon_curve[3],
+                    )
+                )
             plot_curves(output_2, curves_2, y_label=y_label)
             env_summary["written"].append(os.path.basename(output_2))
         else:
@@ -472,11 +617,31 @@ def main() -> None:
                 f"{env_name}_cnn_adam_vs_cnn_muon_vs_crate_muon_vs_crate_adam.png",
             )
             curves_3 = [
-                ("baseline_cnn_adam", baseline_adam[0], baseline_adam[1], baseline_adam[2]),
-                ("baseline_cnn_muon", baseline_muon[0], baseline_muon[1], baseline_muon[2]),
+                (
+                    "baseline_cnn_adam",
+                    baseline_adam[0],
+                    baseline_adam[1],
+                    baseline_adam[2],
+                ),
+                (
+                    "baseline_cnn_muon",
+                    baseline_muon[0],
+                    baseline_muon[1],
+                    baseline_muon[2],
+                ),
                 ("crate_muon", crate_muon[0], crate_muon[1], crate_muon[2]),
                 ("crate_adam", crate_adam[0], crate_adam[1], crate_adam[2]),
             ]
+            if muon_curve and muon_curve[0] is not None:
+                curves_3.append(
+                    (
+                        "external_muon",
+                        muon_curve[0],
+                        muon_curve[1],
+                        muon_curve[2],
+                        muon_curve[3],
+                    )
+                )
             plot_curves(output_3, curves_3, y_label=y_label)
             env_summary["written"].append(os.path.basename(output_3))
         else:
