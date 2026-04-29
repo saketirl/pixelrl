@@ -36,7 +36,7 @@ from encoders import build_encoder
 from sigreg import sigreg_loss, sigreg_loss_masked
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 # Fix CUDNN non-determinism
 os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic_reductions"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
@@ -344,6 +344,10 @@ class Args:
     """If true, use CRATE-style FeedForward as final hidden layer in actor/critic."""
     crate_step_size: float = 0.1
     """Step size for CRATE FeedForward ISTA update."""
+    head_hidden_dim: int = 256
+    """Hidden dimension for actor/critic MLP heads."""
+    head_crate_layers: int = 1
+    """Number of CRATE FeedForward layers to stack in actor/critic CRATE heads."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -356,11 +360,13 @@ class Args:
 
 class Critic(nn.Module):
     """Value network with 2 hidden layers using Swish activation."""
+    hidden_dim: int = 256
+
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
         return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
 
@@ -368,6 +374,7 @@ class Critic(nn.Module):
 class Actor(nn.Module):
     """Continuous action actor with 2 hidden layers using Swish activation."""
     action_dim: int
+    hidden_dim: int = 256
     state_dependent_std: bool = False
     state_std_tanh_scale: float = 0.5
     logstd_min: float = -5.0
@@ -380,9 +387,9 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
         actor_mean = nn.Dense(
             self.action_dim,
@@ -437,12 +444,15 @@ class Actor(nn.Module):
 class CRATECritic(nn.Module):
     """Value network with CRATE FeedForward as final hidden layer."""
     crate_step_size: float = 0.1
+    hidden_dim: int = 256
+    crate_layers: int = 1
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
-        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
+        for _ in range(self.crate_layers):
+            x = CRATEFeedForward(dim=self.hidden_dim, step_size=self.crate_step_size)(x)
         return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
 
 
@@ -450,6 +460,8 @@ class CRATEActor(nn.Module):
     """Continuous action actor with CRATE FeedForward as final hidden layer."""
     action_dim: int
     crate_step_size: float = 0.1
+    hidden_dim: int = 256
+    crate_layers: int = 1
     state_dependent_std: bool = False
     state_std_tanh_scale: float = 0.5
     logstd_min: float = -5.0
@@ -462,9 +474,10 @@ class CRATEActor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.swish(x)
-        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
+        for _ in range(self.crate_layers):
+            x = CRATEFeedForward(dim=self.hidden_dim, step_size=self.crate_step_size)(x)
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
@@ -1357,6 +1370,10 @@ if __name__ == "__main__":
     if args.data_seed < 0:
         args.data_seed = args.seed
     args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
+    if args.head_hidden_dim <= 0:
+        raise ValueError(f"head_hidden_dim must be positive, got {args.head_hidden_dim}")
+    if args.head_crate_layers <= 0:
+        raise ValueError(f"head_crate_layers must be positive, got {args.head_crate_layers}")
 
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -1461,6 +1478,10 @@ if __name__ == "__main__":
     print(f"  actor_logstd_init: {args.actor_logstd_init}")
     print(f"  actor_mean_tanh: {args.actor_mean_tanh}")
     print(f"  actor_mean_scale: {args.actor_mean_scale}")
+    print(f"  use_crate_head: {args.use_crate_head}")
+    print(f"  crate_step_size: {args.crate_step_size}")
+    print(f"  head_hidden_dim: {args.head_hidden_dim}")
+    print(f"  head_crate_layers: {args.head_crate_layers}")
     print(f"  anneal_lr: {args.anneal_lr}")
     print("=" * 60)
 
@@ -1520,6 +1541,8 @@ if __name__ == "__main__":
         actor = CRATEActor(
             action_dim=action_dim,
             crate_step_size=args.crate_step_size,
+            hidden_dim=args.head_hidden_dim,
+            crate_layers=args.head_crate_layers,
             state_dependent_std=args.state_dependent_std,
             state_std_tanh_scale=args.state_std_tanh_scale,
             logstd_min=args.actor_logstd_min,
@@ -1530,11 +1553,21 @@ if __name__ == "__main__":
             actor_mean_tanh=args.actor_mean_tanh,
             actor_mean_scale=args.actor_mean_scale,
         )
-        critic = CRATECritic(crate_step_size=args.crate_step_size)
-        print(f"Using CRATE heads with step_size={args.crate_step_size}")
+        critic = CRATECritic(
+            crate_step_size=args.crate_step_size,
+            hidden_dim=args.head_hidden_dim,
+            crate_layers=args.head_crate_layers,
+        )
+        print(
+            "Using CRATE heads with "
+            f"hidden_dim={args.head_hidden_dim}, "
+            f"crate_layers={args.head_crate_layers}, "
+            f"step_size={args.crate_step_size}"
+        )
     else:
         actor = Actor(
             action_dim=action_dim,
+            hidden_dim=args.head_hidden_dim,
             state_dependent_std=args.state_dependent_std,
             state_std_tanh_scale=args.state_std_tanh_scale,
             logstd_min=args.actor_logstd_min,
@@ -1545,7 +1578,7 @@ if __name__ == "__main__":
             actor_mean_tanh=args.actor_mean_tanh,
             actor_mean_scale=args.actor_mean_scale,
         )
-        critic = Critic()
+        critic = Critic(hidden_dim=args.head_hidden_dim)
 
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
