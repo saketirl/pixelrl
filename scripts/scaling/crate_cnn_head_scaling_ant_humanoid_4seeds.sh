@@ -107,7 +107,7 @@ HEAD_CRATE_LAYER_COUNT="${HEAD_CRATE_LAYERS[$SCALE_IDX]}"
 
 BASE_HEADS_STIEFEL_LR="0.001"
 BASE_HEADS_ADAM_LR="0.0003"
-LR_SCALE="$(awk -v width="${HEAD_WIDTH}" -v layers="${HEAD_CRATE_LAYER_COUNT}" 'BEGIN { printf "%.12g", (256.0 / width) * sqrt(layers) }')"
+LR_SCALE="$(awk -v width="${HEAD_WIDTH}" -v layers="${HEAD_CRATE_LAYER_COUNT}" 'BEGIN { printf "%.12g", sqrt(width / 256.0) * layers }')"
 HEADS_STIEFEL_LR="$(awk -v base="${BASE_HEADS_STIEFEL_LR}" -v scale="${LR_SCALE}" 'BEGIN { printf "%.12g", base * scale }')"
 HEADS_ADAM_LR="$(awk -v base="${BASE_HEADS_ADAM_LR}" -v scale="${LR_SCALE}" 'BEGIN { printf "%.12g", base * scale }')"
 

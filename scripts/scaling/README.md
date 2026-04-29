@@ -92,12 +92,12 @@ env_idx   = TASK_ID / 28
 Only actor/critic head learning rates are scaled:
 
 ```text
-scale = (256 / head_width) * sqrt(head_crate_layers)
+scale = sqrt(head_width / 256) * head_crate_layers
 heads_stiefel_lr = 0.001 * scale
 heads_adam_lr    = 0.0003 * scale
 ```
 
-The encoder LR stays fixed at `3e-4` because the encoder is not scaled.
+This is the baseline-preserving form of `sqrt(width) * layers`: `head_width=256` and `head_crate_layers=1` gives `scale=1`. The encoder LR stays fixed at `3e-4` because the encoder is not scaled.
 
 ## Memory Notes
 
