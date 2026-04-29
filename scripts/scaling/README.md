@@ -61,7 +61,7 @@ sbatch scripts/scaling/crate_cnn_head_scaling_ant_humanoid_4seeds.sh encoder "" 
 
 ## Sweep
 
-The SLURM array is `0-63%4`, for 64 total tasks and 4 concurrent tasks.
+The SLURM array is `0-55%4`, for 56 total tasks and 4 concurrent tasks.
 
 Task dimensions:
 
@@ -69,21 +69,22 @@ Task dimensions:
 - Backends: `spring`, `spring`
 - Seeds: `0`, `1`, `2`, `3`
 - Scaling configs:
-  - baseline: `head_width=256`, `head_crate_layers=1`
+  - baseline/depth: `head_width=256`, `head_crate_layers=1`
   - width: `head_width=512`, `head_crate_layers=1`
   - width: `head_width=1024`, `head_crate_layers=1`
   - width: `head_width=2048`, `head_crate_layers=1`
-  - depth: `head_width=256`, `head_crate_layers=2`
-  - depth: `head_width=256`, `head_crate_layers=4`
   - depth: `head_width=256`, `head_crate_layers=8`
   - depth: `head_width=256`, `head_crate_layers=16`
+  - depth: `head_width=256`, `head_crate_layers=32`
+
+The depth curve is locked to `head_crate_layers={1,8,16,32}`, with `256 x 1` shared as the width baseline.
 
 Task mapping:
 
 ```text
 seed_idx  = TASK_ID % 4
-scale_idx = (TASK_ID / 4) % 8
-env_idx   = TASK_ID / 32
+scale_idx = (TASK_ID / 4) % 7
+env_idx   = TASK_ID / 28
 ```
 
 ## Learning Rate Scaling

@@ -7,7 +7,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --mem=64GB
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-63%4
+#SBATCH --array=0-55%4
 
 set -euo pipefail
 
@@ -18,17 +18,16 @@ set -euo pipefail
 #   env    in {ant, humanoid}
 #   seed   in {0, 1, 2, 3}
 #   config in {
-#     baseline: width=256,  layers=1,
+#     baseline/depth: width=256,  layers=1,
 #     width:    width=512,  layers=1,
 #     width:    width=1024, layers=1,
 #     width:    width=2048, layers=1,
-#     depth:    width=256,  layers=2,
-#     depth:    width=256,  layers=4,
 #     depth:    width=256,  layers=8,
-#     depth:    width=256,  layers=16
+#     depth:    width=256,  layers=16,
+#     depth:    width=256,  layers=32
 #   }
 #
-# 2 x 4 x 8 = 64 configs
+# 2 x 4 x 7 = 56 configs
 
 WANDB_PROJECT="${1:-encoder}"
 WANDB_ENTITY="${2:-}"
@@ -70,9 +69,9 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.22}"
 ENVS=(ant humanoid)
 BACKENDS=(spring spring)
 SEEDS=(0 1 2 3)
-SCALE_AXES=(baseline width width width depth depth depth depth)
-HEAD_WIDTHS=(256 512 1024 2048 256 256 256 256)
-HEAD_CRATE_LAYERS=(1 1 1 1 2 4 8 16)
+SCALE_AXES=(baseline width width width depth depth depth)
+HEAD_WIDTHS=(256 512 1024 2048 256 256 256)
+HEAD_CRATE_LAYERS=(1 1 1 1 8 16 32)
 
 NUM_ENVS=${#ENVS[@]}
 NUM_BACKENDS=${#BACKENDS[@]}
