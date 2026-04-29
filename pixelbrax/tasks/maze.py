@@ -1,0 +1,512 @@
+"""Goal-reaching maze tasks for PixelBrax.
+
+These environments are kept outside the Brax submodule and registered at
+runtime.  The robot definitions are loaded from the pinned Brax assets, then
+augmented with maze walls and a movable visual target.
+"""
+
+from __future__ import annotations
+
+import os
+import xml.etree.ElementTree as ET
+from typing import Sequence
+
+from brax import actuator
+from brax import base
+from brax import math
+from brax.envs.base import PipelineEnv, State
+from brax.io import mjcf
+from etils import epath
+import jax
+from jax import numpy as jp
+import mujoco
+
+
+RESET = "r"
+GOAL = "g"
+MAZE_HEIGHT = 0.5
+HUMANOID_TARGET_Z = 1.25
+
+U_MAZE = (
+    (1, 1, 1, 1, 1),
+    (1, RESET, GOAL, GOAL, 1),
+    (1, 1, 1, GOAL, 1),
+    (1, GOAL, GOAL, GOAL, 1),
+    (1, 1, 1, 1, 1),
+)
+
+
+def _brax_asset_path(filename: str) -> epath.Path:
+    return epath.resource_path("brax") / "envs/assets" / filename
+
+
+def _cells(layout: Sequence[Sequence[object]], value: object, scale: float) -> jp.ndarray:
+    coords = []
+    for row, cells in enumerate(layout):
+        for col, cell in enumerate(cells):
+            if cell == value:
+                coords.append([row * scale, col * scale])
+    if not coords:
+        raise ValueError(f"maze layout contains no {value!r} cells")
+    return jp.array(coords)
+
+
+def _set_init_qpos_length(root: ET.Element, extra_qpos: int) -> None:
+    custom = root.find("custom")
+    if custom is None:
+        return
+    init_qpos = custom.find("./numeric[@name='init_qpos']")
+    if init_qpos is not None:
+        data = init_qpos.get("data", "")
+        init_qpos.set("data", f"{data} {' '.join(['0.0'] * extra_qpos)}".strip())
+
+
+def _add_target_body(worldbody: ET.Element, target_z: float) -> None:
+    target = ET.SubElement(worldbody, "body", name="target", pos=f"0 0 {target_z}")
+    ET.SubElement(
+        target,
+        "joint",
+        name="target_x",
+        type="slide",
+        axis="1 0 0",
+        limited="false",
+        damping="0",
+        armature="0",
+    )
+    ET.SubElement(
+        target,
+        "joint",
+        name="target_y",
+        type="slide",
+        axis="0 1 0",
+        limited="false",
+        damping="0",
+        armature="0",
+    )
+    ET.SubElement(
+        target,
+        "geom",
+        name="target",
+        type="sphere",
+        size="0.4",
+        contype="0",
+        conaffinity="0",
+        rgba="0.1 0.8 0.2 1.0",
+    )
+
+
+def _maze_xml(
+    asset_filename: str,
+    layout: Sequence[Sequence[object]],
+    maze_size_scaling: float,
+    target_z: float,
+) -> tuple[bytes, jp.ndarray, jp.ndarray]:
+    xml_path = _brax_asset_path(asset_filename)
+    root = ET.parse(os.fspath(xml_path)).getroot()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise ValueError(f"{asset_filename} has no worldbody")
+
+    starts = _cells(layout, RESET, maze_size_scaling)
+    goals = _cells(layout, GOAL, maze_size_scaling)
+
+    for row, cells in enumerate(layout):
+        for col, cell in enumerate(cells):
+            if cell != 1:
+                continue
+            ET.SubElement(
+                worldbody,
+                "geom",
+                name=f"maze_wall_{row}_{col}",
+                type="box",
+                pos=(
+                    f"{row * maze_size_scaling} "
+                    f"{col * maze_size_scaling} "
+                    f"{MAZE_HEIGHT * maze_size_scaling / 2}"
+                ),
+                size=(
+                    f"{0.5 * maze_size_scaling} "
+                    f"{0.5 * maze_size_scaling} "
+                    f"{MAZE_HEIGHT * maze_size_scaling / 2}"
+                ),
+                contype="1",
+                conaffinity="1",
+                rgba="0.7 0.5 0.3 1.0",
+            )
+
+    _add_target_body(worldbody, target_z)
+    _set_init_qpos_length(root, extra_qpos=2)
+    return ET.tostring(root), starts, goals
+
+
+class AntMaze(PipelineEnv):
+    """Ant U-maze with dense goal-reaching reward."""
+
+    def __init__(
+        self,
+        ctrl_cost_weight=0.5,
+        use_contact_forces=False,
+        contact_cost_weight=5e-4,
+        healthy_reward=1.0,
+        terminate_when_unhealthy=True,
+        healthy_z_range=(0.2, 1.0),
+        contact_force_range=(-1.0, 1.0),
+        reset_noise_scale=0.1,
+        exclude_current_positions_from_observation=True,
+        backend="generalized",
+        maze_size_scaling=4.0,
+        **kwargs,
+    ):
+        xml, starts, goals = _maze_xml("ant.xml", U_MAZE, maze_size_scaling, 1.4)
+        sys = mjcf.loads(xml)
+        self.possible_starts = starts
+        self.possible_goals = goals
+
+        n_frames = 5
+        if backend in ["spring", "positional"]:
+            sys = sys.tree_replace({"opt.timestep": 0.005})
+            n_frames = 10
+
+        if backend == "mjx":
+            sys = sys.tree_replace(
+                {
+                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
+                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
+                    "opt.iterations": 1,
+                    "opt.ls_iterations": 4,
+                }
+            )
+
+        if backend == "positional":
+            sys = sys.replace(
+                actuator=sys.actuator.replace(gear=200 * jp.ones_like(sys.actuator.gear))
+            )
+
+        kwargs["n_frames"] = kwargs.get("n_frames", n_frames)
+        super().__init__(sys=sys, backend=backend, **kwargs)
+
+        self._ctrl_cost_weight = ctrl_cost_weight
+        self._use_contact_forces = use_contact_forces
+        self._contact_cost_weight = contact_cost_weight
+        self._healthy_reward = healthy_reward
+        self._terminate_when_unhealthy = terminate_when_unhealthy
+        self._healthy_z_range = healthy_z_range
+        self._contact_force_range = contact_force_range
+        self._reset_noise_scale = reset_noise_scale
+        self._exclude_current_positions_from_observation = (
+            exclude_current_positions_from_observation
+        )
+
+        if self._use_contact_forces:
+            raise NotImplementedError("use_contact_forces not implemented.")
+
+    def reset(self, rng: jax.Array) -> State:
+        rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+
+        low, hi = -self._reset_noise_scale, self._reset_noise_scale
+        q = self.sys.init_q + jax.random.uniform(
+            rng1, (self.sys.q_size(),), minval=low, maxval=hi
+        )
+        qd = hi * jax.random.normal(rng2, (self.sys.qd_size(),))
+
+        start = self._random_cell(rng3, self.possible_starts)
+        target = self._random_cell(rng4, self.possible_goals)
+        q = q.at[:2].set(start)
+        q = q.at[-2:].set(target)
+        qd = qd.at[-2:].set(0.0)
+
+        pipeline_state = self.pipeline_init(q, qd)
+        obs = self._get_obs(pipeline_state)
+        reward, done, zero = jp.zeros(3)
+        metrics = {
+            "reward_forward": zero,
+            "reward_survive": zero,
+            "reward_ctrl": zero,
+            "reward_contact": zero,
+            "x_position": zero,
+            "y_position": zero,
+            "distance_from_origin": zero,
+            "x_velocity": zero,
+            "y_velocity": zero,
+            "forward_reward": zero,
+            "dist": zero,
+            "success": zero,
+            "success_easy": zero,
+        }
+        return State(pipeline_state, obs, reward, done, metrics)
+
+    def step(self, state: State, action: jax.Array) -> State:
+        pipeline_state0 = state.pipeline_state
+        assert pipeline_state0 is not None
+        pipeline_state = self.pipeline_step(pipeline_state0, action)
+
+        velocity = (pipeline_state.x.pos[0] - pipeline_state0.x.pos[0]) / self.dt
+        forward_reward = velocity[0]
+
+        min_z, max_z = self._healthy_z_range
+        is_healthy = jp.where(pipeline_state.x.pos[0, 2] < min_z, 0.0, 1.0)
+        is_healthy = jp.where(pipeline_state.x.pos[0, 2] > max_z, 0.0, is_healthy)
+        healthy_reward = (
+            self._healthy_reward
+            if self._terminate_when_unhealthy
+            else self._healthy_reward * is_healthy
+        )
+        ctrl_cost = self._ctrl_cost_weight * jp.sum(jp.square(action))
+        contact_cost = 0.0
+
+        obs = self._get_obs(pipeline_state)
+        target_pos = pipeline_state.x.pos[-1][:2]
+        dist = jp.linalg.norm(pipeline_state.x.pos[0, :2] - target_pos)
+        success = jp.array(dist < 0.5, dtype=float)
+        success_easy = jp.array(dist < 2.0, dtype=float)
+        reward = -dist + healthy_reward - ctrl_cost - contact_cost
+        done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
+
+        state.metrics.update(
+            reward_forward=forward_reward,
+            reward_survive=healthy_reward,
+            reward_ctrl=-ctrl_cost,
+            reward_contact=-contact_cost,
+            x_position=pipeline_state.x.pos[0, 0],
+            y_position=pipeline_state.x.pos[0, 1],
+            distance_from_origin=math.safe_norm(pipeline_state.x.pos[0]),
+            x_velocity=velocity[0],
+            y_velocity=velocity[1],
+            forward_reward=forward_reward,
+            dist=dist,
+            success=success,
+            success_easy=success_easy,
+        )
+        return state.replace(
+            pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
+        )
+
+    def _get_obs(self, pipeline_state: base.State) -> jax.Array:
+        qpos = pipeline_state.q[:-2]
+        qvel = pipeline_state.qd[:-2]
+        target_pos = pipeline_state.x.pos[-1][:2]
+
+        if self._exclude_current_positions_from_observation:
+            qpos = qpos[2:]
+
+        return jp.concatenate([qpos, qvel, target_pos])
+
+    def _random_cell(self, rng: jax.Array, cells: jp.ndarray) -> jax.Array:
+        idx = jax.random.randint(rng, (), 0, cells.shape[0])
+        return cells[idx]
+
+
+class HumanoidMaze(PipelineEnv):
+    """Humanoid U-maze with dense goal-reaching reward."""
+
+    def __init__(
+        self,
+        forward_reward_weight=1.25,
+        ctrl_cost_weight=0.1,
+        healthy_reward=5.0,
+        terminate_when_unhealthy=True,
+        healthy_z_range=(1.0, 2.0),
+        reset_noise_scale=0.0,
+        exclude_current_positions_from_observation=False,
+        backend="generalized",
+        maze_size_scaling=2.0,
+        **kwargs,
+    ):
+        xml, starts, goals = _maze_xml(
+            "humanoid.xml", U_MAZE, maze_size_scaling, HUMANOID_TARGET_Z
+        )
+        sys = mjcf.loads(xml)
+        self.possible_starts = starts
+        self.possible_goals = goals
+
+        n_frames = 5
+        if backend in ["spring", "positional"]:
+            sys = sys.tree_replace({"opt.timestep": 0.0015})
+            n_frames = 10
+            gear = jp.array(
+                [
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    350.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.0,
+                ]
+            )
+            sys = sys.replace(actuator=sys.actuator.replace(gear=gear))
+
+        if backend == "mjx":
+            sys = sys.tree_replace(
+                {
+                    "opt.solver": mujoco.mjtSolver.mjSOL_NEWTON,
+                    "opt.disableflags": mujoco.mjtDisableBit.mjDSBL_EULERDAMP,
+                    "opt.iterations": 1,
+                    "opt.ls_iterations": 4,
+                }
+            )
+
+        kwargs["n_frames"] = kwargs.get("n_frames", n_frames)
+        super().__init__(sys=sys, backend=backend, **kwargs)
+
+        self._forward_reward_weight = forward_reward_weight
+        self._ctrl_cost_weight = ctrl_cost_weight
+        self._healthy_reward = healthy_reward
+        self._terminate_when_unhealthy = terminate_when_unhealthy
+        self._healthy_z_range = healthy_z_range
+        self._reset_noise_scale = reset_noise_scale
+        self._exclude_current_positions_from_observation = (
+            exclude_current_positions_from_observation
+        )
+
+    def reset(self, rng: jax.Array) -> State:
+        rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+
+        low, hi = -self._reset_noise_scale, self._reset_noise_scale
+        qpos = self.sys.init_q + jax.random.uniform(
+            rng1, (self.sys.q_size(),), minval=low, maxval=hi
+        )
+        qvel = jax.random.uniform(rng2, (self.sys.qd_size(),), minval=low, maxval=hi)
+
+        start = self._random_cell(rng3, self.possible_starts)
+        target = self._random_cell(rng4, self.possible_goals)
+        qpos = qpos.at[:2].set(start)
+        qpos = qpos.at[-2:].set(target)
+        qvel = qvel.at[-2:].set(0.0)
+
+        pipeline_state = self.pipeline_init(qpos, qvel)
+        obs = self._get_obs(pipeline_state, jp.zeros(self.sys.act_size()))
+        reward, done, zero = jp.zeros(3)
+        metrics = {
+            "forward_reward": zero,
+            "reward_linvel": zero,
+            "reward_quadctrl": zero,
+            "reward_alive": zero,
+            "x_position": zero,
+            "y_position": zero,
+            "distance_from_origin": zero,
+            "x_velocity": zero,
+            "y_velocity": zero,
+            "dist": zero,
+            "success": zero,
+            "success_easy": zero,
+        }
+        return State(pipeline_state, obs, reward, done, metrics)
+
+    def step(self, state: State, action: jax.Array) -> State:
+        action_min = self.sys.actuator.ctrl_range[:, 0]
+        action_max = self.sys.actuator.ctrl_range[:, 1]
+        action = (action + 1) * (action_max - action_min) * 0.5 + action_min
+
+        pipeline_state0 = state.pipeline_state
+        assert pipeline_state0 is not None
+        pipeline_state = self.pipeline_step(pipeline_state0, action)
+
+        com_before, *_ = self._com(pipeline_state0)
+        com_after, *_ = self._com(pipeline_state)
+        velocity = (com_after - com_before) / self.dt
+        forward_reward = self._forward_reward_weight * velocity[0]
+
+        min_z, max_z = self._healthy_z_range
+        is_healthy = jp.where(pipeline_state.x.pos[0, 2] < min_z, 0.0, 1.0)
+        is_healthy = jp.where(pipeline_state.x.pos[0, 2] > max_z, 0.0, is_healthy)
+        healthy_reward = (
+            self._healthy_reward
+            if self._terminate_when_unhealthy
+            else self._healthy_reward * is_healthy
+        )
+        ctrl_cost = self._ctrl_cost_weight * jp.sum(jp.square(action))
+
+        obs = self._get_obs(pipeline_state, action)
+        dist = jp.linalg.norm(obs[:3] - obs[-3:])
+        success = jp.array(dist < 0.5, dtype=float)
+        success_easy = jp.array(dist < 2.0, dtype=float)
+        reward = -dist + healthy_reward - ctrl_cost
+        done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
+
+        state.metrics.update(
+            forward_reward=forward_reward,
+            reward_linvel=forward_reward,
+            reward_quadctrl=-ctrl_cost,
+            reward_alive=healthy_reward,
+            x_position=com_after[0],
+            y_position=com_after[1],
+            distance_from_origin=jp.linalg.norm(com_after),
+            x_velocity=velocity[0],
+            y_velocity=velocity[1],
+            dist=dist,
+            success=success,
+            success_easy=success_easy,
+        )
+
+        return state.replace(
+            pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
+        )
+
+    def _get_obs(self, pipeline_state: base.State, action: jax.Array) -> jax.Array:
+        position = pipeline_state.q
+        velocity = pipeline_state.qd
+
+        if self._exclude_current_positions_from_observation:
+            position = position[2:]
+
+        com, inertia, mass_sum, x_i = self._com(pipeline_state)
+        cinr = x_i.replace(pos=x_i.pos - com).vmap().do(inertia)
+        com_inertia = jp.hstack(
+            [cinr.i.reshape((cinr.i.shape[0], -1)), inertia.mass[:, None]]
+        )
+
+        xd_i = (
+            base.Transform.create(pos=x_i.pos - pipeline_state.x.pos)
+            .vmap()
+            .do(pipeline_state.xd)
+        )
+        com_vel = inertia.mass[:, None] * xd_i.vel / mass_sum
+        com_ang = xd_i.ang
+        com_velocity = jp.hstack([com_vel, com_ang])
+
+        qfrc_actuator = actuator.to_tau(
+            self.sys, action, pipeline_state.q, pipeline_state.qd
+        )
+
+        target_pos = pipeline_state.x.pos[-1][:2]
+        target = jp.concatenate([target_pos, jp.array([HUMANOID_TARGET_Z])])
+        return jp.concatenate(
+            [
+                position,
+                velocity,
+                com_inertia.ravel(),
+                com_velocity.ravel(),
+                qfrc_actuator,
+                target,
+            ]
+        )
+
+    def _com(self, pipeline_state: base.State) -> jax.Array:
+        inertia = self.sys.link.inertia
+        if self.backend in ["spring", "positional"]:
+            inertia = inertia.replace(
+                i=jax.vmap(jp.diag)(
+                    jax.vmap(jp.diagonal)(inertia.i)
+                    ** (1 - self.sys.spring_inertia_scale)
+                ),
+                mass=inertia.mass ** (1 - self.sys.spring_mass_scale),
+            )
+        mass_sum = jp.sum(inertia.mass)
+        x_i = pipeline_state.x.vmap().do(inertia.transform)
+        com = jp.sum(jax.vmap(jp.multiply)(inertia.mass, x_i.pos), axis=0) / mass_sum
+        return com, inertia, mass_sum, x_i
+
+    def _random_cell(self, rng: jax.Array, cells: jp.ndarray) -> jax.Array:
+        idx = jax.random.randint(rng, (), 0, cells.shape[0])
+        return cells[idx]
