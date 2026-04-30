@@ -177,6 +177,13 @@ def make_pixel_brax(
         # This is useful if the goems may move up/down (e.g., locomotion envs)
         CAM_Z = 3.5
         HFOV = 40.0
+    elif env_name == "ant_goal":
+        CAMERA_TARGET = 0
+        CAM_EYE = 0
+        CAM_OFF = jnp.array([0.0, -6.0, 3.0])
+        CAM_UP = jnp.array([0.0, 0.0, 1.0])
+        CAM_Z = 3.0
+        HFOV = 70.0
     elif env_name == "ant_u_maze":
         CAMERA_TARGET = 0
         CAM_EYE = 0
@@ -201,6 +208,13 @@ def make_pixel_brax(
         CAM_UP = jnp.array([0.0, 1.0, 0.0])
         CAM_Z = 14.0
         HFOV = 55.0
+    elif env_name == "humanoid_goal":
+        CAMERA_TARGET = 0
+        CAM_EYE = 0
+        CAM_OFF = jnp.array([0.0, -5.0, 3.2])
+        CAM_UP = jnp.array([0.0, 0.0, 1.0])
+        CAM_Z = 3.2
+        HFOV = 65.0
     elif "humanoid" in env_name:
         # if backend != 'generalized':
         #   raise AttributeError(f'Physics backend needs to be generalized.')
@@ -236,15 +250,18 @@ def make_pixel_brax(
 
     # The groundplane used in the environment. This component is important for the locomoation
     # tasks, as the agent needs to understand the contact between the plane and the rigid body
-    def grid(grid_size: int, color) -> jnp.ndarray:
+    def grid(grid_size: int, color, line_color=None) -> jnp.ndarray:
+        if line_color is None:
+            line_color = [0, 0, 0]
         grid = onp.zeros((grid_size, grid_size, 3), dtype=onp.single)
         grid[:, :] = onp.array(color) / 255.0
-        grid[0] = onp.zeros((grid_size, 3), dtype=onp.single)
+        grid[0] = onp.array(line_color) / 255.0
         # to reverse texture along y direction
-        grid[:, -1] = onp.zeros((grid_size, 3), dtype=onp.single)
+        grid[:, -1] = onp.array(line_color) / 255.0
         return jnp.asarray(grid)
 
     _GROUND: jnp.ndarray = grid(hw, [200, 200, 200])
+    _GOAL_GROUND: jnp.ndarray = grid(hw, [170, 170, 170], [100, 100, 100])
     _PLAIN_GROUND: jnp.ndarray = jnp.full((hw, hw, 3), 200 / 255.0)
     # print(f'_GROUND: {_GROUND} // {_GROUND.shape}')
     # qqq
@@ -305,11 +322,27 @@ def make_pixel_brax(
         if env_name == "reacher":
             # The geom we are attaching the camera to does not move, so we don't need anything special
             return state.x.pos[CAM_EYE, :] + CAM_OFF
+        elif env_name in ["ant_goal", "humanoid_goal"]:
+            agent_xy = state.x.pos[CAM_EYE, :2]
+            goal_xy = state.x.pos[-1, :2]
+            delta = goal_xy - agent_xy
+            dist = jnp.linalg.norm(delta)
+            default_back = jnp.array([0.0, -1.0])
+            back = jnp.where(dist > 1e-6, -delta / dist, default_back)
+            eye_xy = agent_xy + back * jnp.linalg.norm(CAM_OFF[:2])
+            return jnp.array([eye_xy[0], eye_xy[1], CAM_Z])
         elif env_name in ["ant_u_maze", "humanoid_u_maze"]:
             return CAM_OFF
         elif (
             env_name
-            in ["halfcheetah", "ant", "walker2d", "pusher", "swimmer", "hopper"]
+            in [
+                "halfcheetah",
+                "ant",
+                "walker2d",
+                "pusher",
+                "swimmer",
+                "hopper",
+            ]
             or "humanoid" in env_name
         ):
             # All the geoms the camera can attach to are going to be moving.
@@ -328,7 +361,12 @@ def make_pixel_brax(
 
     def get_target(state: brax.State) -> jnp.ndarray:
         """Gets target of camera. I.e., the center of the camera's viewport"""
-        if env_name in ["reacher", "ant", "pusher", "swimmer"]:
+        if env_name in ["reacher", "ant", "ant_goal", "pusher", "swimmer"]:
+            if env_name == "ant_goal":
+                agent = state.x.pos[CAMERA_TARGET, :]
+                goal = state.x.pos[-1, :]
+                look = agent + 0.5 * (goal - agent)
+                return jnp.array([look[0], look[1], 0.3])
             return jnp.array(
                 [state.x.pos[CAMERA_TARGET, 0], state.x.pos[CAMERA_TARGET, 1], 0]
             )
@@ -341,6 +379,11 @@ def make_pixel_brax(
                 [state.x.pos[CAMERA_TARGET, 0], state.x.pos[CAMERA_TARGET, 1], 0.6]
             )
         elif "humanoid" in env_name:
+            if env_name == "humanoid_goal":
+                agent = state.x.pos[CAMERA_TARGET, :]
+                goal = state.x.pos[-1, :]
+                look = agent + 0.4 * (goal - agent)
+                return jnp.array([look[0], look[1], 1.2])
             return jnp.array(
                 [state.x.pos[CAMERA_TARGET, 0], state.x.pos[CAMERA_TARGET, 1], 1.1]
             )
@@ -730,11 +773,20 @@ def make_pixel_brax(
                 ground = (
                     _PLAIN_GROUND
                     if env_name in ["ant_u_maze", "humanoid_u_maze"]
+                    else _GOAL_GROUND
+                    if env_name in ["ant_goal", "humanoid_goal"]
                     else _GROUND
+                )
+                ground_texture_scaling = (
+                    jnp.array(1.0)
+                    if env_name in ["ant_u_maze", "humanoid_u_maze"]
+                    else jnp.array(8192.0)
+                    if env_name in ["ant_goal", "humanoid_goal"]
+                    else jnp.array(8192.0)
                 )
                 model = create_cube(
                     half_extents=jnp.array([1000.0, 1000.0, 0.0001]),
-                    texture_scaling=jnp.array(1.0),
+                    texture_scaling=ground_texture_scaling,
                     diffuse_map=ground,
                     specular_map=specular_map,
                 )
