@@ -557,6 +557,7 @@ class Storage:
     returns: jnp.array
     rewards: jnp.array
     raw_rewards: jnp.array
+    env_metrics: dict
 
 
 @flax.struct.dataclass
@@ -866,6 +867,19 @@ def rollout_trajectory_metrics(
     metrics[f"{prefix}/frame_var_mean"] = jnp.mean(frame_var)
     metrics[f"{prefix}/frame_var_max"] = jnp.max(frame_var)
     metrics[f"{prefix}/frame_var_min"] = jnp.min(frame_var)
+    return metrics
+
+
+def rollout_env_metrics(storage: Storage, prefix: str = "env") -> dict:
+    """Summarize scalar environment metrics collected during rollout."""
+    metrics = {}
+    for name, values in storage.env_metrics.items():
+        values = values.astype(jnp.float32)
+        if values.ndim > 2:
+            continue
+        flat = values.reshape((-1,))
+        metrics[f"{prefix}/{name}_mean"] = jnp.mean(flat)
+        metrics[f"{prefix}/{name}_std"] = jnp.std(flat)
     return metrics
 
 
@@ -2485,6 +2499,7 @@ if __name__ == "__main__":
             raw_rewards=raw_reward,
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
+            env_metrics=env_state.metrics,
         )
         return (
             agent_state,
@@ -2723,7 +2738,10 @@ if __name__ == "__main__":
 
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
-            avg_episodic_length = np.mean(jax.device_get(episode_stats.returned_episode_lengths))
+            avg_episodic_length_agent = np.mean(jax.device_get(episode_stats.returned_episode_lengths))
+            avg_episodic_length_physics = avg_episodic_length_agent * args.action_repeat
+            avg_return_per_agent_step = avg_episodic_return / max(avg_episodic_length_agent, 1.0)
+            avg_return_per_physics_step = avg_episodic_return / max(avg_episodic_length_physics, 1.0)
             cumulative_episodic_return += avg_episodic_return
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
@@ -2731,7 +2749,8 @@ if __name__ == "__main__":
             base_msg = (
                 f"update={iteration} step={global_step} "
                 f"ep_return={avg_episodic_return:.1f} "
-                f"ep_len={avg_episodic_length * args.action_repeat:.0f} "
+                f"ep_len_agent={avg_episodic_length_agent:.0f} "
+                f"ep_len_physics={avg_episodic_length_physics:.0f} "
                 f"loss={loss[-1, -1].item():.4f} "
                 f"SPS={sps}"
             )
@@ -2758,7 +2777,11 @@ if __name__ == "__main__":
                     "global_step": global_step,
                     "charts/avg_episodic_return": avg_episodic_return,
                     "charts/cumulative_episodic_return": cumulative_episodic_return,
-                    "charts/avg_episodic_length": avg_episodic_length * args.action_repeat,
+                    "charts/avg_episodic_length": avg_episodic_length_physics,
+                    "charts/avg_episodic_length_agent": avg_episodic_length_agent,
+                    "charts/avg_episodic_length_physics": avg_episodic_length_physics,
+                    "charts/avg_return_per_agent_step": avg_return_per_agent_step,
+                    "charts/avg_return_per_physics_step": avg_return_per_physics_step,
                     "charts/encoder_lr": float(encoder_lr_current),
                     "charts/heads_adam_lr": float(heads_adam_lr_current),
                     "charts/heads_stiefel_lr": args.heads_stiefel_lr,
@@ -2817,6 +2840,10 @@ if __name__ == "__main__":
                     max_action=args.max_action,
                 )
                 for k, v in traj_metrics.items():
+                    log_dict[k] = float(v)
+
+                env_metrics = rollout_env_metrics(storage)
+                for k, v in env_metrics.items():
                     log_dict[k] = float(v)
 
                 # Debug metrics for encoder representations

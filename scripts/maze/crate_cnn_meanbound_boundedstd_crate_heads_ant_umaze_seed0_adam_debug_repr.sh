@@ -20,6 +20,7 @@ TOTAL_TIMESTEPS="${3:-10000000}"
 SEED="${4:-0}"
 ENV_NAME="${5:-ant_u_maze}"
 BACKEND="${6:-spring}"
+ACTION_REPEAT="${7:-4}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -58,11 +59,11 @@ ACTOR_LOGSTD_MIN="-5.0"
 ACTOR_LOGSTD_MAX="-1.4"
 
 GROUP_ID="${SLURM_JOB_ID:-local}"
-GROUP_NAME="maze_progress_reward_crate_cnn_meanbound_boundedstd_crate_heads_adam_debug_repr_${ENV_NAME}_seed${SEED}_${GROUP_ID}"
-EXP_NAME="ppo_maze_progressreward_cratecnn_meanbound_boundedstd_crate_adam_debugrepr_${ENV_NAME}_b${BACKEND}_s${SEED}"
+GROUP_NAME="maze_fixed_goal_ar${ACTION_REPEAT}_crate_cnn_meanbound_boundedstd_crate_heads_adam_debug_repr_${ENV_NAME}_seed${SEED}_${GROUP_ID}"
+EXP_NAME="ppo_maze_fixedgoal_ar${ACTION_REPEAT}_cratecnn_meanbound_boundedstd_crate_adam_debugrepr_${ENV_NAME}_b${BACKEND}_s${SEED}"
 
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="maze,pixel_maze,progress_reward,success_terminate,crate_cnn_meanbound_boundedstd,env_${ENV_NAME},backend_${BACKEND},seed_${SEED},encoder_crate_cnn,actor_mean_tanh,actor_mean_scale_${ACTOR_MEAN_SCALE},bounded_global_logstd,actor_logstd_init_${ACTOR_LOGSTD_INIT},actor_logstd_min_${ACTOR_LOGSTD_MIN},actor_logstd_max_${ACTOR_LOGSTD_MAX},headarch_crate,sigreg_off,encoder_crate_step_${ENCODER_CRATE_STEP_SIZE},head_crate_step_${CRATE_STEP_SIZE},single_seed,opt_adam,debug_repr"
+export WANDB_TAGS="maze,pixel_maze,fixed_goal,dense_distance_reward,action_repeat_${ACTION_REPEAT},crate_cnn_meanbound_boundedstd,env_${ENV_NAME},backend_${BACKEND},seed_${SEED},encoder_crate_cnn,actor_mean_tanh,actor_mean_scale_${ACTOR_MEAN_SCALE},bounded_global_logstd,actor_logstd_init_${ACTOR_LOGSTD_INIT},actor_logstd_min_${ACTOR_LOGSTD_MIN},actor_logstd_max_${ACTOR_LOGSTD_MAX},headarch_crate,sigreg_off,encoder_crate_step_${ENCODER_CRATE_STEP_SIZE},head_crate_step_${CRATE_STEP_SIZE},single_seed,opt_adam,debug_repr"
 
 COMMON_ARGS=(
   --env-name "${ENV_NAME}"
@@ -84,7 +85,7 @@ COMMON_ARGS=(
   --seed "${SEED}"
   --log-interval 1
   --frame-stack 4
-  --action-repeat 4
+  --action-repeat "${ACTION_REPEAT}"
   --anneal-lr
   --stiefel-dual-lr 0.01
   --stiefel-dual-steps 5
@@ -116,7 +117,7 @@ ARCH_ARGS=(
 )
 
 echo "Running Adam debug-repr variant in group=${GROUP_NAME}"
-echo "Config: env=${ENV_NAME} backend=${BACKEND} encoder=crate_cnn crate_head=true heads_optimizer=adam debug_repr=true seed=${SEED} wandb_project=${WANDB_PROJECT}"
+echo "Config: env=${ENV_NAME} backend=${BACKEND} action_repeat=${ACTION_REPEAT} encoder=crate_cnn crate_head=true heads_optimizer=adam debug_repr=true seed=${SEED} wandb_project=${WANDB_PROJECT}"
 echo "Exp: ${EXP_NAME}"
 
 cd "${REPO_ROOT}"

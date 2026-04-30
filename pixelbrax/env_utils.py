@@ -21,6 +21,7 @@ from typing import (
 )
 
 import brax
+from pixelbrax.tasks import register_pixelbrax_tasks
 
 # FOR NEW BRAX
 #from brax.io import image
@@ -176,6 +177,13 @@ def make_pixel_brax(
         # This is useful if the goems may move up/down (e.g., locomotion envs)
         CAM_Z = 3.5
         HFOV = 40.0
+    elif env_name == "ant_u_maze":
+        CAMERA_TARGET = 0
+        CAM_EYE = 0
+        CAM_OFF = jnp.array([8.0, 8.0, 22.0])
+        CAM_UP = jnp.array([0.0, 1.0, 0.0])
+        CAM_Z = 22.0
+        HFOV = 55.0
     elif env_name == "walker2d":
         if backend != "spring":
             raise AttributeError(f"Physics backend needs to be generalized.")
@@ -185,6 +193,13 @@ def make_pixel_brax(
         CAM_OFF = jnp.array([0.0, -2.1, -0.2])
         CAM_UP = jnp.array([0.0, 0.0, 1.0])
         CAM_Z = 0.8
+        HFOV = 55.0
+    elif env_name == "humanoid_u_maze":
+        CAMERA_TARGET = 0
+        CAM_EYE = 0
+        CAM_OFF = jnp.array([4.0, 4.0, 14.0])
+        CAM_UP = jnp.array([0.0, 1.0, 0.0])
+        CAM_Z = 14.0
         HFOV = 55.0
     elif "humanoid" in env_name:
         # if backend != 'generalized':
@@ -201,6 +216,7 @@ def make_pixel_brax(
 
     # Now that we have set up our rendering constants, we can create the env
     # This env comes with an autoreset wrapper by default. What to do with this>?
+    register_pixelbrax_tasks()
     env = envs.create(env_name=env_name, backend=backend, action_repeat=action_repeat)
     seed_key = jax.random.PRNGKey(seed=seed)
     ret = jax.jit(jax.random.split, static_argnames=("num",))(seed_key, num=n_envs)
@@ -229,6 +245,7 @@ def make_pixel_brax(
         return jnp.asarray(grid)
 
     _GROUND: jnp.ndarray = grid(hw, [200, 200, 200])
+    _PLAIN_GROUND: jnp.ndarray = jnp.full((hw, hw, 3), 200 / 255.0)
     # print(f'_GROUND: {_GROUND} // {_GROUND.shape}')
     # qqq
 
@@ -288,6 +305,8 @@ def make_pixel_brax(
         if env_name == "reacher":
             # The geom we are attaching the camera to does not move, so we don't need anything special
             return state.x.pos[CAM_EYE, :] + CAM_OFF
+        elif env_name in ["ant_u_maze", "humanoid_u_maze"]:
+            return CAM_OFF
         elif (
             env_name
             in ["halfcheetah", "ant", "walker2d", "pusher", "swimmer", "hopper"]
@@ -313,6 +332,10 @@ def make_pixel_brax(
             return jnp.array(
                 [state.x.pos[CAMERA_TARGET, 0], state.x.pos[CAMERA_TARGET, 1], 0]
             )
+        elif env_name == "ant_u_maze":
+            return jnp.array([8.0, 8.0, 0.0])
+        elif env_name == "humanoid_u_maze":
+            return jnp.array([4.0, 4.0, 0.0])
         elif env_name in ["halfcheetah", "walker2d", "hopper"]:
             return jnp.array(
                 [state.x.pos[CAMERA_TARGET, 0], state.x.pos[CAMERA_TARGET, 1], 0.6]
@@ -704,10 +727,15 @@ def make_pixel_brax(
 
             # Plane
             if geom_id == 0:
+                ground = (
+                    _PLAIN_GROUND
+                    if env_name in ["ant_u_maze", "humanoid_u_maze"]
+                    else _GROUND
+                )
                 model = create_cube(
                     half_extents=jnp.array([1000.0, 1000.0, 0.0001]),
-                    texture_scaling=jnp.array(8192.0),
-                    diffuse_map=_GROUND,
+                    texture_scaling=jnp.array(1.0),
+                    diffuse_map=ground,
                     specular_map=specular_map,
                 )
             # Sphere
@@ -1018,6 +1046,7 @@ def make_pixel_brax(
                 reward=raw_next_states.reward,
                 done=raw_next_states.done,
                 pixels=next_frames,
+                metrics=raw_next_states.metrics,
                 info=raw_next_states.info,
                 key=key,
                 frame_idx=frame_idx.astype(jnp.int8),

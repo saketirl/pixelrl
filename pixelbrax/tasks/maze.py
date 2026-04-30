@@ -161,6 +161,7 @@ class AntMaze(PipelineEnv):
         sys = mjcf.loads(xml)
         self.possible_starts = starts
         self.possible_goals = goals
+        self.fixed_goal = goals[-1]
 
         n_frames = 5
         if backend in ["spring", "positional"]:
@@ -201,7 +202,7 @@ class AntMaze(PipelineEnv):
             raise NotImplementedError("use_contact_forces not implemented.")
 
     def reset(self, rng: jax.Array) -> State:
-        rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+        rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
 
         low, hi = -self._reset_noise_scale, self._reset_noise_scale
         q = self.sys.init_q + jax.random.uniform(
@@ -210,7 +211,7 @@ class AntMaze(PipelineEnv):
         qd = hi * jax.random.normal(rng2, (self.sys.qd_size(),))
 
         start = self._random_cell(rng3, self.possible_starts)
-        target = self._random_cell(rng4, self.possible_goals)
+        target = self.fixed_goal
         q = q.at[:2].set(start)
         q = q.at[-2:].set(target)
         qd = qd.at[-2:].set(0.0)
@@ -318,6 +319,7 @@ class HumanoidMaze(PipelineEnv):
         sys = mjcf.loads(xml)
         self.possible_starts = starts
         self.possible_goals = goals
+        self.fixed_goal = goals[-1]
 
         n_frames = 5
         if backend in ["spring", "positional"]:
@@ -370,7 +372,7 @@ class HumanoidMaze(PipelineEnv):
         )
 
     def reset(self, rng: jax.Array) -> State:
-        rng, rng1, rng2, rng3, rng4 = jax.random.split(rng, 5)
+        rng, rng1, rng2, rng3 = jax.random.split(rng, 4)
 
         low, hi = -self._reset_noise_scale, self._reset_noise_scale
         qpos = self.sys.init_q + jax.random.uniform(
@@ -379,7 +381,7 @@ class HumanoidMaze(PipelineEnv):
         qvel = jax.random.uniform(rng2, (self.sys.qd_size(),), minval=low, maxval=hi)
 
         start = self._random_cell(rng3, self.possible_starts)
-        target = self._random_cell(rng4, self.possible_goals)
+        target = self.fixed_goal
         qpos = qpos.at[:2].set(start)
         qpos = qpos.at[-2:].set(target)
         qvel = qvel.at[-2:].set(0.0)
