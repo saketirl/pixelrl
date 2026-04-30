@@ -2,6 +2,8 @@
 
 from brax import envs
 
+from pixelbrax.tasks.goal import AntGoal
+from pixelbrax.tasks.goal import HumanoidGoal
 from pixelbrax.tasks.maze import AntMaze
 from pixelbrax.tasks.maze import HumanoidMaze
 
@@ -15,6 +17,8 @@ def register_pixelbrax_tasks() -> None:
     if _REGISTERED:
         return
 
+    envs.register_environment("ant_goal", AntGoal)
+    envs.register_environment("humanoid_goal", HumanoidGoal)
     envs.register_environment("ant_u_maze", AntMaze)
     envs.register_environment("humanoid_u_maze", HumanoidMaze)
     _REGISTERED = True
