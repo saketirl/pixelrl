@@ -107,6 +107,12 @@ class Args:
     """the number of parallel game environments"""
     hw: int = 84
     """height/width of the observation images"""
+    goal_progress_reward_scale: float = -1.0
+    """progress reward scale for *_goal envs; negative uses env default"""
+    goal_success_reward: float = -1.0
+    """success bonus for *_goal envs; negative uses env default"""
+    goal_distance_reward_scale: float = 0.0
+    """reserved distance reward scale tag for *_goal sweeps; current env ignores it unless implemented"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
@@ -230,6 +236,16 @@ class Args:
     """Directory for probe plots (subdirectory per probe call is created)."""
     probe_save_plots: bool = False
     """If true, generate probe/additive plots to disk and log them to wandb when tracking."""
+    save_rollout_gif: bool = False
+    """If true, save deterministic rollout GIFs every rollout_gif_step global steps."""
+    rollout_gif_step: int = 1000000
+    """Global step interval for saving rollout GIFs."""
+    rollout_gif_dir: str = "outputs/rollouts"
+    """Directory for rollout GIFs."""
+    rollout_gif_steps: int = 250
+    """Number of agent steps to render in the rollout GIF."""
+    rollout_gif_fps: int = 20
+    """Frames per second for rollout GIF playback."""
 
     # Encoder architecture
     encoder_type: str = "cnn"
@@ -1327,6 +1343,15 @@ def create_optimizer(
 
 def make_pixelbrax_envs(args):
     """Create PixelBrax environments."""
+    env_kwargs = {}
+    if args.env_name in ["ant_goal", "humanoid_goal"]:
+        if args.goal_progress_reward_scale >= 0:
+            env_kwargs["progress_reward_scale"] = args.goal_progress_reward_scale
+        if args.goal_success_reward >= 0:
+            env_kwargs["success_reward"] = args.goal_success_reward
+        if args.goal_distance_reward_scale != 0:
+            env_kwargs["distance_reward_scale"] = args.goal_distance_reward_scale
+
     envs, _, _ = make_pixel_brax(
         backend=args.backend,
         env_name=args.env_name,
@@ -1338,6 +1363,7 @@ def make_pixelbrax_envs(args):
         video_set="train",
         return_float32=False,
         action_repeat=args.action_repeat,
+        env_kwargs=env_kwargs,
     )
 
     try:
@@ -2563,6 +2589,55 @@ if __name__ == "__main__":
     # Probe metrics are buffered here and flushed into the main wandb.log call
     # so we never call wandb.log twice at the same step.
     pending_probe_metrics: dict = {}
+    next_rollout_gif_step = (
+        args.rollout_gif_step if args.rollout_gif_step > 0 else float("inf")
+    )
+
+    def save_policy_rollout_gif(step: int) -> str:
+        from PIL import Image
+
+        os.makedirs(args.rollout_gif_dir, exist_ok=True)
+        key_eval = jax.random.PRNGKey(args.data_seed + step + 100003)
+        reset_rngs = jax.random.split(key_eval, args.n_envs)
+        gif_env_state = envs.reset(reset_rngs)
+        gif_frame_stack = FrameStack.create(args.n_envs, args.frame_stack, raw_obs_shape)
+        gif_frame_stack = gif_frame_stack.reset(gif_env_state.pixels)
+        gif_obs = gif_frame_stack.get_stacked()
+        frames = [np.asarray(jax.device_get(gif_env_state.pixels[0, :, :, -3:]))]
+
+        for _ in range(args.rollout_gif_steps):
+            actor_hidden, _ = split_actor_critic_hiddens(
+                network.apply(agent_state.params["network"], gif_obs)
+            )
+            actor_mean, _ = actor.apply(agent_state.params["actor"], actor_hidden)
+            action = jnp.clip(actor_mean, -args.max_action, args.max_action)
+            gif_env_state = envs.step(gif_env_state, action)
+            raw_obs = gif_env_state.pixels
+            gif_frame_stack = gif_frame_stack.push(raw_obs)
+            gif_frame_stack = gif_frame_stack.reset(
+                raw_obs, gif_env_state.done.astype(jnp.bool_)
+            )
+            gif_obs = gif_frame_stack.get_stacked()
+            frames.append(np.asarray(jax.device_get(raw_obs[0, :, :, -3:])))
+
+        safe_exp_name = "".join(
+            c if c.isalnum() or c in ("-", "_", ".") else "_" for c in args.exp_name
+        )
+        gif_path = os.path.join(
+            args.rollout_gif_dir,
+            f"{safe_exp_name}_seed{args.seed}_step{step}.gif",
+        )
+        duration_ms = max(1, int(1000 / max(args.rollout_gif_fps, 1)))
+        pil_frames = [Image.fromarray(frame) for frame in frames]
+        pil_frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=duration_ms,
+            loop=0,
+        )
+        print(f"[rollout_gif] saved {gif_path}")
+        return gif_path
 
     # Probe at initialisation (step 0) — establishes random-encoder baseline.
     if args.probe_interval > 0:
@@ -2735,6 +2810,18 @@ if __name__ == "__main__":
                 print(f"Checkpoint saved to {ckpt_path}")
 
             next_probe_step += args.probe_interval
+
+        if (
+            args.save_rollout_gif
+            and args.rollout_gif_step > 0
+            and global_step >= next_rollout_gif_step
+        ):
+            gif_path = save_policy_rollout_gif(global_step)
+            next_rollout_gif_step += args.rollout_gif_step
+            if args.track:
+                pending_probe_metrics["rollout/gif"] = wandb.Video(
+                    gif_path, fps=args.rollout_gif_fps, format="gif"
+                )
 
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))

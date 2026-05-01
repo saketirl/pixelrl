@@ -66,6 +66,7 @@ def make_pixel_brax(
     action_repeat=1,
     return_float32=True,
     frame_stack=3,
+    env_kwargs=None,
 ):
     assert backend in ["generalized", "positional", "spring"]
     assert video_set in ["train", "test"]
@@ -231,7 +232,14 @@ def make_pixel_brax(
     # Now that we have set up our rendering constants, we can create the env
     # This env comes with an autoreset wrapper by default. What to do with this>?
     register_pixelbrax_tasks()
-    env = envs.create(env_name=env_name, backend=backend, action_repeat=action_repeat)
+    if env_kwargs is None:
+        env_kwargs = {}
+    env = envs.create(
+        env_name=env_name,
+        backend=backend,
+        action_repeat=action_repeat,
+        **env_kwargs,
+    )
     seed_key = jax.random.PRNGKey(seed=seed)
     ret = jax.jit(jax.random.split, static_argnames=("num",))(seed_key, num=n_envs)
     seed_key = ret[0]

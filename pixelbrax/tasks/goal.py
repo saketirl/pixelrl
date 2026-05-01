@@ -101,6 +101,9 @@ class AntGoal(PipelineEnv):
         exclude_current_positions_from_observation=True,
         backend="generalized",
         goal_radius=10.0,
+        progress_reward_scale=10.0,
+        success_reward=50.0,
+        distance_reward_scale=0.0,
         **kwargs,
     ):
         sys = mjcf.loads(_goal_xml("ant.xml", target_z=0.01))
@@ -140,6 +143,9 @@ class AntGoal(PipelineEnv):
             exclude_current_positions_from_observation
         )
         self._goal_radius = goal_radius
+        self._progress_reward_scale = progress_reward_scale
+        self._success_reward = success_reward
+        self._distance_reward_scale = distance_reward_scale
 
         if self._use_contact_forces:
             raise NotImplementedError("use_contact_forces not implemented.")
@@ -165,6 +171,12 @@ class AntGoal(PipelineEnv):
             "reward_survive": zero,
             "reward_ctrl": zero,
             "reward_contact": zero,
+            "reward_goal": zero,
+            "reward_progress": zero,
+            "reward_success": zero,
+            "reward_distance": zero,
+            "progress": zero,
+            "prev_dist": zero,
             "x_position": zero,
             "y_position": zero,
             "distance_from_origin": zero,
@@ -198,10 +210,22 @@ class AntGoal(PipelineEnv):
 
         obs = self._get_obs(pipeline_state)
         target_pos = pipeline_state.x.pos[-1][:2]
+        prev_dist = jp.linalg.norm(pipeline_state0.x.pos[0, :2] - target_pos)
         dist = jp.linalg.norm(pipeline_state.x.pos[0, :2] - target_pos)
+        progress = prev_dist - dist
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2.0, dtype=float)
-        reward = -dist + healthy_reward - ctrl_cost - contact_cost
+        progress_reward = self._progress_reward_scale * progress
+        success_reward = self._success_reward * success
+        distance_reward = -self._distance_reward_scale * dist
+        reward = (
+            progress_reward
+            + healthy_reward
+            - ctrl_cost
+            - contact_cost
+            + success_reward
+            + distance_reward
+        )
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
         state.metrics.update(
@@ -209,6 +233,12 @@ class AntGoal(PipelineEnv):
             reward_survive=healthy_reward,
             reward_ctrl=-ctrl_cost,
             reward_contact=-contact_cost,
+            reward_goal=progress_reward,
+            reward_progress=progress_reward,
+            reward_success=success_reward,
+            reward_distance=distance_reward,
+            progress=progress,
+            prev_dist=prev_dist,
             x_position=pipeline_state.x.pos[0, 0],
             y_position=pipeline_state.x.pos[0, 1],
             distance_from_origin=math.safe_norm(pipeline_state.x.pos[0]),
@@ -255,6 +285,9 @@ class HumanoidGoal(PipelineEnv):
         backend="generalized",
         min_goal_dist=1.0,
         max_goal_dist=5.0,
+        progress_reward_scale=10.0,
+        success_reward=25.0,
+        distance_reward_scale=0.0,
         **kwargs,
     ):
         sys = mjcf.loads(_goal_xml("humanoid.xml", target_z=HUMANOID_TARGET_Z))
@@ -310,6 +343,9 @@ class HumanoidGoal(PipelineEnv):
         )
         self._min_goal_dist = min_goal_dist
         self._max_goal_dist = max_goal_dist
+        self._progress_reward_scale = progress_reward_scale
+        self._success_reward = success_reward
+        self._distance_reward_scale = distance_reward_scale
 
     def reset(self, rng: jax.Array) -> State:
         rng, rng1, rng2 = jax.random.split(rng, 3)
@@ -332,6 +368,12 @@ class HumanoidGoal(PipelineEnv):
             "reward_linvel": zero,
             "reward_quadctrl": zero,
             "reward_alive": zero,
+            "reward_goal": zero,
+            "reward_progress": zero,
+            "reward_success": zero,
+            "reward_distance": zero,
+            "progress": zero,
+            "prev_dist": zero,
             "x_position": zero,
             "y_position": zero,
             "distance_from_origin": zero,
@@ -368,10 +410,22 @@ class HumanoidGoal(PipelineEnv):
         ctrl_cost = self._ctrl_cost_weight * jp.sum(jp.square(action))
 
         obs = self._get_obs(pipeline_state, action)
+        prev_obs = state.obs
+        prev_dist = jp.linalg.norm(prev_obs[:3] - prev_obs[-3:])
         dist = jp.linalg.norm(obs[:3] - obs[-3:])
+        progress = prev_dist - dist
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2.0, dtype=float)
-        reward = -dist + healthy_reward - ctrl_cost
+        progress_reward = self._progress_reward_scale * progress
+        success_reward = self._success_reward * success
+        distance_reward = -self._distance_reward_scale * dist
+        reward = (
+            progress_reward
+            + healthy_reward
+            - ctrl_cost
+            + success_reward
+            + distance_reward
+        )
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
         state.metrics.update(
@@ -379,6 +433,12 @@ class HumanoidGoal(PipelineEnv):
             reward_linvel=forward_reward,
             reward_quadctrl=-ctrl_cost,
             reward_alive=healthy_reward,
+            reward_goal=progress_reward,
+            reward_progress=progress_reward,
+            reward_success=success_reward,
+            reward_distance=distance_reward,
+            progress=progress,
+            prev_dist=prev_dist,
             x_position=com_after[0],
             y_position=com_after[1],
             distance_from_origin=jp.linalg.norm(com_after),
