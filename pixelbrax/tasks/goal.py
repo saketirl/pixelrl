@@ -7,6 +7,7 @@ augmented with a non-contact visual target.
 
 from __future__ import annotations
 
+import math as _math
 import os
 import xml.etree.ElementTree as ET
 from typing import Tuple
@@ -278,13 +279,15 @@ class HumanoidGoal(PipelineEnv):
         forward_reward_weight=1.25,
         ctrl_cost_weight=0.1,
         healthy_reward=5.0,
-        terminate_when_unhealthy=True,
+        terminate_when_unhealthy=False,
         healthy_z_range=(1.0, 2.0),
         reset_noise_scale=0.0,
         exclude_current_positions_from_observation=False,
         backend="generalized",
-        min_goal_dist=1.0,
-        max_goal_dist=5.0,
+        min_goal_dist=5.0,
+        max_goal_dist=10.0,
+        max_goal_angle=jp.pi / 4,
+        goal_pos=(5.0 * _math.cos(_math.pi / 4), 5.0 * _math.sin(_math.pi / 4)),
         progress_reward_scale=10.0,
         success_reward=25.0,
         distance_reward_scale=0.0,
@@ -343,6 +346,8 @@ class HumanoidGoal(PipelineEnv):
         )
         self._min_goal_dist = min_goal_dist
         self._max_goal_dist = max_goal_dist
+        self._max_goal_angle = max_goal_angle
+        self._goal_pos = jp.array(goal_pos, dtype=float)
         self._progress_reward_scale = progress_reward_scale
         self._success_reward = success_reward
         self._distance_reward_scale = distance_reward_scale
@@ -356,7 +361,7 @@ class HumanoidGoal(PipelineEnv):
         )
         qvel = jax.random.uniform(rng2, (self.sys.qd_size(),), minval=low, maxval=hi)
 
-        _, target = self._random_target(rng)
+        target = self._goal_pos
         qpos = qpos.at[-2:].set(target)
         qvel = qvel.at[-2:].set(0.0)
 
@@ -512,6 +517,8 @@ class HumanoidGoal(PipelineEnv):
         dist = jax.random.uniform(
             rng1, minval=self._min_goal_dist, maxval=self._max_goal_dist
         )
-        angle = jp.pi * 2.0 * jax.random.uniform(rng2)
+        angle = jax.random.uniform(
+            rng2, minval=-self._max_goal_angle, maxval=self._max_goal_angle
+        )
         target = dist * jp.array([jp.cos(angle), jp.sin(angle)])
         return rng, target

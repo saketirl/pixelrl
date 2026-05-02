@@ -234,10 +234,14 @@ def make_pixel_brax(
     register_pixelbrax_tasks()
     if env_kwargs is None:
         env_kwargs = {}
+    create_kwargs = {}
+    if env_name == "ant_goal":
+        create_kwargs["episode_length"] = 1000
     env = envs.create(
         env_name=env_name,
         backend=backend,
         action_repeat=action_repeat,
+        **create_kwargs,
         **env_kwargs,
     )
     seed_key = jax.random.PRNGKey(seed=seed)

@@ -329,3 +329,24 @@ The clean W&B filter for the two CRATE-CNN launchers is:
 ```text
 encoder_crate_cnn AND headarch_crate AND progress20_dist0p1_success50
 ```
+
+## Configuration Update (2026-05-01)
+
+### Explicit Episode Length for Ant
+
+`ant_goal` now has `episode_length=1000` set explicitly in `env_utils.py` (previously relied on the Brax default). With `action_repeat=4` the `EpisodeWrapper` increments the step counter by 4 per call, so the episode ends after 250 `step()` calls = 1000 physics steps.
+
+This made the W&B graphs much cleaner and more comparable across runs — previously episodes could end at irregular lengths depending on Brax version defaults; now every ant episode is guaranteed to terminate at exactly 1000 steps.
+
+### All-Combos Sweep Launcher
+
+Added `scripts/goal/ant_goal_all_combos_bestreward_4seeds.sh`, a 4-task Slurm array covering all encoder/head/optimizer combinations in one submission:
+
+| Task | Encoder | Heads | Optimizer |
+|------|---------|-------|-----------|
+| 0 | crate_cnn | crate | adam |
+| 1 | crate_cnn | crate | stiefel |
+| 2 | cnn | mlp | adam |
+| 3 | cnn | mlp | stiefel |
+
+Each task gets one GPU and runs seeds 0–3 concurrently (`JAX_MEM_FRACTION=0.22` per seed).
