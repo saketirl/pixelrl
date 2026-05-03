@@ -5,7 +5,7 @@ This directory contains the actor/critic head scaling experiment based on:
 - `scripts/staging/crate_cnn_meanbound_boundedstd_crate_stiefel_allenv_4seeds.sh`
 - "1000 Layer Networks for Self-Supervised RL: Scaling Depth Can Enable New Goal-Reaching Capabilities" (`arXiv:2503.14858`)
 
-The experiment is a repo-faithful PPO adaptation of the paper's width-vs-depth comparison. It keeps the pixel encoder fixed as `crate_cnn` and scales only the actor/critic CRATE heads on `ant` and `humanoid`.
+The experiment is a repo-faithful PPO adaptation of the paper's width-vs-depth comparison. It keeps the pixel encoder fixed as `crate_cnn` and scales only the actor/critic CRATE heads on `ant`.
 
 ## Setup
 
