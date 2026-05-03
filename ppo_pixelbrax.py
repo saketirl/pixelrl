@@ -112,7 +112,27 @@ class Args:
     goal_success_reward: float = -1.0
     """success bonus for *_goal envs; negative uses env default"""
     goal_distance_reward_scale: float = 0.0
-    """reserved distance reward scale tag for *_goal sweeps; current env ignores it unless implemented"""
+    """distance penalty scale for *_goal envs"""
+    goal_healthy_reward: float = -1.0
+    """healthy reward for *_goal envs; negative uses env default"""
+    goal_success_easy_reward: float = 0.0
+    """bonus for humanoid_goal when dist < 2.0"""
+    goal_close_reward_scale: float = 0.0
+    """close-range shaping reward scale for humanoid_goal"""
+    goal_close_reward_radius: float = 1.0
+    """radius where humanoid_goal close-range shaping starts"""
+    goal_exp_distance_reward_scale: float = 0.0
+    """potential-style exponential distance reward scale for humanoid_goal"""
+    goal_exp_distance_reward_temperature: float = 1.0
+    """temperature for humanoid_goal exponential distance reward"""
+    goal_standing_reward_scale: float = 0.0
+    """standing posture reward scale for humanoid_goal"""
+    goal_heading_reward_scale: float = 0.0
+    """goal-facing heading reward scale for humanoid_goal"""
+    goal_gate_progress_by_standing: bool = False
+    """gate humanoid_goal progress reward by standing quality"""
+    goal_terminate_when_unhealthy: bool = False
+    """explicitly terminate humanoid_goal episodes when unhealthy"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
@@ -238,6 +258,8 @@ class Args:
     """If true, generate probe/additive plots to disk and log them to wandb when tracking."""
     save_rollout_gif: bool = False
     """If true, save deterministic rollout GIFs every rollout_gif_step global steps."""
+    save_final_rollout_gif: bool = False
+    """If true, save one deterministic rollout GIF after clean training completion."""
     rollout_gif_step: int = 1000000
     """Global step interval for saving rollout GIFs."""
     rollout_gif_dir: str = "outputs/rollouts"
@@ -1351,6 +1373,31 @@ def make_pixelbrax_envs(args):
             env_kwargs["success_reward"] = args.goal_success_reward
         if args.goal_distance_reward_scale != 0:
             env_kwargs["distance_reward_scale"] = args.goal_distance_reward_scale
+        if args.goal_healthy_reward >= 0:
+            env_kwargs["healthy_reward"] = args.goal_healthy_reward
+    if args.env_name == "humanoid_goal":
+        if args.goal_success_easy_reward != 0:
+            env_kwargs["success_easy_reward"] = args.goal_success_easy_reward
+        if args.goal_close_reward_scale != 0:
+            env_kwargs["close_reward_scale"] = args.goal_close_reward_scale
+        if args.goal_close_reward_radius != 1.0:
+            env_kwargs["close_reward_radius"] = args.goal_close_reward_radius
+        if args.goal_exp_distance_reward_scale != 0:
+            env_kwargs["exp_distance_reward_scale"] = (
+                args.goal_exp_distance_reward_scale
+            )
+        if args.goal_exp_distance_reward_temperature != 1.0:
+            env_kwargs["exp_distance_reward_temperature"] = (
+                args.goal_exp_distance_reward_temperature
+            )
+        if args.goal_standing_reward_scale != 0:
+            env_kwargs["standing_reward_scale"] = args.goal_standing_reward_scale
+        if args.goal_heading_reward_scale != 0:
+            env_kwargs["heading_reward_scale"] = args.goal_heading_reward_scale
+        if args.goal_gate_progress_by_standing:
+            env_kwargs["gate_progress_by_standing"] = True
+        if args.goal_terminate_when_unhealthy:
+            env_kwargs["terminate_when_unhealthy"] = True
 
     envs, _, _ = make_pixel_brax(
         backend=args.backend,
@@ -2593,7 +2640,7 @@ if __name__ == "__main__":
         args.rollout_gif_step if args.rollout_gif_step > 0 else float("inf")
     )
 
-    def save_policy_rollout_gif(step: int) -> str:
+    def save_policy_rollout_gif(step: int, suffix: str = "") -> str:
         from PIL import Image
 
         os.makedirs(args.rollout_gif_dir, exist_ok=True)
@@ -2625,7 +2672,7 @@ if __name__ == "__main__":
         )
         gif_path = os.path.join(
             args.rollout_gif_dir,
-            f"{safe_exp_name}_seed{args.seed}_step{step}.gif",
+            f"{safe_exp_name}_seed{args.seed}_{suffix + '_' if suffix else ''}step{step}.gif",
         )
         duration_ms = max(1, int(1000 / max(args.rollout_gif_fps, 1)))
         pil_frames = [Image.fromarray(frame) for frame in frames]
@@ -3106,6 +3153,18 @@ if __name__ == "__main__":
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed:.1f}s")
     print(f"Average SPS: {args.total_timesteps / elapsed:.0f}")
+
+    if args.save_rollout_gif and args.save_final_rollout_gif:
+        gif_path = save_policy_rollout_gif(global_step, suffix="final")
+        if args.track:
+            wandb.log(
+                {
+                    "rollout/final_gif": wandb.Video(
+                        gif_path, fps=args.rollout_gif_fps, format="gif"
+                    )
+                },
+                step=global_step,
+            )
 
     if args.save_checkpoint:
         import pickle
