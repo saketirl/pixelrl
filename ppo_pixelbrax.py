@@ -43,10 +43,16 @@ from configs.continual.slippery_ant_wrapper import (
     load_seeded_friction_schedule_table,
 )
 
-# Import manifold Stiefel optimizer
-from manifold_stiefel_optax import manifold_stiefel
+from optimizers import aurora, manifold_stiefel, manifold_stiefel_admm
 from encoders import build_encoder
 from sigreg import sigreg_loss, sigreg_loss_masked
+from spectrum.tracking import (
+    add_hessian_histogram,
+    add_histogram,
+    add_matrix_singular_histogram,
+    flatten_batch_tree,
+    hessian_eigenvalues,
+)
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
@@ -55,7 +61,7 @@ os.environ["TF_XLA_FLAGS"] = "--xla_gpu_autotune_level=2 --xla_gpu_deterministic
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
 
-HeadsOptimizer = Literal["adam", "stiefel", "muon"]
+HeadsOptimizer = Literal["adam", "stiefel", "stiefel_admm", "muon", "aurora"]
 
 
 class CRATEFeedForward(nn.Module):
@@ -133,7 +139,7 @@ class Args:
     heads_stiefel_lr: float = 0.02
     """learning rate for actor/critic head matrices (Stiefel)"""
     heads_muon_lr: float = 1e-3
-    """learning rate for actor/critic head matrices (Optax Muon)"""
+    """learning rate for actor/critic head matrices (Optax Muon or Aurora)"""
     heads_adam_lr: float = 3e-4
     """learning rate for actor/critic head vectors/scalars (Adam/AdamW)"""
     weight_decay: float = 0.0
@@ -193,6 +199,8 @@ class Args:
     """dual learning rate for Stiefel"""
     stiefel_dual_steps: int = 5
     """number of dual optimization steps for Stiefel"""
+    stiefel_admm_steps: int = 10
+    """number of ADMM iterations for Stiefel ADMM"""
     stiefel_msign_steps: int = 5
     """number of matrix sign iterations for Stiefel"""
 
@@ -235,6 +243,14 @@ class Args:
     """Number of underlying per-env timesteps between SlipperyAnt friction changes."""
     slippery_schedule_seed: int = 0
     """CSV row used for SlipperyAnt friction phases."""
+    spectrum_lanczos_order: int = 20
+    """Lanczos order for task-boundary Hessian spectrum diagnostics"""
+    spectrum_lanczos_draws: int = 1
+    """Number of random Lanczos draws for task-boundary Hessian diagnostics"""
+    spectrum_batch_size: int = 0
+    """Batch size for spectrum diagnostics; 0 uses one PPO minibatch"""
+    spectrum_hist_bins: int = 64
+    """Number of histogram bins for spectrum and activation WandB payloads"""
 
     # Debug/analysis flags
     debug_repr: bool = False
@@ -382,12 +398,20 @@ class Args:
 class Critic(nn.Module):
     """Value network with 2 hidden layers using Swish activation."""
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
-        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+    def __call__(self, x, return_intermediates: bool = False):
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = nn.swish(dense_0)
+        dense_1 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(hidden_0)
+        hidden_1 = nn.swish(dense_1)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(hidden_1)
+        if return_intermediates:
+            return {
+                "value": value,
+                "Dense_0": hidden_0,
+                "Dense_1": hidden_1,
+                "Dense_2": value,
+            }
+        return value
 
 
 class Actor(nn.Module):
@@ -404,16 +428,16 @@ class Actor(nn.Module):
     actor_mean_scale: float = 1.0
 
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
+    def __call__(self, x, return_intermediates: bool = False):
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = nn.swish(dense_0)
+        dense_1 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(hidden_0)
+        hidden_1 = nn.swish(dense_1)
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
-        )(x)
+        )(hidden_1)
         if self.actor_mean_tanh:
             actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
         if self.state_dependent_std:
@@ -427,7 +451,7 @@ class Actor(nn.Module):
                 kernel_init=constant(0.0),
                 bias_init=constant(0.0),
                 name="log_std_head",
-            )(x)
+            )(hidden_1)
             actor_logstd = log_std_bias + self.state_std_tanh_scale * jnp.tanh(log_std_delta)
             actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         else:
@@ -456,6 +480,14 @@ class Actor(nn.Module):
                 )
                 if self.clip_global_logstd:
                     actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
+        if return_intermediates:
+            return {
+                "actor_mean": actor_mean,
+                "actor_logstd": actor_logstd,
+                "Dense_0": hidden_0,
+                "Dense_1": hidden_1,
+                "Dense_2": actor_mean,
+            }
         return actor_mean, actor_logstd
 
 
@@ -464,11 +496,19 @@ class CRATECritic(nn.Module):
     crate_step_size: float = 0.1
 
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
-        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
-        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+    def __call__(self, x, return_intermediates: bool = False):
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = nn.swish(dense_0)
+        crate_hidden = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(hidden_0)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(crate_hidden)
+        if return_intermediates:
+            return {
+                "value": value,
+                "Dense_0": hidden_0,
+                "CRATEFeedForward_0": crate_hidden,
+                "Dense_1": value,
+            }
+        return value
 
 
 class CRATEActor(nn.Module):
@@ -486,15 +526,15 @@ class CRATEActor(nn.Module):
     actor_mean_scale: float = 1.0
 
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.swish(x)
-        x = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(x)
+    def __call__(self, x, return_intermediates: bool = False):
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = nn.swish(dense_0)
+        crate_hidden = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(hidden_0)
         actor_mean = nn.Dense(
             self.action_dim,
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0)
-        )(x)
+        )(crate_hidden)
         if self.actor_mean_tanh:
             actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
         if self.state_dependent_std:
@@ -508,7 +548,7 @@ class CRATEActor(nn.Module):
                 kernel_init=constant(0.0),
                 bias_init=constant(0.0),
                 name="log_std_head",
-            )(x)
+            )(crate_hidden)
             actor_logstd = log_std_bias + self.state_std_tanh_scale * jnp.tanh(log_std_delta)
             actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         else:
@@ -537,6 +577,14 @@ class CRATEActor(nn.Module):
                 )
                 if self.clip_global_logstd:
                     actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
+        if return_intermediates:
+            return {
+                "actor_mean": actor_mean,
+                "actor_logstd": actor_logstd,
+                "Dense_0": hidden_0,
+                "CRATEFeedForward_0": crate_hidden,
+                "Dense_1": actor_mean,
+            }
         return actor_mean, actor_logstd
 
 
@@ -904,10 +952,10 @@ def split_actor_critic_hiddens(encoded):
 def resolve_heads_optimizer(heads_optimizer: str) -> str:
     """Validate and normalize the selected head matrix optimizer."""
     optimizer = heads_optimizer.lower()
-    if optimizer not in {"adam", "stiefel", "muon"}:
+    if optimizer not in {"adam", "stiefel", "stiefel_admm", "muon", "aurora"}:
         raise ValueError(
             f"Unsupported heads_optimizer='{heads_optimizer}'. "
-            "Expected one of: adam, stiefel, muon."
+            "Expected one of: adam, stiefel, stiefel_admm, muon, aurora."
         )
     return optimizer
 
@@ -917,6 +965,10 @@ def is_stiefel_matrix_param(param) -> bool:
 
 
 def is_muon_matrix_param(param) -> bool:
+    return param.ndim == 2 and min(param.shape) > 1
+
+
+def is_aurora_matrix_param(param) -> bool:
     return param.ndim == 2 and min(param.shape) > 1
 
 
@@ -1150,6 +1202,7 @@ def create_optimizer(
     heads_muon_lr: float = 1e-3,
     stiefel_dual_lr: float = 0.01,
     stiefel_dual_steps: int = 5,
+    stiefel_admm_steps: int = 10,
     stiefel_msign_steps: int = 5,
     adam_eps: float = 1e-5,
     max_grad_norm: float = 0.5,
@@ -1253,6 +1306,24 @@ def create_optimizer(
             min_ndim=2,
         ),
     )
+    actor_stiefel_admm_tx = optax.chain(
+        optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
+        manifold_stiefel_admm(
+            learning_rate=heads_stiefel_lr,
+            steps=stiefel_admm_steps,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+    critic_stiefel_admm_tx = optax.chain(
+        optax.clip_by_global_norm(critic_stiefel_max_grad_norm),
+        manifold_stiefel_admm(
+            learning_rate=heads_stiefel_lr,
+            steps=stiefel_admm_steps,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
 
     if not hasattr(optax, "contrib") or not hasattr(optax.contrib, "muon"):
         if resolved_heads_optimizer == "muon":
@@ -1280,6 +1351,30 @@ def create_optimizer(
         optax.clip_by_global_norm(critic_muon_max_grad_norm),
         muon_opt(heads_muon_lr) if muon_opt is not None else optax.set_to_zero(),
     )
+    actor_aurora_tx = optax.chain(
+        optax.clip_by_global_norm(actor_muon_max_grad_norm),
+        aurora(
+            learning_rate=heads_muon_lr,
+            weight_decay=muon_weight_decay,
+            mu=muon_beta,
+            nesterov=muon_nesterov,
+            eps=muon_eps,
+            msign_steps=muon_ns_steps,
+            adam_eps=adam_eps,
+        ),
+    )
+    critic_aurora_tx = optax.chain(
+        optax.clip_by_global_norm(critic_muon_max_grad_norm),
+        aurora(
+            learning_rate=heads_muon_lr,
+            weight_decay=muon_weight_decay,
+            mu=muon_beta,
+            nesterov=muon_nesterov,
+            eps=muon_eps,
+            msign_steps=muon_ns_steps,
+            adam_eps=adam_eps,
+        ),
+    )
 
     transforms = {
         'encoder': encoder_tx,
@@ -1287,8 +1382,12 @@ def create_optimizer(
         'encoder_final_stiefel': encoder_final_stiefel_tx,
         'actor_stiefel': actor_stiefel_tx,
         'critic_stiefel': critic_stiefel_tx,
+        'actor_stiefel_admm': actor_stiefel_admm_tx,
+        'critic_stiefel_admm': critic_stiefel_admm_tx,
         'actor_muon': actor_muon_tx,
         'critic_muon': critic_muon_tx,
+        'actor_aurora': actor_aurora_tx,
+        'critic_aurora': critic_aurora_tx,
         'heads_adam': heads_adam_tx,
     }
 
@@ -1313,14 +1412,22 @@ def create_optimizer(
             if path[0] == 'actor':
                 if resolved_heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
                     return 'actor_stiefel'
+                if resolved_heads_optimizer == "stiefel_admm" and is_stiefel_matrix_param(param):
+                    return 'actor_stiefel_admm'
                 if resolved_heads_optimizer == "muon" and is_muon_matrix_param(param):
                     return 'actor_muon'
+                if resolved_heads_optimizer == "aurora" and is_aurora_matrix_param(param):
+                    return 'actor_aurora'
                 return 'heads_adam'
             if path[0] == 'critic':
                 if resolved_heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
                     return 'critic_stiefel'
+                if resolved_heads_optimizer == "stiefel_admm" and is_stiefel_matrix_param(param):
+                    return 'critic_stiefel_admm'
                 if resolved_heads_optimizer == "muon" and is_muon_matrix_param(param):
                     return 'critic_muon'
+                if resolved_heads_optimizer == "aurora" and is_aurora_matrix_param(param):
+                    return 'critic_aurora'
                 return 'heads_adam'
 
             # Fallback for any extra top-level params.
@@ -1492,6 +1599,7 @@ if __name__ == "__main__":
     print(f"  weight_decay: {args.weight_decay}")
     print(f"  stiefel_dual_lr: {args.stiefel_dual_lr}")
     print(f"  stiefel_dual_steps: {args.stiefel_dual_steps}")
+    print(f"  stiefel_admm_steps: {args.stiefel_admm_steps}")
     print(f"  max_grad_norm ({adam_type}): {args.max_grad_norm}")
     print(f"  actor_stiefel_max_grad_norm: {args.actor_stiefel_max_grad_norm}")
     print(f"  critic_stiefel_max_grad_norm: {args.critic_stiefel_max_grad_norm}")
@@ -1565,11 +1673,13 @@ if __name__ == "__main__":
     current_sys = base_sys
     continual_config = None
     current_task = None
+    current_task_index = 0
     task_start_step = 0
     updates_per_task = 0
     schedule_seed = args.data_seed
     slippery_friction_schedule = None
     slippery_default_geom_friction = None
+    last_slippery_phase_logged = None
 
     if args.continual_dynamics_config is not None:
         loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
@@ -1731,10 +1841,12 @@ if __name__ == "__main__":
             return 0, 0
         flat = flax.traverse_util.flatten_dict(params[key])
         total_count = sum(p.size for p in flat.values())
-        if heads_optimizer == "stiefel":
+        if heads_optimizer in {"stiefel", "stiefel_admm"}:
             optimized_count = sum(p.size for p in flat.values() if is_stiefel_matrix_param(p))
         elif heads_optimizer == "muon":
             optimized_count = sum(p.size for p in flat.values() if is_muon_matrix_param(p))
+        elif heads_optimizer == "aurora":
+            optimized_count = sum(p.size for p in flat.values() if is_aurora_matrix_param(p))
         else:
             optimized_count = 0
         return optimized_count, total_count - optimized_count
@@ -1786,7 +1898,9 @@ if __name__ == "__main__":
     else:
         head_opt_label = {
             "stiefel": "Stiefel",
+            "stiefel_admm": "ADMM Stiefel",
             "muon": "Optax Muon",
+            "aurora": "Aurora",
         }[args.heads_optimizer]
         print(
             f"  Actor total: {actor_params:,} "
@@ -1877,6 +1991,7 @@ if __name__ == "__main__":
         heads_muon_lr=args.heads_muon_lr,
         stiefel_dual_lr=args.stiefel_dual_lr,
         stiefel_dual_steps=args.stiefel_dual_steps,
+        stiefel_admm_steps=args.stiefel_admm_steps,
         stiefel_msign_steps=args.stiefel_msign_steps,
         adam_eps=1e-5,
         max_grad_norm=args.max_grad_norm,
@@ -1908,6 +2023,8 @@ if __name__ == "__main__":
     )
 
     network_debug_apply = jax.jit(network.apply, static_argnames=("return_intermediates",))
+    actor_debug_apply = jax.jit(actor.apply, static_argnames=("return_intermediates",))
+    critic_debug_apply = jax.jit(critic.apply, static_argnames=("return_intermediates",))
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
@@ -1921,7 +2038,7 @@ if __name__ == "__main__":
 
 
     def encode_with_intermediates(network_params, obs):
-        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "separate_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn"}:
+        if encoder_type not in {"resnet", "cnn", "cnn_swish", "cnn_swish_ta", "cnn_swish_tb", "cnn_swish_tc", "crate_cnn", "crate_cnn_tanh", "crate_cnn_tanh_resid", "cnn_swish_tanh", "cnn_swish_tanh_resid", "cnn_swish_tanh_resid_learned", "split_cnn", "separate_cnn", "sigreg_cnn", "innovation_cnn", "innovation_direct_cnn", "mlp"}:
             raise ValueError(f"return_intermediates is not supported for encoder_type={encoder_type}")
         return network_debug_apply(network_params, obs, return_intermediates=True)
 
@@ -2328,6 +2445,153 @@ if __name__ == "__main__":
         )
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+    spectrum_batch_size = args.spectrum_batch_size or args.minibatch_size
+
+    def collect_spectrum_diagnostics(
+        params,
+        storage: Storage,
+        key: jax.random.PRNGKey,
+        prefix: str,
+        task_index: int,
+        global_step_value: int,
+        sigreg_coef_value: float,
+        innovation_coef_value: float,
+        vicreg_var_coef_value: float,
+        bottleneck_var_coef_value: float,
+        bottleneck_pre_ln_coef_value: float,
+        actor_cond_coef_value: float,
+        actor_noise_coef_value: float,
+        phase: Optional[int] = None,
+        closest_rollout: bool = False,
+    ) -> dict:
+        batch = flatten_batch_tree(storage, spectrum_batch_size)
+
+        def spectrum_loss(loss_params, loss_batch):
+            loss_value, _ = ppo_loss(
+                loss_params,
+                loss_batch.obs,
+                loss_batch.next_obs,
+                loss_batch.next_dones,
+                loss_batch.actions,
+                loss_batch.logprobs,
+                loss_batch.advantages,
+                loss_batch.returns,
+                loss_batch.values,
+                key,
+                sigreg_coef_value,
+                innovation_coef_value,
+                vicreg_var_coef_value,
+                bottleneck_var_coef_value,
+                bottleneck_pre_ln_coef_value,
+                actor_cond_coef_value,
+                actor_noise_coef_value,
+            )
+            return loss_value
+
+        logs = {
+            f"{prefix}/task_index": float(task_index),
+            f"{prefix}/global_step": float(global_step_value),
+            f"{prefix}/lanczos_order": float(args.spectrum_lanczos_order),
+            f"{prefix}/lanczos_draws": float(args.spectrum_lanczos_draws),
+            f"{prefix}/closest_rollout": float(closest_rollout),
+        }
+        if phase is not None:
+            logs[f"{prefix}/phase"] = float(phase)
+
+        eigvals = hessian_eigenvalues(
+            spectrum_loss,
+            params,
+            batch,
+            key,
+            order=args.spectrum_lanczos_order,
+            draws=args.spectrum_lanczos_draws,
+        )
+        add_hessian_histogram(
+            logs,
+            f"{prefix}/hessian",
+            eigvals,
+            bins=args.spectrum_hist_bins,
+        )
+
+        def get_param(path):
+            node = params
+            for part in path:
+                if part not in node:
+                    return None
+                node = node[part]
+            return node
+
+        def add_weight_if_present(name, path):
+            matrix = get_param(path)
+            if matrix is not None and getattr(matrix, "ndim", 0) >= 2:
+                add_matrix_singular_histogram(
+                    logs,
+                    f"{prefix}/weights/{name}",
+                    matrix,
+                    bins=args.spectrum_hist_bins,
+                )
+
+        for path in encoder_final_stiefel_kernel_paths(encoder_type):
+            if path[0] == "network" and path[1] == "params":
+                add_weight_if_present(
+                    "/".join(("network",) + path[2:-1]),
+                    path,
+                )
+        add_weight_if_present("actor/Dense_0", ("actor", "params", "Dense_0", "kernel"))
+        add_weight_if_present("actor/Dense_1", ("actor", "params", "Dense_1", "kernel"))
+        add_weight_if_present(
+            "actor/CRATEFeedForward_0",
+            ("actor", "params", "CRATEFeedForward_0", "weight"),
+        )
+        add_weight_if_present("critic/Dense_0", ("critic", "params", "Dense_0", "kernel"))
+        add_weight_if_present("critic/Dense_1", ("critic", "params", "Dense_1", "kernel"))
+        add_weight_if_present(
+            "critic/CRATEFeedForward_0",
+            ("critic", "params", "CRATEFeedForward_0", "weight"),
+        )
+
+        encoder_debug = encode_with_intermediates(params["network"], batch.obs)
+        if encoder_type in {"split_cnn", "separate_cnn"}:
+            actor_hidden = encoder_debug["actor_hidden"]
+            critic_hidden = encoder_debug["critic_hidden"]
+        else:
+            if "policy_hidden" in encoder_debug:
+                actor_hidden = encoder_debug["policy_hidden"]
+            else:
+                actor_hidden = encoder_debug["hidden"]
+            critic_hidden = actor_hidden
+        actor_debug = actor_debug_apply(
+            params["actor"],
+            actor_hidden,
+            return_intermediates=True,
+        )
+        critic_debug = critic_debug_apply(
+            params["critic"],
+            critic_hidden,
+            return_intermediates=True,
+        )
+
+        def add_activation_if_present(name, values, key_name):
+            if key_name in values:
+                add_histogram(
+                    logs,
+                    f"{prefix}/activations/{name}",
+                    values[key_name],
+                    bins=args.spectrum_hist_bins,
+                )
+
+        if encoder_type in {"split_cnn", "separate_cnn"}:
+            add_activation_if_present("network/actor_hidden", encoder_debug, "actor_hidden")
+            add_activation_if_present("network/critic_hidden", encoder_debug, "critic_hidden")
+        else:
+            add_activation_if_present("network/hidden", encoder_debug, "hidden")
+            add_activation_if_present("network/policy_hidden", encoder_debug, "policy_hidden")
+        add_activation_if_present("actor/Dense_1", actor_debug, "Dense_1")
+        add_activation_if_present("actor/CRATEFeedForward_0", actor_debug, "CRATEFeedForward_0")
+        add_activation_if_present("actor/Dense_2", actor_debug, "Dense_2")
+        add_activation_if_present("critic/Dense_1", critic_debug, "Dense_1")
+        add_activation_if_present("critic/CRATEFeedForward_0", critic_debug, "CRATEFeedForward_0")
+        return logs
 
     @jax.jit
     def update_ppo(
@@ -2772,6 +3036,7 @@ if __name__ == "__main__":
                 task_index=task_index,
                 schedule_seed=schedule_seed,
             )
+            current_task_index = task_index
             current_sys = apply_dynamics_task(base_sys, current_task)
             task_start_step = global_step
 
@@ -2874,6 +3139,31 @@ if __name__ == "__main__":
             iteration - 1,
             args.actor_noise_stop_updates,
         )
+        if (
+            args.track
+            and continual_config is not None
+            and (iteration - 1) % updates_per_task == 0
+        ):
+            import wandb
+            key, spectrum_key = jax.random.split(key)
+            wandb.log(
+                collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    spectrum_key,
+                    "spectrum/task_start",
+                    current_task_index,
+                    global_step,
+                    sigreg_coef_current,
+                    innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
+                ),
+                step=global_step,
+            )
         (
             agent_state,
             loss,
@@ -2914,6 +3204,127 @@ if __name__ == "__main__":
             actor_cond_coef_current,
             actor_noise_coef_current,
         )
+        if (
+            args.track
+            and continual_config is not None
+            and (iteration % updates_per_task == 0 or iteration == args.num_updates)
+        ):
+            import wandb
+            key, spectrum_key = jax.random.split(key)
+            wandb.log(
+                collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    spectrum_key,
+                    "spectrum/task_end",
+                    current_task_index,
+                    global_step,
+                    sigreg_coef_current,
+                    innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
+                ),
+                step=global_step,
+            )
+
+        if args.track and args.slippery_ant:
+            import wandb
+            slippery_phase = slippery_phase_from_timestep(
+                timestep=int((global_step // args.n_envs) * args.action_repeat),
+                change_every=args.slippery_change_every,
+                num_seeded_phases=int(slippery_friction_schedule.shape[0]),
+            )
+            if last_slippery_phase_logged is None:
+                key, spectrum_key = jax.random.split(key)
+                wandb.log(
+                    collect_spectrum_diagnostics(
+                        agent_state.params,
+                        storage,
+                        spectrum_key,
+                        "spectrum/task_start",
+                        slippery_phase,
+                        global_step,
+                        sigreg_coef_current,
+                        innovation_coef_current,
+                        vicreg_var_coef_current,
+                        bottleneck_var_coef_current,
+                        bottleneck_pre_ln_coef_current,
+                        actor_cond_coef_current,
+                        actor_noise_coef_current,
+                        phase=slippery_phase,
+                        closest_rollout=True,
+                    ),
+                    step=global_step,
+                )
+                last_slippery_phase_logged = slippery_phase
+            elif slippery_phase != last_slippery_phase_logged:
+                key, end_key, start_key = jax.random.split(key, 3)
+                wandb.log(
+                    collect_spectrum_diagnostics(
+                        agent_state.params,
+                        storage,
+                        end_key,
+                        "spectrum/task_end",
+                        last_slippery_phase_logged,
+                        global_step,
+                        sigreg_coef_current,
+                        innovation_coef_current,
+                        vicreg_var_coef_current,
+                        bottleneck_var_coef_current,
+                        bottleneck_pre_ln_coef_current,
+                        actor_cond_coef_current,
+                        actor_noise_coef_current,
+                        phase=last_slippery_phase_logged,
+                        closest_rollout=True,
+                    ),
+                    step=global_step,
+                )
+                wandb.log(
+                    collect_spectrum_diagnostics(
+                        agent_state.params,
+                        storage,
+                        start_key,
+                        "spectrum/task_start",
+                        slippery_phase,
+                        global_step,
+                        sigreg_coef_current,
+                        innovation_coef_current,
+                        vicreg_var_coef_current,
+                        bottleneck_var_coef_current,
+                        bottleneck_pre_ln_coef_current,
+                        actor_cond_coef_current,
+                        actor_noise_coef_current,
+                        phase=slippery_phase,
+                        closest_rollout=True,
+                    ),
+                    step=global_step,
+                )
+                last_slippery_phase_logged = slippery_phase
+            if iteration == args.num_updates:
+                key, spectrum_key = jax.random.split(key)
+                wandb.log(
+                    collect_spectrum_diagnostics(
+                        agent_state.params,
+                        storage,
+                        spectrum_key,
+                        "spectrum/task_end",
+                        last_slippery_phase_logged,
+                        global_step,
+                        sigreg_coef_current,
+                        innovation_coef_current,
+                        vicreg_var_coef_current,
+                        bottleneck_var_coef_current,
+                        bottleneck_pre_ln_coef_current,
+                        actor_cond_coef_current,
+                        actor_noise_coef_current,
+                        phase=last_slippery_phase_logged,
+                        closest_rollout=True,
+                    ),
+                    step=global_step,
+                )
 
         # Online linear probe — fire when global_step crosses the next threshold.
         # Using >= avoids the LCM cadence problem that % would cause when
@@ -3010,7 +3421,9 @@ if __name__ == "__main__":
                     "charts/heads_muon_lr": args.heads_muon_lr,
                     "charts/head_optimizer_is_adam": float(args.heads_optimizer == "adam"),
                     "charts/head_optimizer_is_stiefel": float(args.heads_optimizer == "stiefel"),
+                    "charts/head_optimizer_is_stiefel_admm": float(args.heads_optimizer == "stiefel_admm"),
                     "charts/head_optimizer_is_muon": float(args.heads_optimizer == "muon"),
+                    "charts/head_optimizer_is_aurora": float(args.heads_optimizer == "aurora"),
                     "charts/SPS": sps,
                     "charts/SPS_update": sps_update,
                     "losses/value_loss": v_loss[-1, -1].item(),

@@ -23,7 +23,7 @@ import tyro
 import distrax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-from manifold_stiefel_optax import manifold_stiefel
+from optimizers import aurora, manifold_stiefel, manifold_stiefel_admm
 
 # Import Brax from local source (pixelbrax/brax/brax)
 import sys
@@ -36,6 +36,13 @@ from pixelbrax.continual_dynamics import (
     make_dynamics_task,
     resolve_schedule_seed,
     validate_continual_dynamics_config,
+)
+from spectrum.tracking import (
+    add_activation_distributions,
+    add_hessian_spectrum,
+    add_weight_spectra,
+    flatten_batch_tree,
+    hessian_eigenvalues,
 )
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
@@ -74,9 +81,9 @@ class Args:
     adam_eps: float = 1e-5
     """epsilon parameter for Adam"""
     heads_optimizer: str = "adam"
-    """Optimizer for actor/critic matrix params: adam or stiefel"""
+    """Optimizer for actor/critic matrix params: adam, stiefel, stiefel_admm, or aurora"""
     heads_stiefel_lr: float = 0.001
-    """Learning rate for actor/critic matrix params when using Stiefel"""
+    """Learning rate for actor/critic matrix params when using Stiefel or Aurora"""
     stiefel_dual_lr: float = 0.01
     """Dual learning rate for manifold Stiefel"""
     stiefel_dual_steps: int = 5
@@ -127,6 +134,14 @@ class Args:
     # Continual dynamics
     continual_dynamics_config: Optional[str] = None
     """Path to a YAML continual dynamics config"""
+    spectrum_lanczos_order: int = 20
+    """Lanczos order for task-boundary Hessian spectrum diagnostics"""
+    spectrum_lanczos_draws: int = 1
+    """Number of random Lanczos draws for task-boundary Hessian diagnostics"""
+    spectrum_batch_size: int = 0
+    """Batch size for spectrum diagnostics; 0 uses one PPO minibatch"""
+    spectrum_hist_bins: int = 64
+    """Number of histogram bins for spectrum and activation WandB payloads"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -142,13 +157,21 @@ class Network(nn.Module):
     activation: str = "swish"
     
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_intermediates: bool = False):
         # x: (B, obs_dim) - 1D state observations
         activation = actor_critic_activation_fn(self.activation)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        dense_1 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(hidden_0)
+        x = activation(dense_1)
+        if return_intermediates:
+            return {
+                "hidden": x,
+                "Dense_0": hidden_0,
+                "Dense_1": x,
+                "Dense_0_pre": dense_0,
+                "Dense_1_pre": dense_1,
+            }
         return x
 
 
@@ -164,16 +187,20 @@ def actor_critic_activation_fn(name: str):
 
 def resolve_heads_optimizer(heads_optimizer: str) -> str:
     optimizer = heads_optimizer.lower()
-    if optimizer not in {"adam", "stiefel"}:
+    if optimizer not in {"adam", "stiefel", "stiefel_admm", "aurora"}:
         raise ValueError(
             f"Unsupported heads_optimizer={heads_optimizer!r}. "
-            "Expected one of: adam, stiefel."
+            "Expected one of: adam, stiefel, stiefel_admm, aurora."
         )
     return optimizer
 
 
 def is_stiefel_matrix_param(param) -> bool:
     return param.ndim >= 2 and min(param.shape) > 1
+
+
+def is_aurora_matrix_param(param) -> bool:
+    return param.ndim == 2 and min(param.shape) > 1
 
 
 def optimizer_label_for_param(path, param, heads_optimizer: str) -> str:
@@ -183,10 +210,18 @@ def optimizer_label_for_param(path, param, heads_optimizer: str) -> str:
     if top_level == "actor":
         if heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
             return "actor_stiefel"
+        if heads_optimizer == "stiefel_admm" and is_stiefel_matrix_param(param):
+            return "actor_stiefel_admm"
+        if heads_optimizer == "aurora" and is_aurora_matrix_param(param):
+            return "actor_aurora"
         return "heads_adam"
     if top_level == "critic":
         if heads_optimizer == "stiefel" and is_stiefel_matrix_param(param):
             return "critic_stiefel"
+        if heads_optimizer == "stiefel_admm" and is_stiefel_matrix_param(param):
+            return "critic_stiefel_admm"
+        if heads_optimizer == "aurora" and is_aurora_matrix_param(param):
+            return "critic_aurora"
         return "heads_adam"
     return "heads_adam"
 
@@ -235,12 +270,46 @@ def create_optimizer(
             min_ndim=2,
         ),
     )
+    actor_stiefel_admm_tx = optax.chain(
+        optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
+        manifold_stiefel_admm(
+            learning_rate=heads_stiefel_lr,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+    critic_stiefel_admm_tx = optax.chain(
+        optax.clip_by_global_norm(critic_stiefel_max_grad_norm),
+        manifold_stiefel_admm(
+            learning_rate=heads_stiefel_lr,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+    actor_aurora_tx = optax.chain(
+        optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
+        aurora(
+            learning_rate=heads_stiefel_lr,
+            adam_eps=adam_eps,
+        ),
+    )
+    critic_aurora_tx = optax.chain(
+        optax.clip_by_global_norm(critic_stiefel_max_grad_norm),
+        aurora(
+            learning_rate=heads_stiefel_lr,
+            adam_eps=adam_eps,
+        ),
+    )
 
     transforms = {
         "network_adam": make_adam_tx(),
         "heads_adam": make_adam_tx(),
         "actor_stiefel": actor_stiefel_tx,
         "critic_stiefel": critic_stiefel_tx,
+        "actor_stiefel_admm": actor_stiefel_admm_tx,
+        "critic_stiefel_admm": critic_stiefel_admm_tx,
+        "actor_aurora": actor_aurora_tx,
+        "critic_aurora": critic_aurora_tx,
     }
 
     def label_fn(params):
@@ -261,6 +330,10 @@ def count_optimizer_params(params, heads_optimizer: str) -> dict:
         "heads_adam": 0,
         "actor_stiefel": 0,
         "critic_stiefel": 0,
+        "actor_stiefel_admm": 0,
+        "critic_stiefel_admm": 0,
+        "actor_aurora": 0,
+        "critic_aurora": 0,
     }
     for path, param in flat.items():
         counts[optimizer_label_for_param(path, param, heads_optimizer)] += int(param.size)
@@ -272,13 +345,21 @@ class Critic(nn.Module):
     activation: str = "swish"
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_intermediates: bool = False):
         activation = actor_critic_activation_fn(self.activation)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        return nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        dense_1 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(hidden_0)
+        hidden_1 = activation(dense_1)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(hidden_1)
+        if return_intermediates:
+            return {
+                "value": value,
+                "Dense_0": hidden_0,
+                "Dense_1": hidden_1,
+                "Dense_2": value,
+            }
+        return value
 
 
 class Actor(nn.Module):
@@ -287,22 +368,30 @@ class Actor(nn.Module):
     activation: str = "swish"
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_intermediates: bool = False):
         activation = actor_critic_activation_fn(self.activation)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
-        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = activation(x)
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        dense_1 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(hidden_0)
+        hidden_1 = activation(dense_1)
         actor_mean = nn.Dense(
             self.action_dim, 
             kernel_init=orthogonal(0.01), 
             bias_init=constant(0.0)
-        )(x)
+        )(hidden_1)
         actor_logstd = self.param(
             "log_std", 
             nn.initializers.zeros, 
             (self.action_dim,)
         )
+        if return_intermediates:
+            return {
+                "actor_mean": actor_mean,
+                "actor_logstd": actor_logstd,
+                "Dense_0": hidden_0,
+                "Dense_1": hidden_1,
+                "Dense_2": actor_mean,
+            }
         return actor_mean, actor_logstd
 
 
@@ -469,6 +558,7 @@ if __name__ == "__main__":
     current_sys = base_sys
     continual_config = None
     current_task = None
+    current_task_index = 0
     task_start_step = 0
     updates_per_task = 0
     schedule_seed = args.seed
@@ -552,6 +642,10 @@ if __name__ == "__main__":
     print(f"  heads_adam: {optimizer_counts['heads_adam']:,}")
     print(f"  actor_stiefel: {optimizer_counts['actor_stiefel']:,}")
     print(f"  critic_stiefel: {optimizer_counts['critic_stiefel']:,}")
+    print(f"  actor_stiefel_admm: {optimizer_counts['actor_stiefel_admm']:,}")
+    print(f"  critic_stiefel_admm: {optimizer_counts['critic_stiefel_admm']:,}")
+    print(f"  actor_aurora: {optimizer_counts['actor_aurora']:,}")
+    print(f"  critic_aurora: {optimizer_counts['critic_aurora']:,}")
     
     agent_state = TrainState.create(
         apply_fn=None,
@@ -569,9 +663,86 @@ if __name__ == "__main__":
             critic_stiefel_max_grad_norm=args.critic_stiefel_max_grad_norm,
         ),
     )
+    network_debug_apply = jax.jit(network.apply, static_argnames=("return_intermediates",))
+    actor_debug_apply = jax.jit(actor.apply, static_argnames=("return_intermediates",))
+    critic_debug_apply = jax.jit(critic.apply, static_argnames=("return_intermediates",))
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
+
+    spectrum_batch_size = args.spectrum_batch_size or args.minibatch_size
+
+    def collect_spectrum_diagnostics(
+        params,
+        storage: Storage,
+        key: jax.random.PRNGKey,
+        prefix: str,
+        task_index: int,
+        global_step_value: int,
+    ) -> dict:
+        batch = flatten_batch_tree(storage, spectrum_batch_size)
+
+        def spectrum_loss(loss_params, loss_batch):
+            loss_value, _ = ppo_loss(
+                loss_params,
+                loss_batch.obs,
+                loss_batch.actions,
+                loss_batch.logprobs,
+                loss_batch.advantages,
+                loss_batch.returns,
+                loss_batch.values,
+            )
+            return loss_value
+
+        logs = {
+            f"{prefix}/task_index": float(task_index),
+            f"{prefix}/global_step": float(global_step_value),
+            f"{prefix}/lanczos_order": float(args.spectrum_lanczos_order),
+            f"{prefix}/lanczos_draws": float(args.spectrum_lanczos_draws),
+        }
+        eigvals = hessian_eigenvalues(
+            spectrum_loss,
+            params,
+            batch,
+            key,
+            order=args.spectrum_lanczos_order,
+            draws=args.spectrum_lanczos_draws,
+        )
+        add_hessian_spectrum(
+            logs,
+            f"{prefix}/hessian",
+            eigvals,
+            bins=args.spectrum_hist_bins,
+        )
+        add_weight_spectra(logs, params, prefix, bins=args.spectrum_hist_bins)
+
+        net_debug = network_debug_apply(
+            params["network"],
+            batch.obs,
+            return_intermediates=True,
+        )
+        actor_debug = actor_debug_apply(
+            params["actor"],
+            net_debug["hidden"],
+            return_intermediates=True,
+        )
+        critic_debug = critic_debug_apply(
+            params["critic"],
+            net_debug["hidden"],
+            return_intermediates=True,
+        )
+        activations = {
+            **{f"network/{k}": v for k, v in net_debug.items() if k != "hidden"},
+            **{f"actor/{k}": v for k, v in actor_debug.items() if k not in {"actor_logstd"}},
+            **{f"critic/{k}": v for k, v in critic_debug.items()},
+        }
+        add_activation_distributions(
+            logs,
+            activations,
+            prefix,
+            bins=args.spectrum_hist_bins,
+        )
+        return logs
 
     @jax.jit
     def get_action_and_value(
@@ -820,6 +991,7 @@ if __name__ == "__main__":
                 task_index=task_index,
                 schedule_seed=schedule_seed,
             )
+            current_task_index = task_index
             current_sys = apply_dynamics_task(base_sys, current_task)
             task_start_step = global_step
 
@@ -868,11 +1040,47 @@ if __name__ == "__main__":
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
+        if (
+            args.track
+            and continual_config is not None
+            and (iteration - 1) % updates_per_task == 0
+        ):
+            import wandb
+            key, spectrum_key = jax.random.split(key)
+            wandb.log(
+                collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    spectrum_key,
+                    "spectrum/task_start",
+                    current_task_index,
+                    global_step,
+                ),
+                step=global_step,
+            )
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
             agent_state,
             storage,
             key,
         )
+        if (
+            args.track
+            and continual_config is not None
+            and (iteration % updates_per_task == 0 or iteration == args.num_updates)
+        ):
+            import wandb
+            key, spectrum_key = jax.random.split(key)
+            wandb.log(
+                collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    spectrum_key,
+                    "spectrum/task_end",
+                    current_task_index,
+                    global_step,
+                ),
+                step=global_step,
+            )
         
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
