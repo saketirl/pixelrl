@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=slippery-ant-wrapper
-#SBATCH --output=slurm_logs/slippery_ant_wrapper_%j.out
+#SBATCH --job-name=slippery-env-wrapper
+#SBATCH --output=slurm_logs/slippery_env_wrapper_%j.out
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
@@ -10,13 +10,8 @@
 
 set -euo pipefail
 
-# State-observation Brax Ant launcher for configs/continual/slippery_ant_wrapper.py.
-# This uses the wrapper's own per-env timestep friction schedule, starting with
-# the environment's default friction before traversing the CSV-backed schedule
-# selected by the seed row in configs/continual/frictions.csv.
-#  - total experiment length: 10,000,000 * num_envs global steps
-#  - if there are 5 tasks split evenly, task switches happen every 2,000,000 * num_envs global steps
-
+# Generic state-observation Brax launcher for the CSV-backed slippery friction
+# wrapper. Defaults to Humanoid and matches slippery_ant_wrapper_lr1e4.sh.
 
 WANDB_PROJECT="${1:-continual_brax}"
 WANDB_ENTITY="${2:-rl-power}"
@@ -27,6 +22,7 @@ SEED="${6:-${SEED:-0}}"
 ACTOR_CRITIC_ACTIVATION="${7:-${ACTOR_CRITIC_ACTIVATION:-relu}}"
 BACKEND="${8:-${BACKEND:-spring}}"
 HEADS_OPTIMIZER="${9:-${HEADS_OPTIMIZER:-adam}}"
+ENV_NAME="${10:-${ENV_NAME:-humanoid}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -49,7 +45,6 @@ if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
   export WANDB_API_KEY="$(cat "${WANDB_KEY_FILE}")"
 fi
 
-ENV_NAME="ant"
 N_ENVS="${N_ENVS:-128}"
 NUM_STEPS="${NUM_STEPS:-10}"
 NUM_MINIBATCHES="${NUM_MINIBATCHES:-32}"
@@ -99,13 +94,13 @@ EFFECTIVE_PHASES=$(((EFFECTIVE_ENV_STEPS_PER_ENV + CHANGE_EVERY_POLICY_STEPS - 1
 DISTINCT_PHASES="${EFFECTIVE_PHASES}"
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="slippery_ant_wrapper_${BACKEND}_${DISTINCT_PHASES}phases_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_${GROUP_ID}_lr1e4"
+GROUP_NAME="slippery_${ENV_NAME}_wrapper_${BACKEND}_${DISTINCT_PHASES}phases_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_${GROUP_ID}_lr1e4"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="continual_rl,slippery_ant_wrapper,brax_state,${ENV_NAME},backend_${BACKEND},seed_${SEED},phase_every_${PHASE_EVERY_ENV_STEPS},change_every_per_env_${CHANGE_EVERY},phases_${DISTINCT_PHASES},action_repeat_${ACTION_REPEAT},actorcritic_${ACTOR_CRITIC_ACTIVATION},headopt_${HEADS_OPTIMIZER},wrapper_faithful,${SCHEDULE_TAG},batch_${ROLLOUT_ENV_STEPS},minibatches_${NUM_MINIBATCHES},epochs_${UPDATE_EPOCHS},reward_norm,vclip,lr1e4,repo_ppo"
+export WANDB_TAGS="continual_rl,slippery_wrapper,brax_state,${ENV_NAME},backend_${BACKEND},seed_${SEED},phase_every_${PHASE_EVERY_ENV_STEPS},change_every_per_env_${CHANGE_EVERY},phases_${DISTINCT_PHASES},action_repeat_${ACTION_REPEAT},actorcritic_${ACTOR_CRITIC_ACTIVATION},headopt_${HEADS_OPTIMIZER},wrapper_faithful,${SCHEDULE_TAG},batch_${ROLLOUT_ENV_STEPS},minibatches_${NUM_MINIBATCHES},epochs_${UPDATE_EPOCHS},reward_norm,vclip,lr1e4,repo_ppo"
 
-EXP_NAME="ppo_slippery_brax_${ENV_NAME}_${BACKEND}_${DISTINCT_PHASES}phases_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_s${SEED}_lr1e4"
+EXP_NAME="ppo_brax_slippery_${ENV_NAME}_${BACKEND}_${DISTINCT_PHASES}phases_${ACTOR_CRITIC_ACTIVATION}_headopt_${HEADS_OPTIMIZER}_s${SEED}_lr1e4"
 
-echo "Running SlipperyAnt wrapper group=${GROUP_NAME}"
+echo "Running slippery ${ENV_NAME} wrapper group=${GROUP_NAME}"
 echo "Config: env=${ENV_NAME} backend=${BACKEND} seed=${SEED} action_repeat=${ACTION_REPEAT} phase_every_env_steps=${PHASE_EVERY_ENV_STEPS} change_every_per_env_policy_steps=${CHANGE_EVERY_POLICY_STEPS} change_every_wrapper_steps=${CHANGE_EVERY} schedule=${SCHEDULE_DESC} schedule_seed=${SLIPPERY_SCHEDULE_SEED} total_timesteps=${TOTAL_TIMESTEPS} per_env_steps=${EFFECTIVE_ENV_STEPS_PER_ENV}"
 echo "PPO: batch=${ROLLOUT_ENV_STEPS} lr=1e-4 epochs=${UPDATE_EPOCHS} minibatches=${NUM_MINIBATCHES} clip_eps=0.1 reward_normalize=true clip_vloss=true max_grad_norm=0.05"
 echo "W&B: entity=${WANDB_ENTITY} project=${WANDB_PROJECT}"
@@ -141,7 +136,7 @@ COMMON_ARGS=(
   --seed "${SEED}"
   --log-interval 1
   --action-repeat "${ACTION_REPEAT}"
-  --slippery-ant
+  --slippery
   --slippery-change-every "${CHANGE_EVERY}"
   --slippery-schedule-seed "${SLIPPERY_SCHEDULE_SEED}"
   --exp-name "${EXP_NAME}"

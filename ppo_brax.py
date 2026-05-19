@@ -5,7 +5,6 @@ Adapted from CleanRL's PPO implementation for continuous control with state obse
 This serves as a baseline to verify the algorithm works before testing pixel observations.
 #To continue this session, run codex resume 019dac51-812f-7023-bfdd-553feaa73809
 """
-import json
 import os
 import random
 import time
@@ -29,21 +28,14 @@ from optimizers import aurora, manifold_stiefel, manifold_stiefel_admm
 import sys
 sys.path.insert(0, "/users/apraka15/arjun/pixelrl/pixelbrax/brax")
 from brax import envs as brax_envs
-from pixelbrax.continual_dynamics import (
-    apply_dynamics_task,
-    continual_log_metrics,
-    load_continual_dynamics_config,
-    make_dynamics_task,
-    resolve_schedule_seed,
-    validate_continual_dynamics_config,
+from configs.continual.slippery_ant_wrapper import (
+    DEFAULT_SLIPPERY_FRICTIONS_CSV,
+    NonstationaryFrictionBraxWrapper,
+    VecEnv,
+    load_seeded_friction_schedule_table,
 )
-from spectrum.tracking import (
-    add_activation_distributions,
-    add_hessian_spectrum,
-    add_weight_spectra,
-    flatten_batch_tree,
-    hessian_eigenvalues,
-)
+
+SUPPORTED_SLIPPERY_ENVS = {"ant", "humanoid"}
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.6"
@@ -126,22 +118,52 @@ class Args:
     """Activation for all MLP hidden layers: swish or relu"""
     reward_normalize: bool = True
     """Normalize rewards using discounted-return RMS statistics"""
+    obs_normalize: bool = False
+    """Normalize state observations with running mean and variance."""
+    obs_norm_clip: float = 10.0
+    """Clip normalized observations to this absolute value."""
+
+    # Policy std/mean parameterization
+    actor_logstd_min: float = -5.0
+    """Minimum log-std clamp for the actor policy."""
+    actor_logstd_max: float = 2.0
+    """Maximum log-std clamp for the actor policy."""
+    clip_global_logstd: bool = False
+    """If true, clamp the global actor log-std parameter with actor_logstd_min/max."""
+    bounded_global_logstd: bool = False
+    """If true, parameterize global log-std inside actor_logstd_min/max with a sigmoid."""
+    actor_logstd_init: float = 0.0
+    """Initializer for the global actor log-std parameter."""
+    actor_mean_tanh: bool = False
+    """If true, bound the actor mean with tanh(actor_mean) * actor_mean_scale."""
+    actor_mean_scale: float = 1.0
+    """Scale for tanh-bounded actor means."""
+    use_crate_head: bool = False
+    """If true, use CRATE-style FeedForward as final hidden layer in actor/critic."""
+    crate_step_size: float = 0.1
+    """Step size for CRATE FeedForward ISTA update."""
+    use_crate_network: bool = False
+    """If true, use a CRATE-style FeedForward block in the state-observation trunk."""
+    network_crate_step_size: float = 0.1
+    """Step size for the state trunk CRATE FeedForward ISTA update."""
 
     # Action repeat
     action_repeat: int = 1
     """Number of times to repeat each action (frame skip)"""
 
-    # Continual dynamics
-    continual_dynamics_config: Optional[str] = None
-    """Path to a YAML continual dynamics config"""
-    spectrum_lanczos_order: int = 20
-    """Lanczos order for task-boundary Hessian spectrum diagnostics"""
-    spectrum_lanczos_draws: int = 1
-    """Number of random Lanczos draws for task-boundary Hessian diagnostics"""
-    spectrum_batch_size: int = 0
-    """Batch size for spectrum diagnostics; 0 uses one PPO minibatch"""
-    spectrum_hist_bins: int = 64
-    """Number of histogram bins for spectrum and activation WandB payloads"""
+    # Slippery friction schedule
+    slippery: bool = False
+    """Use the CSV-backed slippery friction schedule."""
+    slippery_ant: bool = False
+    """Deprecated alias for --slippery."""
+    slippery_change_every: int = 100_000
+    """Number of underlying per-env timesteps between slippery friction changes."""
+    slippery_schedule_seed: Optional[int] = None
+    """CSV row used for slippery friction phases; defaults to the training seed."""
+    slippery_probe_steps: int = 0
+    """Run a zero-action schedule probe for this many steps before training."""
+    slippery_probe_only: bool = False
+    """Exit after the slippery schedule probe."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -362,10 +384,78 @@ class Critic(nn.Module):
         return value
 
 
+class CRATEFeedForward(nn.Module):
+    """CRATE-style FeedForward layer implementing an ISTA step."""
+    dim: int
+    step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x):
+        weight = self.param(
+            "weight",
+            nn.initializers.kaiming_uniform(),
+            (self.dim, self.dim),
+        )
+        grad_1 = (x @ weight.T) @ weight
+        grad_2 = x @ weight
+        grad_update = self.step_size * (grad_2 - grad_1)
+        return nn.swish(x + grad_update)
+
+
+class CRATENetwork(nn.Module):
+    """State-observation trunk with a CRATE FeedForward final block."""
+    activation: str = "swish"
+    crate_step_size: float = 0.1
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        activation = actor_critic_activation_fn(self.activation)
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        crate_hidden = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(hidden_0)
+        if return_intermediates:
+            return {
+                "hidden": crate_hidden,
+                "Dense_0": hidden_0,
+                "CRATEFeedForward_0": crate_hidden,
+                "Dense_0_pre": dense_0,
+            }
+        return crate_hidden
+
+
+class CRATECritic(nn.Module):
+    """Value network with CRATE FeedForward as final hidden layer."""
+    crate_step_size: float = 0.1
+    activation: str = "swish"
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        activation = actor_critic_activation_fn(self.activation)
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        crate_hidden = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(hidden_0)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(crate_hidden)
+        if return_intermediates:
+            return {
+                "value": value,
+                "Dense_0": hidden_0,
+                "CRATEFeedForward_0": crate_hidden,
+                "Dense_1": value,
+            }
+        return value
+
+
 class Actor(nn.Module):
     """Continuous action actor with 2 hidden layers using Gaussian distribution."""
     action_dim: int
     activation: str = "swish"
+    logstd_min: float = -5.0
+    logstd_max: float = 2.0
+    clip_global_logstd: bool = False
+    bounded_global_logstd: bool = False
+    actor_logstd_init: float = 0.0
+    actor_mean_tanh: bool = False
+    actor_mean_scale: float = 1.0
 
     @nn.compact
     def __call__(self, x, return_intermediates: bool = False):
@@ -379,11 +469,34 @@ class Actor(nn.Module):
             kernel_init=orthogonal(0.01), 
             bias_init=constant(0.0)
         )(hidden_1)
-        actor_logstd = self.param(
-            "log_std", 
-            nn.initializers.zeros, 
-            (self.action_dim,)
-        )
+        if self.actor_mean_tanh:
+            actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
+
+        if self.bounded_global_logstd:
+            eps = 1e-6
+            init = jnp.clip(
+                self.actor_logstd_init,
+                self.logstd_min + eps,
+                self.logstd_max - eps,
+            )
+            frac = (init - self.logstd_min) / (self.logstd_max - self.logstd_min)
+            raw_init = jnp.log(frac) - jnp.log1p(-frac)
+            actor_logstd_raw = self.param(
+                "log_std_raw",
+                constant(raw_init),
+                (self.action_dim,),
+            )
+            actor_logstd = self.logstd_min + (
+                self.logstd_max - self.logstd_min
+            ) * jax.nn.sigmoid(actor_logstd_raw)
+        else:
+            actor_logstd = self.param(
+                "log_std",
+                constant(self.actor_logstd_init),
+                (self.action_dim,),
+            )
+            if self.clip_global_logstd:
+                actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
         if return_intermediates:
             return {
                 "actor_mean": actor_mean,
@@ -391,6 +504,70 @@ class Actor(nn.Module):
                 "Dense_0": hidden_0,
                 "Dense_1": hidden_1,
                 "Dense_2": actor_mean,
+            }
+        return actor_mean, actor_logstd
+
+
+class CRATEActor(nn.Module):
+    """Continuous action actor with CRATE FeedForward as final hidden layer."""
+    action_dim: int
+    crate_step_size: float = 0.1
+    activation: str = "swish"
+    logstd_min: float = -5.0
+    logstd_max: float = 2.0
+    clip_global_logstd: bool = False
+    bounded_global_logstd: bool = False
+    actor_logstd_init: float = 0.0
+    actor_mean_tanh: bool = False
+    actor_mean_scale: float = 1.0
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        activation = actor_critic_activation_fn(self.activation)
+        dense_0 = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        crate_hidden = CRATEFeedForward(dim=256, step_size=self.crate_step_size)(hidden_0)
+        actor_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+        )(crate_hidden)
+        if self.actor_mean_tanh:
+            actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
+
+        if self.bounded_global_logstd:
+            eps = 1e-6
+            init = jnp.clip(
+                self.actor_logstd_init,
+                self.logstd_min + eps,
+                self.logstd_max - eps,
+            )
+            frac = (init - self.logstd_min) / (self.logstd_max - self.logstd_min)
+            raw_init = jnp.log(frac) - jnp.log1p(-frac)
+            actor_logstd_raw = self.param(
+                "log_std_raw",
+                constant(raw_init),
+                (self.action_dim,),
+            )
+            actor_logstd = self.logstd_min + (
+                self.logstd_max - self.logstd_min
+            ) * jax.nn.sigmoid(actor_logstd_raw)
+        else:
+            actor_logstd = self.param(
+                "log_std",
+                constant(self.actor_logstd_init),
+                (self.action_dim,),
+            )
+            if self.clip_global_logstd:
+                actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
+
+        if return_intermediates:
+            return {
+                "actor_mean": actor_mean,
+                "actor_logstd": actor_logstd,
+                "Dense_0": hidden_0,
+                "CRATEFeedForward_0": crate_hidden,
+                "Dense_1": actor_mean,
             }
         return actor_mean, actor_logstd
 
@@ -409,6 +586,12 @@ class Storage:
     advantages: jnp.array
     returns: jnp.array
     rewards: jnp.array
+
+
+@flax.struct.dataclass
+class SlipperyRolloutInfo:
+    friction_slide: jnp.array
+    timestep: jnp.array
 
 
 @flax.struct.dataclass
@@ -480,9 +663,63 @@ class RewardNormalizer:
         return jnp.clip(normalized, -clip, clip)
 
 
+@flax.struct.dataclass
+class ObsNormalizer:
+    """Running mean/std normalizer for vector state observations."""
+    mean: jnp.array
+    var: jnp.array
+    count: jnp.array
+    enabled: bool = flax.struct.field(pytree_node=False, default=False)
+    clip: float = flax.struct.field(pytree_node=False, default=10.0)
+
+    @classmethod
+    def create(cls, obs_shape, enabled=False, clip=10.0):
+        return cls(
+            mean=jnp.zeros(obs_shape, dtype=jnp.float32),
+            var=jnp.ones(obs_shape, dtype=jnp.float32),
+            count=jnp.array(1e-4, dtype=jnp.float32),
+            enabled=enabled,
+            clip=clip,
+        )
+
+    def update(self, obs):
+        if not self.enabled:
+            return self
+        obs = obs.astype(jnp.float32)
+        batch_mean = jnp.mean(obs, axis=0)
+        batch_var = jnp.var(obs, axis=0)
+        batch_count = jnp.asarray(obs.shape[0], dtype=jnp.float32)
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + jnp.square(delta) * self.count * batch_count / total_count
+        new_var = m2 / total_count
+        return self.replace(mean=new_mean, var=new_var, count=total_count)
+
+    def normalize(self, obs, epsilon=1e-8):
+        if not self.enabled:
+            return obs
+        normalized = (obs.astype(jnp.float32) - self.mean) / jnp.sqrt(self.var + epsilon)
+        return jnp.clip(normalized, -self.clip, self.clip)
+
+
 def make_brax_envs(args):
     """Create Brax environments with state observations."""
-    # Use brax.envs.create() which applies standard wrappers
+    if args.slippery:
+        env = NonstationaryFrictionBraxWrapper(
+            env_name=args.env_name,
+            backend=args.backend,
+            change_every=args.slippery_change_every,
+            schedule_seed=args.slippery_schedule_seed,
+            action_repeat=args.action_repeat,
+        )
+        action_dim = env.action_size
+        obs_dim = env.observation_size[0]
+        return VecEnv(env), action_dim, obs_dim
+
     env = brax_envs.create(
         env_name=args.env_name,
         backend=args.backend,
@@ -498,6 +735,95 @@ def make_brax_envs(args):
     return env, action_dim, obs_dim
 
 
+def slippery_num_seeded_phases() -> int:
+    table = load_seeded_friction_schedule_table(str(DEFAULT_SLIPPERY_FRICTIONS_CSV))
+    return int(table.shape[1])
+
+
+def slippery_phase_from_timestep(timestep: int, change_every: int, num_seeded_phases: int) -> int:
+    """Map a 1-indexed post-step timestep to the default-plus-CSV regime index."""
+    zero_based_timestep = max(int(timestep) - 1, 0)
+    phase = zero_based_timestep // change_every
+    total_phases = num_seeded_phases + 1
+    return min(phase, total_phases - 1)
+
+
+def latest_slippery_metrics(rollout_info: SlipperyRolloutInfo, args) -> dict[str, float]:
+    friction = jax.device_get(rollout_info.friction_slide[-1])
+    timestep = jax.device_get(rollout_info.timestep[-1])
+    first_timestep = int(np.asarray(timestep)[0])
+    num_seeded_phases = slippery_num_seeded_phases()
+    return {
+        "slippery/friction_slide_mean": float(np.mean(friction)),
+        "slippery/friction_slide_first_env": float(np.asarray(friction)[0]),
+        "slippery/timestep_first_env": first_timestep,
+        "slippery/phase_first_env": slippery_phase_from_timestep(
+            timestep=first_timestep,
+            change_every=args.slippery_change_every,
+            num_seeded_phases=num_seeded_phases,
+        ),
+        "slippery/change_every": int(args.slippery_change_every),
+    }
+
+
+def run_slippery_probe(envs, args, key):
+    """Prints the wrapper's friction schedule under zero actions."""
+    if args.slippery_probe_steps <= 0:
+        return key
+
+    key, reset_key = jax.random.split(key)
+    reset_rngs = jax.random.split(reset_key, args.n_envs)
+    obs, state = envs.reset(reset_rngs, None)
+    del obs
+
+    zero_action = jnp.zeros((args.n_envs, envs.action_size), dtype=jnp.float32)
+
+    @jax.jit
+    def probe_rollout(state, key):
+        def step(carry, _):
+            state, key = carry
+            key, step_key = jax.random.split(key)
+            step_rngs = jax.random.split(step_key, args.n_envs)
+            _, next_state, _, _, info = envs.step(step_rngs, state, zero_action, None)
+            friction = info["friction"][:, 0, 0]
+            timestep = next_state.info["timestep"]
+            return (next_state, key), (friction, timestep)
+
+        return jax.lax.scan(
+            step,
+            (state, key),
+            None,
+            length=args.slippery_probe_steps,
+        )
+
+    (state, key), (friction, timestep) = probe_rollout(state, key)
+    del state
+    friction = np.asarray(jax.device_get(friction))
+    timestep = np.asarray(jax.device_get(timestep))
+
+    print("\nSlippery wrapper probe:")
+    print(
+        "  source="
+        f"{DEFAULT_SLIPPERY_FRICTIONS_CSV} "
+        f"change_every={args.slippery_change_every} "
+        f"seed={args.slippery_schedule_seed}"
+    )
+    print("  step timestep phase friction_first_env")
+    num_seeded_phases = slippery_num_seeded_phases()
+    for i in range(args.slippery_probe_steps):
+        phase = slippery_phase_from_timestep(
+            timestep=int(timestep[i, 0]),
+            change_every=args.slippery_change_every,
+            num_seeded_phases=num_seeded_phases,
+        )
+        print(
+            f"  {i + 1:4d} {int(timestep[i, 0]):8d} "
+            f"{phase:5d} {float(friction[i, 0]):.6g}"
+        )
+
+    return key
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     if args.actor_critic_activation not in {"swish", "relu"}:
@@ -505,6 +831,24 @@ if __name__ == "__main__":
             "actor_critic_activation must be one of: swish, relu; "
             f"got {args.actor_critic_activation!r}"
         )
+    if args.action_repeat <= 0:
+        raise ValueError("--action-repeat must be positive.")
+    if args.slippery_ant:
+        args.slippery = True
+        if args.env_name != "ant":
+            print("--slippery-ant is deprecated; use --slippery for non-Ant slippery envs.")
+    if args.slippery:
+        if args.env_name not in SUPPORTED_SLIPPERY_ENVS:
+            supported = ", ".join(sorted(SUPPORTED_SLIPPERY_ENVS))
+            raise ValueError(f"--slippery supports only envs in {{{supported}}}; got {args.env_name!r}.")
+        if args.slippery_change_every <= 0:
+            raise ValueError("--slippery-change-every must be positive.")
+        if args.slippery_schedule_seed is None:
+            args.slippery_schedule_seed = args.seed
+        if args.slippery_schedule_seed < 0:
+            raise ValueError("--slippery-schedule-seed must be non-negative.")
+        if args.slippery_probe_only and args.slippery_probe_steps <= 0:
+            raise ValueError("--slippery-probe-only requires --slippery-probe-steps > 0.")
     args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -541,6 +885,20 @@ if __name__ == "__main__":
     print(f"minibatch_size: {args.minibatch_size}")
     print(f"actor_critic_activation: {args.actor_critic_activation}")
     print(f"reward_normalize: {args.reward_normalize}")
+    print(f"obs_normalize: {args.obs_normalize}")
+    print(f"obs_norm_clip: {args.obs_norm_clip}")
+    print(f"anneal_lr: {args.anneal_lr}")
+    print(f"actor_logstd_min: {args.actor_logstd_min}")
+    print(f"actor_logstd_max: {args.actor_logstd_max}")
+    print(f"clip_global_logstd: {args.clip_global_logstd}")
+    print(f"bounded_global_logstd: {args.bounded_global_logstd}")
+    print(f"actor_logstd_init: {args.actor_logstd_init}")
+    print(f"actor_mean_tanh: {args.actor_mean_tanh}")
+    print(f"actor_mean_scale: {args.actor_mean_scale}")
+    print(f"use_crate_network: {args.use_crate_network}")
+    print(f"network_crate_step_size: {args.network_crate_step_size}")
+    print(f"use_crate_head: {args.use_crate_head}")
+    print(f"crate_step_size: {args.crate_step_size}")
     print(f"heads_optimizer: {args.heads_optimizer}")
     print(f"heads_stiefel_lr: {args.heads_stiefel_lr}")
     print(f"stiefel_dual_lr: {args.stiefel_dual_lr}")
@@ -548,62 +906,45 @@ if __name__ == "__main__":
     print(f"stiefel_msign_steps: {args.stiefel_msign_steps}")
     print(f"actor_stiefel_max_grad_norm: {args.actor_stiefel_max_grad_norm}")
     print(f"critic_stiefel_max_grad_norm: {args.critic_stiefel_max_grad_norm}")
+    if args.slippery:
+        print(f"slippery_change_every: {args.slippery_change_every}")
+        print(f"slippery_friction_csv: {DEFAULT_SLIPPERY_FRICTIONS_CSV}")
+        print(f"slippery_schedule_seed: {args.slippery_schedule_seed}")
     
     envs, action_dim, obs_dim = make_brax_envs(args)
     print(f"action_dim: {action_dim}")
     print(f"obs_dim: {obs_dim}")
     print(f"action_repeat: {args.action_repeat}")
 
-    base_sys = envs.unwrapped.sys
-    current_sys = base_sys
-    continual_config = None
-    current_task = None
-    current_task_index = 0
-    task_start_step = 0
-    updates_per_task = 0
-    schedule_seed = args.seed
+    if args.slippery:
+        key = run_slippery_probe(envs, args, key)
+    if args.slippery_probe_only:
+        raise SystemExit(0)
 
-    def env_with_sys(sys):
-        envs.unwrapped.sys = sys
-        return envs
+    def reset_env(rng):
+        if args.slippery:
+            reset_rngs = jax.random.split(rng, args.n_envs)
+            obs, state = envs.reset(reset_rngs, None)
+            return obs, state
+        state = envs.reset(rng)
+        return state.obs, state
 
-    def reset_with_sys(sys, rng):
-        return env_with_sys(sys).reset(rng)
-
-    def step_with_sys(sys, state, action):
-        return env_with_sys(sys).step(state, action)
-
-    if args.continual_dynamics_config is not None:
-        loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
-        if loaded_config.enabled:
-            updates_per_task = validate_continual_dynamics_config(
-                loaded_config,
-                env_name=args.env_name,
-                backend=args.backend,
-                n_envs=args.n_envs,
-                num_steps=args.num_steps,
-                base_sys=base_sys,
+    def step_env(key, state, action):
+        if args.slippery:
+            key, env_key = jax.random.split(key)
+            step_rngs = jax.random.split(env_key, args.n_envs)
+            obs, next_state, reward, done, info = envs.step(step_rngs, state, action, None)
+            rollout_info = SlipperyRolloutInfo(
+                friction_slide=info["friction"][:, 0, 0],
+                timestep=next_state.info["timestep"],
             )
-            continual_config = loaded_config
-            schedule_seed = resolve_schedule_seed(continual_config, args.seed)
-            current_task = make_dynamics_task(
-                continual_config,
-                base_sys,
-                task_index=0,
-                schedule_seed=schedule_seed,
-            )
-            current_sys = apply_dynamics_task(base_sys, current_task)
-            print("\nContinual dynamics: ENABLED")
-            print(f"  config: {continual_config.path}")
-            print(f"  switch_every_env_steps: {continual_config.switch_every_env_steps}")
-            print(f"  updates_per_task: {updates_per_task}")
-            print(f"  schedule_seed: {schedule_seed}")
-            print(
-                "  task=0 step=0 default=True values="
-                f"{json.dumps(current_task.values, sort_keys=True)}"
-            )
-        else:
-            print("\nContinual dynamics: config disabled; using fixed dynamics")
+            return key, obs, next_state, reward, done.astype(jnp.bool_), rollout_info
+        next_state = envs.step(state, action)
+        rollout_info = SlipperyRolloutInfo(
+            friction_slide=jnp.zeros(args.n_envs, dtype=jnp.float32),
+            timestep=jnp.zeros(args.n_envs, dtype=jnp.int32),
+        )
+        return key, next_state.obs, next_state, next_state.reward, next_state.done.astype(jnp.bool_), rollout_info
     
     # Observation shape is 1D for state-based observations
     obs_shape = (obs_dim,)
@@ -621,12 +962,35 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     # Initialize networks
-    network = Network(activation=args.actor_critic_activation)
-    actor = Actor(
+    if args.use_crate_network:
+        network = CRATENetwork(
+            activation=args.actor_critic_activation,
+            crate_step_size=args.network_crate_step_size,
+        )
+        print(f"Using CRATE state trunk with step_size={args.network_crate_step_size}")
+    else:
+        network = Network(activation=args.actor_critic_activation)
+    actor_kwargs = dict(
         action_dim=action_dim,
         activation=args.actor_critic_activation,
+        logstd_min=args.actor_logstd_min,
+        logstd_max=args.actor_logstd_max,
+        clip_global_logstd=args.clip_global_logstd,
+        bounded_global_logstd=args.bounded_global_logstd,
+        actor_logstd_init=args.actor_logstd_init,
+        actor_mean_tanh=args.actor_mean_tanh,
+        actor_mean_scale=args.actor_mean_scale,
     )
-    critic = Critic(activation=args.actor_critic_activation)
+    if args.use_crate_head:
+        actor = CRATEActor(crate_step_size=args.crate_step_size, **actor_kwargs)
+        critic = CRATECritic(
+            crate_step_size=args.crate_step_size,
+            activation=args.actor_critic_activation,
+        )
+        print(f"Using CRATE heads with step_size={args.crate_step_size}")
+    else:
+        actor = Actor(**actor_kwargs)
+        critic = Critic(activation=args.actor_critic_activation)
     
     dummy_obs = jnp.zeros((1,) + obs_shape)
     network_params = network.init(network_key, dummy_obs)
@@ -663,86 +1027,9 @@ if __name__ == "__main__":
             critic_stiefel_max_grad_norm=args.critic_stiefel_max_grad_norm,
         ),
     )
-    network_debug_apply = jax.jit(network.apply, static_argnames=("return_intermediates",))
-    actor_debug_apply = jax.jit(actor.apply, static_argnames=("return_intermediates",))
-    critic_debug_apply = jax.jit(critic.apply, static_argnames=("return_intermediates",))
     network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
-
-    spectrum_batch_size = args.spectrum_batch_size or args.minibatch_size
-
-    def collect_spectrum_diagnostics(
-        params,
-        storage: Storage,
-        key: jax.random.PRNGKey,
-        prefix: str,
-        task_index: int,
-        global_step_value: int,
-    ) -> dict:
-        batch = flatten_batch_tree(storage, spectrum_batch_size)
-
-        def spectrum_loss(loss_params, loss_batch):
-            loss_value, _ = ppo_loss(
-                loss_params,
-                loss_batch.obs,
-                loss_batch.actions,
-                loss_batch.logprobs,
-                loss_batch.advantages,
-                loss_batch.returns,
-                loss_batch.values,
-            )
-            return loss_value
-
-        logs = {
-            f"{prefix}/task_index": float(task_index),
-            f"{prefix}/global_step": float(global_step_value),
-            f"{prefix}/lanczos_order": float(args.spectrum_lanczos_order),
-            f"{prefix}/lanczos_draws": float(args.spectrum_lanczos_draws),
-        }
-        eigvals = hessian_eigenvalues(
-            spectrum_loss,
-            params,
-            batch,
-            key,
-            order=args.spectrum_lanczos_order,
-            draws=args.spectrum_lanczos_draws,
-        )
-        add_hessian_spectrum(
-            logs,
-            f"{prefix}/hessian",
-            eigvals,
-            bins=args.spectrum_hist_bins,
-        )
-        add_weight_spectra(logs, params, prefix, bins=args.spectrum_hist_bins)
-
-        net_debug = network_debug_apply(
-            params["network"],
-            batch.obs,
-            return_intermediates=True,
-        )
-        actor_debug = actor_debug_apply(
-            params["actor"],
-            net_debug["hidden"],
-            return_intermediates=True,
-        )
-        critic_debug = critic_debug_apply(
-            params["critic"],
-            net_debug["hidden"],
-            return_intermediates=True,
-        )
-        activations = {
-            **{f"network/{k}": v for k, v in net_debug.items() if k != "hidden"},
-            **{f"actor/{k}": v for k, v in actor_debug.items() if k not in {"actor_logstd"}},
-            **{f"critic/{k}": v for k, v in critic_debug.items()},
-        }
-        add_activation_distributions(
-            logs,
-            activations,
-            prefix,
-            bins=args.spectrum_hist_bins,
-        )
-        return logs
 
     @jax.jit
     def get_action_and_value(
@@ -903,24 +1190,30 @@ if __name__ == "__main__":
 
     # Reset environment
     key, reset_key = jax.random.split(key)
-    env_state = reset_with_sys(current_sys, reset_key)
-    
-    # For state-based observations, directly use env_state.obs
-    next_obs = env_state.obs
+    next_obs, env_state = reset_env(reset_key)
+    obs_normalizer = ObsNormalizer.create(
+        obs_shape,
+        enabled=args.obs_normalize,
+        clip=args.obs_norm_clip,
+    )
+    obs_normalizer = obs_normalizer.update(next_obs)
+    next_obs = obs_normalizer.normalize(next_obs)
     next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
 
     # Initialize reward normalizer (discounted return-based, like CleanRL)
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
-    def step_once(current_sys, carry, step):
-        agent_state, episode_stats, reward_norm, env_state, obs, done, key = carry
+    def step_once(carry, step):
+        agent_state, episode_stats, reward_norm, obs_norm, env_state, obs, done, key = carry
         action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
-        # Step environment
-        env_state = step_with_sys(current_sys, env_state, action)
-        next_obs = env_state.obs  # State-based observation
-        raw_reward = env_state.reward
-        next_done = env_state.done.astype(jnp.bool_)  # Ensure bool type
+        key, next_obs_raw, env_state, raw_reward, next_done, rollout_info = step_env(
+            key,
+            env_state,
+            action,
+        )
+        obs_norm = obs_norm.update(next_obs_raw)
+        next_obs = obs_norm.normalize(next_obs_raw)
 
         # Update reward statistics only when normalization is enabled.
         if args.reward_normalize:
@@ -954,85 +1247,77 @@ if __name__ == "__main__":
             returns=jnp.zeros_like(reward),
             advantages=jnp.zeros_like(reward),
         )
-        return (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage
+        return (
+            agent_state,
+            episode_stats,
+            reward_norm,
+            obs_norm,
+            env_state,
+            next_obs,
+            next_done,
+            key,
+        ), (storage, rollout_info)
 
     def rollout(
-        current_sys,
         agent_state,
         episode_stats,
         reward_norm,
+        obs_norm,
         env_state,
         next_obs,
         next_done,
         key,
         max_steps,
     ):
-        (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key), storage = jax.lax.scan(
-            partial(step_once, current_sys),
-            (agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, key),
+        (
+            agent_state,
+            episode_stats,
+            reward_norm,
+            obs_norm,
+            env_state,
+            next_obs,
+            next_done,
+            key,
+        ), (storage, rollout_info) = jax.lax.scan(
+            step_once,
+            (agent_state, episode_stats, reward_norm, obs_norm, env_state, next_obs, next_done, key),
             jnp.arange(max_steps),
         )
-        return agent_state, episode_stats, reward_norm, env_state, next_obs, next_done, storage, key
+        return (
+            agent_state,
+            episode_stats,
+            reward_norm,
+            obs_norm,
+            env_state,
+            next_obs,
+            next_done,
+            storage,
+            rollout_info,
+            key,
+        )
 
     rollout = partial(rollout, max_steps=args.num_steps)
     rollout = jax.jit(rollout)
 
     print("Starting training...")
     for iteration in range(1, args.num_updates + 1):
-        if (
-            continual_config is not None
-            and iteration > 1
-            and (iteration - 1) % updates_per_task == 0
-        ):
-            task_index = (iteration - 1) // updates_per_task
-            current_task = make_dynamics_task(
-                continual_config,
-                base_sys,
-                task_index=task_index,
-                schedule_seed=schedule_seed,
-            )
-            current_task_index = task_index
-            current_sys = apply_dynamics_task(base_sys, current_task)
-            task_start_step = global_step
-
-            key, reset_key = jax.random.split(key)
-            env_state = reset_with_sys(current_sys, reset_key)
-            next_obs = env_state.obs
-            next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
-            episode_stats = EpisodeStatistics(
-                episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
-                episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
-                returned_episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
-                returned_episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
-            )
-            reward_normalizer = reward_normalizer.replace(
-                discounted_return=jnp.zeros(args.n_envs),
-            )
-
-            print(
-                f"continual_switch task={task_index} step={global_step} "
-                f"default={current_task.is_default} values="
-                f"{json.dumps(current_task.values, sort_keys=True)}"
-            )
-
-            if args.track:
-                import wandb
-                wandb.log(
-                    continual_log_metrics(
-                        current_task,
-                        switch_every_env_steps=continual_config.switch_every_env_steps,
-                        task_start_step=task_start_step,
-                        global_step=global_step,
-                    ),
-                    step=global_step,
-                )
-
         iteration_time_start = time.time()
-        agent_state, episode_stats, reward_normalizer, env_state, next_obs, next_done, storage, key = rollout(
-            current_sys,
+        (
             agent_state,
             episode_stats,
             reward_normalizer,
+            obs_normalizer,
+            env_state,
+            next_obs,
+            next_done,
+            storage,
+            rollout_info,
+            key,
+        ) = rollout(
+            agent_state,
+            episode_stats,
+            reward_normalizer,
+            obs_normalizer,
             env_state,
             next_obs,
             next_done,
@@ -1040,61 +1325,32 @@ if __name__ == "__main__":
         )
         global_step += args.num_steps * args.n_envs
         storage = compute_gae(agent_state, next_obs, next_done, storage)
-        if (
-            args.track
-            and continual_config is not None
-            and (iteration - 1) % updates_per_task == 0
-        ):
-            import wandb
-            key, spectrum_key = jax.random.split(key)
-            wandb.log(
-                collect_spectrum_diagnostics(
-                    agent_state.params,
-                    storage,
-                    spectrum_key,
-                    "spectrum/task_start",
-                    current_task_index,
-                    global_step,
-                ),
-                step=global_step,
-            )
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
             agent_state,
             storage,
             key,
         )
-        if (
-            args.track
-            and continual_config is not None
-            and (iteration % updates_per_task == 0 or iteration == args.num_updates)
-        ):
-            import wandb
-            key, spectrum_key = jax.random.split(key)
-            wandb.log(
-                collect_spectrum_diagnostics(
-                    agent_state.params,
-                    storage,
-                    spectrum_key,
-                    "spectrum/task_end",
-                    current_task_index,
-                    global_step,
-                ),
-                step=global_step,
-            )
         
         if iteration % args.log_interval == 0:
             avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
             avg_episodic_length = np.mean(jax.device_get(episode_stats.returned_episode_lengths))
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
+            slippery_metrics = latest_slippery_metrics(rollout_info, args) if args.slippery else None
             
-            print(
+            base_msg = (
                 f"update={iteration} step={global_step} "
                 f"ep_return={avg_episodic_return:.1f} "
                 f"ep_len={avg_episodic_length * args.action_repeat:.0f} "  # Actual env steps
                 f"loss={loss[-1, -1].item():.4f} "
                 f"SPS={sps}"
             )
+            if slippery_metrics is not None:
+                base_msg += (
+                    f" friction={slippery_metrics['slippery/friction_slide_first_env']:.4g}"
+                    f" phase={slippery_metrics['slippery/phase_first_env']}"
+                )
+            print(base_msg)
             
             if args.track:
                 lr = float(linear_schedule(iteration * args.num_minibatches * args.update_epochs)) if args.anneal_lr else args.learning_rate
@@ -1112,15 +1368,8 @@ if __name__ == "__main__":
                     "losses/loss": loss[-1, -1].item(),
                 }
 
-                if continual_config is not None:
-                    log_dict.update(
-                        continual_log_metrics(
-                            current_task,
-                            switch_every_env_steps=continual_config.switch_every_env_steps,
-                            task_start_step=task_start_step,
-                            global_step=global_step,
-                        )
-                    )
+                if slippery_metrics is not None:
+                    log_dict.update(slippery_metrics)
 
                 wandb.log(log_dict, step=global_step)
 

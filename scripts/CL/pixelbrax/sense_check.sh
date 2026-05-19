@@ -81,10 +81,12 @@ UPDATE_EPOCHS="${UPDATE_EPOCHS:-4}"
 ACTION_REPEAT="${ACTION_REPEAT:-4}"
 LR="1e-4"
 JAX_MEM_FRACTION="${JAX_MEM_FRACTION:-0.60}"
-SPECTRUM_LANCZOS_ORDER="${SPECTRUM_LANCZOS_ORDER:-20}"
+SPECTRUM_LANCZOS_ORDER="${SPECTRUM_LANCZOS_ORDER:-100}"
 SPECTRUM_LANCZOS_DRAWS="${SPECTRUM_LANCZOS_DRAWS:-1}"
 SPECTRUM_BATCH_SIZE="${SPECTRUM_BATCH_SIZE:-0}"
-SPECTRUM_HIST_BINS="${SPECTRUM_HIST_BINS:-64}"
+SPECTRUM_HIST_BINS="${SPECTRUM_HIST_BINS:-128}"
+SPECTRUM_DENSITY_GRID_LEN="${SPECTRUM_DENSITY_GRID_LEN:-10000}"
+SPECTRUM_DENSITY_SIGMA_SQUARED="${SPECTRUM_DENSITY_SIGMA_SQUARED:-1e-5}"
 
 ROLLOUT_ENV_STEPS=$((N_ENVS * NUM_STEPS))
 if (( PHASE_EVERY_ENV_STEPS % N_ENVS != 0 )); then
@@ -130,7 +132,7 @@ EXP_NAME="ppo_pixelbrax_slippery_ant_${RUN_NAME}_sense_check_s${SEED}"
 echo "PixelBrax SlipperyAnt sense check group=${GROUP_NAME}"
 echo "Config: run=${RUN_NAME} env=${ENV_NAME} backend=${BACKEND} seed=${SEED} total_timesteps=${TOTAL_TIMESTEPS} n_envs=${N_ENVS} num_steps=${NUM_STEPS} minibatches=${NUM_MINIBATCHES} minibatch_size=${MINIBATCH_SIZE} update_epochs=${UPDATE_EPOCHS}"
 echo "Slippery: phase_every_env_steps=${PHASE_EVERY_ENV_STEPS} slippery_change_every=${SLIPPERY_CHANGE_EVERY} effective_phases=${EFFECTIVE_PHASES} action_repeat=${ACTION_REPEAT}"
-echo "Spectrum: lanczos_order=${SPECTRUM_LANCZOS_ORDER} draws=${SPECTRUM_LANCZOS_DRAWS} batch_size=${SPECTRUM_BATCH_SIZE} hist_bins=${SPECTRUM_HIST_BINS}"
+echo "Spectrum: lanczos_order=${SPECTRUM_LANCZOS_ORDER} draws=${SPECTRUM_LANCZOS_DRAWS} batch_size=${SPECTRUM_BATCH_SIZE} hist_bins=${SPECTRUM_HIST_BINS} density_grid_len=${SPECTRUM_DENSITY_GRID_LEN} density_sigma_squared=${SPECTRUM_DENSITY_SIGMA_SQUARED}"
 echo "Packing: runs=1 jax_mem_fraction=${JAX_MEM_FRACTION}"
 echo "W&B: entity=${WANDB_ENTITY} project=${WANDB_PROJECT} group=${GROUP_NAME}"
 
@@ -187,6 +189,8 @@ uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   --spectrum-lanczos-draws "${SPECTRUM_LANCZOS_DRAWS}" \
   --spectrum-batch-size "${SPECTRUM_BATCH_SIZE}" \
   --spectrum-hist-bins "${SPECTRUM_HIST_BINS}" \
+  --spectrum-density-grid-len "${SPECTRUM_DENSITY_GRID_LEN}" \
+  --spectrum-density-sigma-squared "${SPECTRUM_DENSITY_SIGMA_SQUARED}" \
   --debug-repr \
   --exp-name "${EXP_NAME}" \
   "${WANDB_ENTITY_ARGS[@]}"
