@@ -35,9 +35,11 @@ if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
   export WANDB_API_KEY="$(tr -d '\r\n' < "${WANDB_KEY_FILE}")"
 fi
 
-ENV_NAME="humanoid"
+ENV_NAME="${ENV_NAME:-humanoid}"
 BACKEND="${BACKEND:-spring}"
 ACTOR_CRITIC_ACTIVATION="${ACTOR_CRITIC_ACTIVATION:-relu}"
+BASE_OPTIMIZER="${BASE_OPTIMIZER:-adam}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 HEADS_OPTIMIZER="${HEADS_OPTIMIZER:-adam}"
 N_ENVS="${N_ENVS:-128}"
 NUM_STEPS="${NUM_STEPS:-10}"
@@ -112,11 +114,82 @@ select_validate_config() {
   NUM_PHASES="${phase_counts[$count_idx]}"
 }
 
+select_optimizer_ablation_config() {
+  local best_schedule_seed="${BEST_SCHEDULE_SEED:-14}"
+  local phase_env_steps="${ABLATION_PHASE_ENV_STEPS:-999936}"
+  local phases="${ABLATION_NUM_PHASES:-20}"
+  if (( TASK_ID < 0 || TASK_ID >= 8 )); then
+    echo "Invalid optimizer_ablation TASK_ID=${TASK_ID}. Expected 0..7." >&2
+    exit 1
+  fi
+
+  local seed_idx=$((TASK_ID % 2))
+  local condition_idx=$((TASK_ID / 2))
+  SEED="${seed_idx}"
+  SLIPPERY_SCHEDULE_SEED="${best_schedule_seed}"
+  PHASE_EVERY_ENV_STEPS="${phase_env_steps}"
+  NUM_PHASES="${phases}"
+
+  case "${condition_idx}" in
+    0)
+      RUN_KIND="stiefel_adam_relu"
+      HEADS_OPTIMIZER="stiefel"
+      BASE_OPTIMIZER="adam"
+      ACTOR_CRITIC_ACTIVATION="relu"
+      ;;
+    1)
+      RUN_KIND="stiefel_adam_swish"
+      HEADS_OPTIMIZER="stiefel"
+      BASE_OPTIMIZER="adam"
+      ACTOR_CRITIC_ACTIVATION="swish"
+      ;;
+    2)
+      RUN_KIND="stiefel_adamw_relu"
+      HEADS_OPTIMIZER="stiefel"
+      BASE_OPTIMIZER="adamw"
+      ACTOR_CRITIC_ACTIVATION="relu"
+      ;;
+    3)
+      RUN_KIND="stiefel_adamw_swish"
+      HEADS_OPTIMIZER="stiefel"
+      BASE_OPTIMIZER="adamw"
+      ACTOR_CRITIC_ACTIVATION="swish"
+      ;;
+    *) echo "Invalid optimizer ablation condition index ${condition_idx}." >&2; exit 1 ;;
+  esac
+}
+
+select_confirm_config() {
+  local best_schedule_seed="${BEST_SCHEDULE_SEED:-14}"
+  local phase_env_steps="${CONFIRM_PHASE_ENV_STEPS:-999936}"
+  local phases="${CONFIRM_NUM_PHASES:-20}"
+  local seed_offset="${CONFIRM_SEED_OFFSET:-0}"
+  local confirm_heads_optimizer="${CONFIRM_HEADS_OPTIMIZER:-stiefel}"
+  local confirm_base_optimizer="${CONFIRM_BASE_OPTIMIZER:-adam}"
+  local confirm_activation="${CONFIRM_ACTOR_CRITIC_ACTIVATION:-relu}"
+
+  if (( TASK_ID < 0 || TASK_ID >= 8 )); then
+    echo "Invalid confirm TASK_ID=${TASK_ID}. Expected 0..7." >&2
+    exit 1
+  fi
+
+  RUN_KIND="confirm_${confirm_heads_optimizer}_${confirm_base_optimizer}_${confirm_activation}"
+  SEED="$((seed_offset + TASK_ID))"
+  SLIPPERY_SCHEDULE_SEED="${best_schedule_seed}"
+  PHASE_EVERY_ENV_STEPS="${phase_env_steps}"
+  NUM_PHASES="${phases}"
+  HEADS_OPTIMIZER="${confirm_heads_optimizer}"
+  BASE_OPTIMIZER="${confirm_base_optimizer}"
+  ACTOR_CRITIC_ACTIVATION="${confirm_activation}"
+}
+
 case "${WAVE}" in
   pilot) select_pilot_config ;;
   lr) select_lr_config ;;
   validate) select_validate_config ;;
-  *) echo "Unsupported WAVE=${WAVE}. Expected pilot, lr, or validate." >&2; exit 1 ;;
+  optimizer_ablation) select_optimizer_ablation_config ;;
+  confirm) select_confirm_config ;;
+  *) echo "Unsupported WAVE=${WAVE}. Expected pilot, lr, validate, optimizer_ablation, or confirm." >&2; exit 1 ;;
 esac
 
 if (( PHASE_EVERY_ENV_STEPS < 1 )); then
@@ -156,18 +229,18 @@ EFFECTIVE_ENV_STEPS_PER_ENV=$((TOTAL_TIMESTEPS / N_ENVS))
 EFFECTIVE_PHASES=$(((EFFECTIVE_ENV_STEPS_PER_ENV + CHANGE_EVERY_POLICY_STEPS - 1) / CHANGE_EVERY_POLICY_STEPS))
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
 PHASE_MILLIONS=$((PHASE_EVERY_ENV_STEPS / 1000000))
-GROUP_NAME="slippery_humanoid_envonly_${WAVE}_${GROUP_ID}"
+GROUP_NAME="slippery_${ENV_NAME}_envonly_${WAVE}_${GROUP_ID}"
 LR_TAG="${LEARNING_RATE//./p}"
 LR_TAG="${LR_TAG//-/_}"
-EXP_NAME="ppo_brax_sliphum_${WAVE}_${RUN_KIND}_ph${NUM_PHASES}_phase${PHASE_MILLIONS}m_sched${SLIPPERY_SCHEDULE_SEED}_s${SEED}_lr${LR_TAG}_t${TASK_ID}"
+EXP_NAME="ppo_brax_slip${ENV_NAME}_${WAVE}_${RUN_KIND}_ph${NUM_PHASES}_phase${PHASE_MILLIONS}m_sched${SLIPPERY_SCHEDULE_SEED}_s${SEED}_lr${LR_TAG}_t${TASK_ID}"
 
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_TAGS="continual_rl,slippery_humanoid_sweep,env_only,${WAVE},${RUN_KIND},brax_state,${ENV_NAME},backend_${BACKEND},seed_${SEED},schedule_seed_${SLIPPERY_SCHEDULE_SEED},phase_every_${PHASE_EVERY_ENV_STEPS},change_every_per_env_${CHANGE_EVERY},phases_${EFFECTIVE_PHASES},requested_phases_${NUM_PHASES},action_repeat_${ACTION_REPEAT},actorcritic_${ACTOR_CRITIC_ACTIVATION},headopt_${HEADS_OPTIMIZER},${SCHEDULE_TAG},batch_${ROLLOUT_ENV_STEPS},minibatches_${NUM_MINIBATCHES},epochs_${UPDATE_EPOCHS},minibatch_size_${MINIBATCH_SIZE},reward_norm,vclip,lr_${LEARNING_RATE},repo_ppo"
+export WANDB_TAGS="continual_rl,slippery_${ENV_NAME}_sweep,env_only,${WAVE},${RUN_KIND},brax_state,${ENV_NAME},backend_${BACKEND},seed_${SEED},schedule_seed_${SLIPPERY_SCHEDULE_SEED},phase_every_${PHASE_EVERY_ENV_STEPS},change_every_per_env_${CHANGE_EVERY},phases_${EFFECTIVE_PHASES},requested_phases_${NUM_PHASES},action_repeat_${ACTION_REPEAT},actorcritic_${ACTOR_CRITIC_ACTIVATION},baseopt_${BASE_OPTIMIZER},weight_decay_${WEIGHT_DECAY},headopt_${HEADS_OPTIMIZER},${SCHEDULE_TAG},batch_${ROLLOUT_ENV_STEPS},minibatches_${NUM_MINIBATCHES},epochs_${UPDATE_EPOCHS},minibatch_size_${MINIBATCH_SIZE},reward_norm,vclip,lr_${LEARNING_RATE},repo_ppo"
 
-echo "Running Slippery Humanoid env-only sweep group=${GROUP_NAME}"
+echo "Running Slippery ${ENV_NAME} env-only sweep group=${GROUP_NAME}"
 echo "Config: wave=${WAVE} task_id=${TASK_ID} kind=${RUN_KIND} env=${ENV_NAME} backend=${BACKEND} seed=${SEED} schedule_seed=${SLIPPERY_SCHEDULE_SEED}"
 echo "Schedule: phase_every_env_steps=${PHASE_EVERY_ENV_STEPS} requested_phases=${NUM_PHASES} effective_phases=${EFFECTIVE_PHASES} change_every_policy_steps=${CHANGE_EVERY_POLICY_STEPS} change_every_wrapper_steps=${CHANGE_EVERY} total_timesteps=${TOTAL_TIMESTEPS} per_env_steps=${EFFECTIVE_ENV_STEPS_PER_ENV}"
-echo "PPO fixed: batch=${ROLLOUT_ENV_STEPS} minibatch_size=${MINIBATCH_SIZE} lr=${LEARNING_RATE} anneal_lr=true epochs=${UPDATE_EPOCHS} minibatches=${NUM_MINIBATCHES} clip_eps=0.1 reward_normalize=true clip_vloss=true max_grad_norm=0.05"
+echo "PPO fixed: batch=${ROLLOUT_ENV_STEPS} minibatch_size=${MINIBATCH_SIZE} lr=${LEARNING_RATE} base_optimizer=${BASE_OPTIMIZER} weight_decay=${WEIGHT_DECAY} anneal_lr=true epochs=${UPDATE_EPOCHS} minibatches=${NUM_MINIBATCHES} clip_eps=0.1 reward_normalize=true clip_vloss=true max_grad_norm=0.05"
 echo "Policy: actor_mean_tanh=true actor_mean_scale=${ACTOR_MEAN_SCALE} bounded_global_logstd=true actor_logstd_init=${ACTOR_LOGSTD_INIT} actor_logstd_min=${ACTOR_LOGSTD_MIN} actor_logstd_max=${ACTOR_LOGSTD_MAX}"
 echo "Obs: obs_normalize=true obs_norm_clip=${OBS_NORM_CLIP}"
 echo "Network: use_crate_network=true network_crate_step_size=${NETWORK_CRATE_STEP_SIZE}"
@@ -184,6 +257,8 @@ COMMON_ARGS=(
   --total-timesteps "${TOTAL_TIMESTEPS}"
   --learning-rate "${LEARNING_RATE}"
   --adam-eps "${ADAM_EPS}"
+  --base-optimizer "${BASE_OPTIMIZER}"
+  --weight-decay "${WEIGHT_DECAY}"
   --anneal-lr
   --num-steps "${NUM_STEPS}"
   --num-minibatches "${NUM_MINIBATCHES}"

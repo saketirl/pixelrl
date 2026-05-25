@@ -31,7 +31,7 @@ HEADS_OPTIMIZER="${9:-${HEADS_OPTIMIZER:-adam}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_slippery_brax.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_brax.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 
@@ -141,6 +141,7 @@ COMMON_ARGS=(
   --seed "${SEED}"
   --log-interval 1
   --action-repeat "${ACTION_REPEAT}"
+  --slippery-ant
   --slippery-change-every "${CHANGE_EVERY}"
   --slippery-schedule-seed "${SLIPPERY_SCHEDULE_SEED}"
   --exp-name "${EXP_NAME}"
@@ -151,5 +152,5 @@ if [[ -n "${WANDB_ENTITY}" ]]; then
 fi
 
 cd "${REPO_ROOT}"
-uv run python "${REPO_ROOT}/ppo_slippery_brax.py" \
+uv run python "${REPO_ROOT}/ppo_brax.py" \
   "${COMMON_ARGS[@]}"

@@ -27,7 +27,7 @@ HEADS_OPTIMIZER="${8:-${HEADS_OPTIMIZER:-adam}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_slippery_brax_memfrac.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_brax.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 
@@ -162,6 +162,7 @@ for SEED in "${SEED_LIST[@]}"; do
   --seed "${SEED}"
   --log-interval 1
   --action-repeat "${ACTION_REPEAT}"
+  --slippery-ant
   --slippery-change-every "${CHANGE_EVERY}"
   --slippery-schedule-seed "${SLIPPERY_SCHEDULE_SEED}"
   --exp-name "${EXP_NAME}"
@@ -176,7 +177,7 @@ for SEED in "${SEED_LIST[@]}"; do
     export WANDB_RUN_GROUP="${GROUP_NAME}"
     export WANDB_TAGS="continual_rl,slippery_ant_wrapper,brax_state,${ENV_NAME},backend_${BACKEND},seed_${SEED},phase_every_${PHASE_EVERY_ENV_STEPS},change_every_per_env_${CHANGE_EVERY},phases_${DISTINCT_PHASES},action_repeat_${ACTION_REPEAT},actorcritic_${ACTOR_CRITIC_ACTIVATION},headopt_${HEADS_OPTIMIZER},wrapper_faithful,${SCHEDULE_TAG},batch_${ROLLOUT_ENV_STEPS},minibatches_${NUM_MINIBATCHES},epochs_${UPDATE_EPOCHS},minibatch_size_${MINIBATCH_SIZE},reward_norm,vclip,lr1e4,repo_ppo,multi_process_per_gpu,seeds_per_gpu_${SEEDS_PER_GPU},jax_mem_fraction_${JAX_MEM_FRACTION}"
     echo "Starting seed=${SEED} schedule_seed=${SLIPPERY_SCHEDULE_SEED} exp=${EXP_NAME} log=${CHILD_LOG}"
-    uv run python "${REPO_ROOT}/ppo_slippery_brax_memfrac.py" "${COMMON_ARGS[@]}"
+    uv run python "${REPO_ROOT}/ppo_brax.py" "${COMMON_ARGS[@]}"
   ) >"${CHILD_LOG}" 2>&1 &
 
   PID=$!

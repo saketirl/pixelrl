@@ -7,7 +7,6 @@ Optimizer split:
 - selectable Adam, Optax Muon, or manifold Stiefel for actor/critic head matrices
 - Adam/AdamW for actor/critic vectors/scalars
 """
-import json
 import os
 import random
 import time
@@ -29,29 +28,25 @@ from flax.training.train_state import TrainState
 import sys
 sys.path.insert(0, "/users/stiwari4/data/stiwari4/pixelenvs/pixelbrax/pixelbrax/brax")
 import pixelbrax
-from pixelbrax.continual_dynamics import (
-    apply_dynamics_task,
-    continual_log_metrics,
-    load_continual_dynamics_config,
-    make_dynamics_task,
-    resolve_schedule_seed,
-    validate_continual_dynamics_config,
-)
 from pixelbrax.env_utils import make_pixel_brax
 from configs.continual.slippery_ant_wrapper import (
     DEFAULT_SLIPPERY_FRICTIONS_CSV,
     load_seeded_friction_schedule_table,
 )
 
+SUPPORTED_SLIPPERY_ENVS = {"ant", "humanoid"}
+
 from optimizers import aurora, manifold_stiefel, manifold_stiefel_admm
+from aurora_tracking import add_aurora_diagnostics, tree_delta
 from encoders import build_encoder
 from sigreg import sigreg_loss, sigreg_loss_masked
 from spectrum.tracking import (
+    add_hessian_density_curve,
     add_hessian_histogram,
     add_histogram,
     add_matrix_singular_histogram,
     flatten_batch_tree,
-    hessian_eigenvalues,
+    hessian_eigenvalues_and_tridiags,
 )
 
 # Fix weird OOM https://github.com/google/jax/discussions/6332#discussioncomment-1279991
@@ -232,18 +227,16 @@ class Args:
     action_repeat: int = 1
     """Number of times to repeat each action (frame skip)"""
 
-    # Continual dynamics
-    continual_dynamics_config: Optional[str] = None
-    """Path to a YAML continual dynamics config"""
-
-    # SlipperyAnt friction schedule
+    # Slippery friction schedule
+    slippery: bool = False
+    """Use the CSV-backed slippery friction schedule."""
     slippery_ant: bool = False
-    """Use the CSV-backed SlipperyAnt friction schedule."""
+    """Deprecated alias for --slippery."""
     slippery_change_every: int = 100_000
-    """Number of underlying per-env timesteps between SlipperyAnt friction changes."""
+    """Number of underlying per-env timesteps between slippery friction changes."""
     slippery_schedule_seed: int = 0
-    """CSV row used for SlipperyAnt friction phases."""
-    spectrum_lanczos_order: int = 20
+    """CSV row used for slippery friction phases."""
+    spectrum_lanczos_order: int = 100
     """Lanczos order for task-boundary Hessian spectrum diagnostics"""
     spectrum_lanczos_draws: int = 1
     """Number of random Lanczos draws for task-boundary Hessian diagnostics"""
@@ -251,7 +244,10 @@ class Args:
     """Batch size for spectrum diagnostics; 0 uses one PPO minibatch"""
     spectrum_hist_bins: int = 64
     """Number of histogram bins for spectrum and activation WandB payloads"""
-
+    spectrum_density_grid_len: int = 10000
+    """Number of points in Hessian spectral density curves"""
+    spectrum_density_sigma_squared: float = 1e-5
+    """Gaussian smoothing scale for Hessian spectral density curves"""
     # Debug/analysis flags
     debug_repr: bool = False
     """Toggle debug logging for encoder representations"""
@@ -1531,12 +1527,15 @@ if __name__ == "__main__":
         args.data_seed = args.seed
     args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
     if args.slippery_ant:
+        args.slippery = True
         if args.env_name != "ant":
-            raise ValueError("--slippery-ant currently supports only --env-name ant.")
+            print("--slippery-ant is deprecated; use --slippery for non-Ant slippery envs.")
+    if args.slippery:
+        if args.env_name not in SUPPORTED_SLIPPERY_ENVS:
+            supported = ", ".join(sorted(SUPPORTED_SLIPPERY_ENVS))
+            raise ValueError(f"--slippery supports only envs in {{{supported}}}; got {args.env_name!r}.")
         if args.slippery_change_every <= 0:
             raise ValueError("--slippery-change-every must be positive.")
-        if args.continual_dynamics_config is not None:
-            raise ValueError("--slippery-ant cannot be combined with --continual-dynamics-config.")
 
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -1671,49 +1670,11 @@ if __name__ == "__main__":
 
     base_sys = envs.base_sys
     current_sys = base_sys
-    continual_config = None
-    current_task = None
-    current_task_index = 0
-    task_start_step = 0
-    updates_per_task = 0
-    schedule_seed = args.data_seed
     slippery_friction_schedule = None
     slippery_default_geom_friction = None
     last_slippery_phase_logged = None
 
-    if args.continual_dynamics_config is not None:
-        loaded_config = load_continual_dynamics_config(args.continual_dynamics_config)
-        if loaded_config.enabled:
-            updates_per_task = validate_continual_dynamics_config(
-                loaded_config,
-                env_name=args.env_name,
-                backend=args.backend,
-                n_envs=args.n_envs,
-                num_steps=args.num_steps,
-                base_sys=base_sys,
-            )
-            continual_config = loaded_config
-            schedule_seed = resolve_schedule_seed(continual_config, args.data_seed)
-            current_task = make_dynamics_task(
-                continual_config,
-                base_sys,
-                task_index=0,
-                schedule_seed=schedule_seed,
-            )
-            current_sys = apply_dynamics_task(base_sys, current_task)
-            print("\nContinual dynamics: ENABLED")
-            print(f"  config: {continual_config.path}")
-            print(f"  switch_every_env_steps: {continual_config.switch_every_env_steps}")
-            print(f"  updates_per_task: {updates_per_task}")
-            print(f"  schedule_seed: {schedule_seed}")
-            print(
-                "  task=0 step=0 default=True values="
-                f"{json.dumps(current_task.values, sort_keys=True)}"
-            )
-        else:
-            print("\nContinual dynamics: config disabled; using fixed dynamics")
-
-    if args.slippery_ant:
+    if args.slippery:
         friction_table = load_seeded_friction_schedule_table(
             str(DEFAULT_SLIPPERY_FRICTIONS_CSV.resolve())
         )
@@ -1727,7 +1688,7 @@ if __name__ == "__main__":
             jax.device_get(base_sys.geom_friction),
             dtype=np.float32,
         )
-        print("\nSlipperyAnt friction schedule: ENABLED")
+        print(f"\nSlippery friction schedule: ENABLED for env={args.env_name}")
         print(f"  source: {DEFAULT_SLIPPERY_FRICTIONS_CSV}")
         print(f"  change_every: {args.slippery_change_every}")
         print(f"  schedule_seed: {args.slippery_schedule_seed}")
@@ -2447,6 +2408,100 @@ if __name__ == "__main__":
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
     spectrum_batch_size = args.spectrum_batch_size or args.minibatch_size
 
+    def selected_diagnostic_matrix_specs(params):
+        specs = []
+
+        def has_path(path):
+            node = params
+            for part in path:
+                if part not in node:
+                    return False
+                node = node[part]
+            return getattr(node, "ndim", 0) >= 2
+
+        for path in encoder_final_stiefel_kernel_paths(encoder_type):
+            if path[0] == "network" and path[1] == "params" and has_path(path):
+                specs.append(("/".join(("network",) + path[2:-1]), path))
+        candidates = (
+            ("actor/Dense_0", ("actor", "params", "Dense_0", "kernel")),
+            ("actor/Dense_1", ("actor", "params", "Dense_1", "kernel")),
+            ("actor/CRATEFeedForward_0", ("actor", "params", "CRATEFeedForward_0", "weight")),
+            ("critic/Dense_0", ("critic", "params", "Dense_0", "kernel")),
+            ("critic/Dense_1", ("critic", "params", "Dense_1", "kernel")),
+            ("critic/CRATEFeedForward_0", ("critic", "params", "CRATEFeedForward_0", "weight")),
+        )
+        for name, path in candidates:
+            if has_path(path):
+                specs.append((name, path))
+        return specs
+
+    def selected_activation_debug(params, storage: Storage):
+        batch = flatten_batch_tree(storage, spectrum_batch_size)
+        encoder_debug = encode_with_intermediates(params["network"], batch.obs)
+        if encoder_type in {"split_cnn", "separate_cnn"}:
+            actor_hidden = encoder_debug["actor_hidden"]
+            critic_hidden = encoder_debug["critic_hidden"]
+        else:
+            actor_hidden = encoder_debug.get("policy_hidden", encoder_debug["hidden"])
+            critic_hidden = actor_hidden
+        actor_debug = actor_debug_apply(
+            params["actor"],
+            actor_hidden,
+            return_intermediates=True,
+        )
+        critic_debug = critic_debug_apply(
+            params["critic"],
+            critic_hidden,
+            return_intermediates=True,
+        )
+
+        activations = {}
+        if encoder_type in {"split_cnn", "separate_cnn"}:
+            activations["network/actor_hidden"] = encoder_debug.get("actor_hidden")
+            activations["network/critic_hidden"] = encoder_debug.get("critic_hidden")
+        else:
+            activations["network/hidden"] = encoder_debug.get("hidden")
+            activations["network/policy_hidden"] = encoder_debug.get("policy_hidden")
+        for name in ("Dense_1", "CRATEFeedForward_0", "Dense_2"):
+            if name in actor_debug:
+                activations[f"actor/{name}"] = actor_debug[name]
+        for name in ("Dense_1", "CRATEFeedForward_0"):
+            if name in critic_debug:
+                activations[f"critic/{name}"] = critic_debug[name]
+        return activations
+
+    def collect_aurora_diagnostics(
+        params,
+        storage: Storage,
+        prefix: str,
+        task_index: int,
+        global_step_value: int,
+        grads=None,
+        param_updates=None,
+        phase: Optional[int] = None,
+        closest_rollout: bool = False,
+    ) -> dict:
+        logs = {
+            f"{prefix}/task_index": float(task_index),
+            f"{prefix}/global_step": float(global_step_value),
+            f"{prefix}/closest_rollout": float(closest_rollout),
+            f"{prefix}/has_grads": float(grads is not None),
+            f"{prefix}/has_updates": float(param_updates is not None),
+        }
+        if phase is not None:
+            logs[f"{prefix}/phase"] = float(phase)
+        add_aurora_diagnostics(
+            logs,
+            prefix,
+            selected_diagnostic_matrix_specs(params),
+            params,
+            bins=args.spectrum_hist_bins,
+            grads=grads,
+            param_updates=param_updates,
+            activations=selected_activation_debug(params, storage),
+        )
+        return logs
+
     def collect_spectrum_diagnostics(
         params,
         storage: Storage,
@@ -2498,7 +2553,7 @@ if __name__ == "__main__":
         if phase is not None:
             logs[f"{prefix}/phase"] = float(phase)
 
-        eigvals = hessian_eigenvalues(
+        eigvals, tridiags = hessian_eigenvalues_and_tridiags(
             spectrum_loss,
             params,
             batch,
@@ -2511,6 +2566,14 @@ if __name__ == "__main__":
             f"{prefix}/hessian",
             eigvals,
             bins=args.spectrum_hist_bins,
+        )
+        add_hessian_density_curve(
+            logs,
+            f"{prefix}/hessian",
+            tridiags,
+            sigma_squared=args.spectrum_density_sigma_squared,
+            grid_len=args.spectrum_density_grid_len,
+            image_label=f"Task {task_index} {'train' if 'task_start' in prefix else 'end'}",
         )
 
         def get_param(path):
@@ -2846,7 +2909,7 @@ if __name__ == "__main__":
     # Initialize reward normalizer
     reward_normalizer = RewardNormalizer.create(n_envs=args.n_envs, gamma=args.gamma)
 
-    if args.slippery_ant:
+    if args.slippery:
         slippery_friction_schedule_jnp = jnp.asarray(slippery_friction_schedule, dtype=jnp.float32)
         slippery_default_geom_friction_jnp = jnp.asarray(
             slippery_default_geom_friction,
@@ -3024,56 +3087,6 @@ if __name__ == "__main__":
             wandb.log({**probe_init_metrics, **probe_init_media}, step=0)
 
     for iteration in range(1, args.num_updates + 1):
-        if (
-            continual_config is not None
-            and iteration > 1
-            and (iteration - 1) % updates_per_task == 0
-        ):
-            task_index = (iteration - 1) // updates_per_task
-            current_task = make_dynamics_task(
-                continual_config,
-                base_sys,
-                task_index=task_index,
-                schedule_seed=schedule_seed,
-            )
-            current_task_index = task_index
-            current_sys = apply_dynamics_task(base_sys, current_task)
-            task_start_step = global_step
-
-            key, reset_key = jax.random.split(key)
-            reset_rngs = jax.random.split(reset_key, args.n_envs)
-            env_state = envs.reset_with_sys(current_sys, reset_rngs)
-            frame_stack = frame_stack.reset(env_state.pixels)
-            next_obs = frame_stack.get_stacked()
-            next_done = jnp.zeros(args.n_envs, dtype=jnp.bool_)
-            episode_stats = EpisodeStatistics(
-                episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
-                episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
-                returned_episode_returns=jnp.zeros(args.n_envs, dtype=jnp.float32),
-                returned_episode_lengths=jnp.zeros(args.n_envs, dtype=jnp.int32),
-            )
-            reward_normalizer = reward_normalizer.replace(
-                discounted_return=jnp.zeros(args.n_envs),
-            )
-
-            print(
-                f"continual_switch task={task_index} step={global_step} "
-                f"default={current_task.is_default} values="
-                f"{json.dumps(current_task.values, sort_keys=True)}"
-            )
-
-            if args.track:
-                import wandb
-                wandb.log(
-                    continual_log_metrics(
-                        current_task,
-                        switch_every_env_steps=continual_config.switch_every_env_steps,
-                        task_start_step=task_start_step,
-                        global_step=global_step,
-                    ),
-                    step=global_step,
-                )
-
         iteration_time_start = time.time()
         (
             agent_state,
@@ -3139,31 +3152,7 @@ if __name__ == "__main__":
             iteration - 1,
             args.actor_noise_stop_updates,
         )
-        if (
-            args.track
-            and continual_config is not None
-            and (iteration - 1) % updates_per_task == 0
-        ):
-            import wandb
-            key, spectrum_key = jax.random.split(key)
-            wandb.log(
-                collect_spectrum_diagnostics(
-                    agent_state.params,
-                    storage,
-                    spectrum_key,
-                    "spectrum/task_start",
-                    current_task_index,
-                    global_step,
-                    sigreg_coef_current,
-                    innovation_coef_current,
-                    vicreg_var_coef_current,
-                    bottleneck_var_coef_current,
-                    bottleneck_pre_ln_coef_current,
-                    actor_cond_coef_current,
-                    actor_noise_coef_current,
-                ),
-                step=global_step,
-            )
+        params_before_update = agent_state.params
         (
             agent_state,
             loss,
@@ -3204,33 +3193,7 @@ if __name__ == "__main__":
             actor_cond_coef_current,
             actor_noise_coef_current,
         )
-        if (
-            args.track
-            and continual_config is not None
-            and (iteration % updates_per_task == 0 or iteration == args.num_updates)
-        ):
-            import wandb
-            key, spectrum_key = jax.random.split(key)
-            wandb.log(
-                collect_spectrum_diagnostics(
-                    agent_state.params,
-                    storage,
-                    spectrum_key,
-                    "spectrum/task_end",
-                    current_task_index,
-                    global_step,
-                    sigreg_coef_current,
-                    innovation_coef_current,
-                    vicreg_var_coef_current,
-                    bottleneck_var_coef_current,
-                    bottleneck_pre_ln_coef_current,
-                    actor_cond_coef_current,
-                    actor_noise_coef_current,
-                ),
-                step=global_step,
-            )
-
-        if args.track and args.slippery_ant:
+        if args.track and args.slippery:
             import wandb
             slippery_phase = slippery_phase_from_timestep(
                 timestep=int((global_step // args.n_envs) * args.action_repeat),
@@ -3239,92 +3202,132 @@ if __name__ == "__main__":
             )
             if last_slippery_phase_logged is None:
                 key, spectrum_key = jax.random.split(key)
-                wandb.log(
-                    collect_spectrum_diagnostics(
+                slippery_start_logs = collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    spectrum_key,
+                    "spectrum/task_start",
+                    slippery_phase,
+                    global_step,
+                    sigreg_coef_current,
+                    innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
+                    phase=slippery_phase,
+                    closest_rollout=True,
+                )
+                slippery_start_logs.update(
+                    collect_aurora_diagnostics(
                         agent_state.params,
                         storage,
-                        spectrum_key,
-                        "spectrum/task_start",
+                        "aurora/task_start",
                         slippery_phase,
                         global_step,
-                        sigreg_coef_current,
-                        innovation_coef_current,
-                        vicreg_var_coef_current,
-                        bottleneck_var_coef_current,
-                        bottleneck_pre_ln_coef_current,
-                        actor_cond_coef_current,
-                        actor_noise_coef_current,
                         phase=slippery_phase,
                         closest_rollout=True,
-                    ),
-                    step=global_step,
+                    )
                 )
+                wandb.log(slippery_start_logs, step=global_step)
                 last_slippery_phase_logged = slippery_phase
             elif slippery_phase != last_slippery_phase_logged:
                 key, end_key, start_key = jax.random.split(key, 3)
-                wandb.log(
-                    collect_spectrum_diagnostics(
+                slippery_end_logs = collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    end_key,
+                    "spectrum/task_end",
+                    last_slippery_phase_logged,
+                    global_step,
+                    sigreg_coef_current,
+                    innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
+                    phase=last_slippery_phase_logged,
+                    closest_rollout=True,
+                )
+                slippery_end_logs.update(
+                    collect_aurora_diagnostics(
                         agent_state.params,
                         storage,
-                        end_key,
-                        "spectrum/task_end",
+                        "aurora/task_end",
                         last_slippery_phase_logged,
                         global_step,
-                        sigreg_coef_current,
-                        innovation_coef_current,
-                        vicreg_var_coef_current,
-                        bottleneck_var_coef_current,
-                        bottleneck_pre_ln_coef_current,
-                        actor_cond_coef_current,
-                        actor_noise_coef_current,
+                        grads=final_grads,
+                        param_updates=tree_delta(agent_state.params, params_before_update),
                         phase=last_slippery_phase_logged,
                         closest_rollout=True,
-                    ),
-                    step=global_step,
+                    )
                 )
-                wandb.log(
-                    collect_spectrum_diagnostics(
+                wandb.log(slippery_end_logs, step=global_step)
+                slippery_start_logs = collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    start_key,
+                    "spectrum/task_start",
+                    slippery_phase,
+                    global_step,
+                    sigreg_coef_current,
+                    innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
+                    phase=slippery_phase,
+                    closest_rollout=True,
+                )
+                slippery_start_logs.update(
+                    collect_aurora_diagnostics(
                         agent_state.params,
                         storage,
-                        start_key,
-                        "spectrum/task_start",
+                        "aurora/task_start",
                         slippery_phase,
                         global_step,
-                        sigreg_coef_current,
-                        innovation_coef_current,
-                        vicreg_var_coef_current,
-                        bottleneck_var_coef_current,
-                        bottleneck_pre_ln_coef_current,
-                        actor_cond_coef_current,
-                        actor_noise_coef_current,
                         phase=slippery_phase,
                         closest_rollout=True,
-                    ),
-                    step=global_step,
+                    )
                 )
+                wandb.log(slippery_start_logs, step=global_step)
                 last_slippery_phase_logged = slippery_phase
             if iteration == args.num_updates:
                 key, spectrum_key = jax.random.split(key)
-                wandb.log(
-                    collect_spectrum_diagnostics(
+                slippery_final_logs = collect_spectrum_diagnostics(
+                    agent_state.params,
+                    storage,
+                    spectrum_key,
+                    "spectrum/task_end",
+                    last_slippery_phase_logged,
+                    global_step,
+                    sigreg_coef_current,
+                    innovation_coef_current,
+                    vicreg_var_coef_current,
+                    bottleneck_var_coef_current,
+                    bottleneck_pre_ln_coef_current,
+                    actor_cond_coef_current,
+                    actor_noise_coef_current,
+                    phase=last_slippery_phase_logged,
+                    closest_rollout=True,
+                )
+                slippery_final_logs.update(
+                    collect_aurora_diagnostics(
                         agent_state.params,
                         storage,
-                        spectrum_key,
-                        "spectrum/task_end",
+                        "aurora/task_end",
                         last_slippery_phase_logged,
                         global_step,
-                        sigreg_coef_current,
-                        innovation_coef_current,
-                        vicreg_var_coef_current,
-                        bottleneck_var_coef_current,
-                        bottleneck_pre_ln_coef_current,
-                        actor_cond_coef_current,
-                        actor_noise_coef_current,
+                        grads=final_grads,
+                        param_updates=tree_delta(agent_state.params, params_before_update),
                         phase=last_slippery_phase_logged,
                         closest_rollout=True,
-                    ),
-                    step=global_step,
+                    )
                 )
+                wandb.log(slippery_final_logs, step=global_step)
 
         # Online linear probe — fire when global_step crosses the next threshold.
         # Using >= avoids the LCM cadence problem that % would cause when
@@ -3371,7 +3374,7 @@ if __name__ == "__main__":
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
             slippery_metrics = None
-            if args.slippery_ant:
+            if args.slippery:
                 slippery_metrics = latest_slippery_pixel_metrics(
                     global_step,
                     args,
@@ -3468,15 +3471,6 @@ if __name__ == "__main__":
                     "actor_noise/stop_updates": args.actor_noise_stop_updates,
                 }
 
-                if continual_config is not None:
-                    log_dict.update(
-                        continual_log_metrics(
-                            current_task,
-                            switch_every_env_steps=continual_config.switch_every_env_steps,
-                            task_start_step=task_start_step,
-                            global_step=global_step,
-                        )
-                    )
                 if slippery_metrics is not None:
                     log_dict.update(slippery_metrics)
 

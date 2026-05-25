@@ -28,7 +28,7 @@ BACKEND="${7:-${BACKEND:-spring}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_slippery_brax_memfrac.py" ]]; then
+if [[ ! -f "${REPO_ROOT}/ppo_brax.py" ]]; then
   REPO_ROOT="${SCRIPT_REPO_ROOT}"
 fi
 
@@ -170,6 +170,7 @@ for IDX in "${!CONFIG_NAMES[@]}"; do
     --seed "${SEED}"
     --log-interval 1
     --action-repeat "${ACTION_REPEAT}"
+  --slippery-ant
     --slippery-change-every "${CHANGE_EVERY}"
     --slippery-schedule-seed "${SLIPPERY_SCHEDULE_SEED}"
     --exp-name "${EXP_NAME}"
@@ -184,7 +185,7 @@ for IDX in "${!CONFIG_NAMES[@]}"; do
     export WANDB_RUN_GROUP="${GROUP_NAME}"
     export WANDB_TAGS="continual_rl,slippery_ant_wrapper,throughput_hparam_sweep,large_rollout,adam,relu,config_${CONFIG_NAME},lr_${LR},nenvs_${N_ENVS},steps_${NUM_STEPS},batch_${ROLLOUT_ENV_STEPS},minibatches_${NUM_MINIBATCHES},epochs_${UPDATE_EPOCHS},minibatch_size_${MINIBATCH_SIZE},phase_every_${PHASE_EVERY_ENV_STEPS},change_every_per_env_${CHANGE_EVERY},phases_${EFFECTIVE_PHASES},action_repeat_${ACTION_REPEAT},wrapper_faithful,${SCHEDULE_TAG},reward_norm,vclip,target_5m_return_2000,jax_mem_fraction_${JAX_MEM_FRACTION}"
     echo "Starting config=${CONFIG_NAME} lr=${LR} epochs=${UPDATE_EPOCHS} exp=${EXP_NAME} log=${CHILD_LOG}"
-    uv run python "${REPO_ROOT}/ppo_slippery_brax_memfrac.py" "${COMMON_ARGS[@]}"
+    uv run python "${REPO_ROOT}/ppo_brax.py" "${COMMON_ARGS[@]}"
   ) >"${CHILD_LOG}" 2>&1 &
 
   PID=$!
