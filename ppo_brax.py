@@ -22,7 +22,13 @@ import tyro
 import distrax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-from optimizers import aurora, manifold_stiefel, manifold_stiefel_admm
+from optimizers import (
+    OnlineStiefelState,
+    aurora,
+    manifold_stiefel,
+    manifold_stiefel_admm,
+    online_stiefel,
+)
 
 # Import Brax from local source (pixelbrax/brax/brax)
 import sys
@@ -72,8 +78,12 @@ class Args:
     """the learning rate of the optimizer"""
     adam_eps: float = 1e-5
     """epsilon parameter for Adam"""
+    base_optimizer: str = "adam"
+    """Optimizer for Adam-managed params: adam or adamw"""
+    weight_decay: float = 0.0
+    """Weight decay for AdamW-managed params"""
     heads_optimizer: str = "adam"
-    """Optimizer for actor/critic matrix params: adam, stiefel, stiefel_admm, or aurora"""
+    """Optimizer for actor/critic matrix params: adam, stiefel, stiefel_admm, stiefel_online, or aurora"""
     heads_stiefel_lr: float = 0.001
     """Learning rate for actor/critic matrix params when using Stiefel or Aurora"""
     stiefel_dual_lr: float = 0.01
@@ -116,6 +126,8 @@ class Args:
     """logging interval (in updates)"""
     actor_critic_activation: str = "swish"
     """Activation for all MLP hidden layers: swish or relu"""
+    network_arch: str = "ppo"
+    """Network architecture: ppo for shared trunk + deeper heads, lop for lop-jax style shallow independent heads."""
     reward_normalize: bool = True
     """Normalize rewards using discounted-return RMS statistics"""
     obs_normalize: bool = False
@@ -197,6 +209,17 @@ class Network(nn.Module):
         return x
 
 
+class IdentityNetwork(nn.Module):
+    """Identity state trunk for lop-jax style independent actor/critic MLPs."""
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        self.param("dummy", constant(0.0), ())
+        if return_intermediates:
+            return {"hidden": x}
+        return x
+
+
 def actor_critic_activation_fn(name: str):
     if name == "swish":
         return nn.swish
@@ -209,10 +232,19 @@ def actor_critic_activation_fn(name: str):
 
 def resolve_heads_optimizer(heads_optimizer: str) -> str:
     optimizer = heads_optimizer.lower()
-    if optimizer not in {"adam", "stiefel", "stiefel_admm", "aurora"}:
+    if optimizer not in {"adam", "stiefel", "stiefel_admm", "stiefel_online", "aurora"}:
         raise ValueError(
             f"Unsupported heads_optimizer={heads_optimizer!r}. "
-            "Expected one of: adam, stiefel, stiefel_admm, aurora."
+            "Expected one of: adam, stiefel, stiefel_admm, stiefel_online, aurora."
+        )
+    return optimizer
+
+
+def resolve_base_optimizer(base_optimizer: str) -> str:
+    optimizer = base_optimizer.lower()
+    if optimizer not in {"adam", "adamw"}:
+        raise ValueError(
+            f"Unsupported base_optimizer={base_optimizer!r}. Expected one of: adam, adamw."
         )
     return optimizer
 
@@ -234,6 +266,8 @@ def optimizer_label_for_param(path, param, heads_optimizer: str) -> str:
             return "actor_stiefel"
         if heads_optimizer == "stiefel_admm" and is_stiefel_matrix_param(param):
             return "actor_stiefel_admm"
+        if heads_optimizer == "stiefel_online" and is_stiefel_matrix_param(param):
+            return "actor_stiefel_online"
         if heads_optimizer == "aurora" and is_aurora_matrix_param(param):
             return "actor_aurora"
         return "heads_adam"
@@ -242,6 +276,8 @@ def optimizer_label_for_param(path, param, heads_optimizer: str) -> str:
             return "critic_stiefel"
         if heads_optimizer == "stiefel_admm" and is_stiefel_matrix_param(param):
             return "critic_stiefel_admm"
+        if heads_optimizer == "stiefel_online" and is_stiefel_matrix_param(param):
+            return "critic_stiefel_online"
         if heads_optimizer == "aurora" and is_aurora_matrix_param(param):
             return "critic_aurora"
         return "heads_adam"
@@ -252,6 +288,8 @@ def create_optimizer(
     learning_rate,
     *,
     adam_eps: float,
+    base_optimizer: str,
+    weight_decay: float,
     max_grad_norm: float,
     heads_optimizer: str,
     heads_stiefel_lr: float,
@@ -261,15 +299,17 @@ def create_optimizer(
     actor_stiefel_max_grad_norm: float,
     critic_stiefel_max_grad_norm: float,
 ):
+    base_optimizer = resolve_base_optimizer(base_optimizer)
     heads_optimizer = resolve_heads_optimizer(heads_optimizer)
 
-    def make_adam_tx():
+    def make_base_tx():
+        optimizer = optax.adam if base_optimizer == "adam" else optax.adamw
+        kwargs = {"learning_rate": learning_rate, "eps": adam_eps}
+        if base_optimizer == "adamw":
+            kwargs["weight_decay"] = weight_decay
         return optax.chain(
             optax.clip_by_global_norm(max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=learning_rate,
-                eps=adam_eps,
-            ),
+            optax.inject_hyperparams(optimizer)(**kwargs),
         )
 
     actor_stiefel_tx = optax.chain(
@@ -308,6 +348,24 @@ def create_optimizer(
             min_ndim=2,
         ),
     )
+    actor_stiefel_online_tx = optax.chain(
+        optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
+        online_stiefel(
+            learning_rate=heads_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
+    critic_stiefel_online_tx = optax.chain(
+        optax.clip_by_global_norm(critic_stiefel_max_grad_norm),
+        online_stiefel(
+            learning_rate=heads_stiefel_lr,
+            dual_lr=stiefel_dual_lr,
+            msign_steps=stiefel_msign_steps,
+            min_ndim=2,
+        ),
+    )
     actor_aurora_tx = optax.chain(
         optax.clip_by_global_norm(actor_stiefel_max_grad_norm),
         aurora(
@@ -324,12 +382,14 @@ def create_optimizer(
     )
 
     transforms = {
-        "network_adam": make_adam_tx(),
-        "heads_adam": make_adam_tx(),
+        "network_adam": make_base_tx(),
+        "heads_adam": make_base_tx(),
         "actor_stiefel": actor_stiefel_tx,
         "critic_stiefel": critic_stiefel_tx,
         "actor_stiefel_admm": actor_stiefel_admm_tx,
         "critic_stiefel_admm": critic_stiefel_admm_tx,
+        "actor_stiefel_online": actor_stiefel_online_tx,
+        "critic_stiefel_online": critic_stiefel_online_tx,
         "actor_aurora": actor_aurora_tx,
         "critic_aurora": critic_aurora_tx,
     }
@@ -354,12 +414,90 @@ def count_optimizer_params(params, heads_optimizer: str) -> dict:
         "critic_stiefel": 0,
         "actor_stiefel_admm": 0,
         "critic_stiefel_admm": 0,
+        "actor_stiefel_online": 0,
+        "critic_stiefel_online": 0,
         "actor_aurora": 0,
         "critic_aurora": 0,
     }
     for path, param in flat.items():
         counts[optimizer_label_for_param(path, param, heads_optimizer)] += int(param.size)
     return counts
+
+
+def online_stiefel_constraint_metrics(opt_state) -> dict:
+    states = [
+        state
+        for state in jax.tree_util.tree_leaves(
+            opt_state,
+            is_leaf=lambda x: isinstance(x, OnlineStiefelState),
+        )
+        if isinstance(state, OnlineStiefelState)
+    ]
+    residuals = []
+    normalized_residuals = []
+    for state in states:
+        residual_leaves = jax.tree_util.tree_leaves(state.last_constraint_residual)
+        dual_leaves = jax.tree_util.tree_leaves(state.dual_lambda)
+        for residual, dual_lambda in zip(residual_leaves, dual_leaves):
+            if residual.shape != () or dual_lambda.ndim != 2:
+                continue
+            residuals.append(residual)
+            normalized_residuals.append(residual / jnp.sqrt(dual_lambda.size))
+    if not residuals:
+        return {}
+    residuals = jnp.asarray(residuals)
+    normalized_residuals = jnp.asarray(normalized_residuals)
+    return {
+        "optim/stiefel_online_constraint_mean": float(jnp.mean(residuals)),
+        "optim/stiefel_online_constraint_max": float(jnp.max(residuals)),
+        "optim/stiefel_online_constraint_rms_mean": float(jnp.mean(normalized_residuals)),
+        "optim/stiefel_online_constraint_rms_max": float(jnp.max(normalized_residuals)),
+    }
+
+
+def matrix_constraint_metrics(params) -> dict:
+    flat = flax.traverse_util.flatten_dict(params)
+    metrics = {}
+    all_fro = []
+    all_rms = []
+
+    for module_name in ("actor", "critic"):
+        fro_residuals = []
+        rms_residuals = []
+        for path, param in flat.items():
+            if not path or path[0] != module_name or not is_stiefel_matrix_param(param):
+                continue
+            matrix = param.T if param.shape[-2] < param.shape[-1] else param
+            gram = matrix.T @ matrix
+            residual = gram - jnp.eye(gram.shape[-1], dtype=gram.dtype)
+            fro_residual = jnp.linalg.norm(residual, ord="fro")
+            rms_residual = fro_residual / jnp.sqrt(jnp.asarray(residual.size, dtype=gram.dtype))
+            fro_residuals.append(fro_residual)
+            rms_residuals.append(rms_residual)
+
+        if not fro_residuals:
+            continue
+        fro_residuals = jnp.asarray(fro_residuals)
+        rms_residuals = jnp.asarray(rms_residuals)
+        metrics.update({
+            f"optim/matrix_constraint_{module_name}_mean": float(jnp.mean(fro_residuals)),
+            f"optim/matrix_constraint_{module_name}_max": float(jnp.max(fro_residuals)),
+            f"optim/matrix_constraint_{module_name}_rms_mean": float(jnp.mean(rms_residuals)),
+            f"optim/matrix_constraint_{module_name}_rms_max": float(jnp.max(rms_residuals)),
+        })
+        all_fro.extend(fro_residuals)
+        all_rms.extend(rms_residuals)
+
+    if all_fro:
+        all_fro = jnp.asarray(all_fro)
+        all_rms = jnp.asarray(all_rms)
+        metrics.update({
+            "optim/matrix_constraint_mean": float(jnp.mean(all_fro)),
+            "optim/matrix_constraint_max": float(jnp.max(all_fro)),
+            "optim/matrix_constraint_rms_mean": float(jnp.mean(all_rms)),
+            "optim/matrix_constraint_rms_max": float(jnp.max(all_rms)),
+        })
+    return metrics
 
 
 class Critic(nn.Module):
@@ -380,6 +518,25 @@ class Critic(nn.Module):
                 "Dense_0": hidden_0,
                 "Dense_1": hidden_1,
                 "Dense_2": value,
+            }
+        return value
+
+
+class LopCritic(nn.Module):
+    """lop-jax style critic: one hidden layer directly on observations."""
+    activation: str = "relu"
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        activation = actor_critic_activation_fn(self.activation)
+        dense_0 = nn.Dense(256, kernel_init=nn.initializers.lecun_uniform(), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        value = nn.Dense(1, kernel_init=nn.initializers.lecun_uniform(), bias_init=constant(0.0))(hidden_0)
+        if return_intermediates:
+            return {
+                "value": value,
+                "Dense_0": hidden_0,
+                "Dense_1": value,
             }
         return value
 
@@ -504,6 +661,67 @@ class Actor(nn.Module):
                 "Dense_0": hidden_0,
                 "Dense_1": hidden_1,
                 "Dense_2": actor_mean,
+            }
+        return actor_mean, actor_logstd
+
+
+class LopActor(nn.Module):
+    """lop-jax style actor: one hidden layer directly on observations."""
+    action_dim: int
+    activation: str = "relu"
+    logstd_min: float = -5.0
+    logstd_max: float = 2.0
+    clip_global_logstd: bool = False
+    bounded_global_logstd: bool = False
+    actor_logstd_init: float = 0.0
+    actor_mean_tanh: bool = False
+    actor_mean_scale: float = 1.0
+
+    @nn.compact
+    def __call__(self, x, return_intermediates: bool = False):
+        activation = actor_critic_activation_fn(self.activation)
+        dense_0 = nn.Dense(256, kernel_init=nn.initializers.lecun_uniform(), bias_init=constant(0.0))(x)
+        hidden_0 = activation(dense_0)
+        actor_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=nn.initializers.lecun_uniform(),
+            bias_init=constant(0.0),
+        )(hidden_0)
+        if self.actor_mean_tanh:
+            actor_mean = self.actor_mean_scale * jnp.tanh(actor_mean)
+
+        if self.bounded_global_logstd:
+            eps = 1e-6
+            init = jnp.clip(
+                self.actor_logstd_init,
+                self.logstd_min + eps,
+                self.logstd_max - eps,
+            )
+            frac = (init - self.logstd_min) / (self.logstd_max - self.logstd_min)
+            raw_init = jnp.log(frac) - jnp.log1p(-frac)
+            actor_logstd_raw = self.param(
+                "log_std_raw",
+                constant(raw_init),
+                (self.action_dim,),
+            )
+            actor_logstd = self.logstd_min + (
+                self.logstd_max - self.logstd_min
+            ) * jax.nn.sigmoid(actor_logstd_raw)
+        else:
+            actor_logstd = self.param(
+                "log_std",
+                constant(self.actor_logstd_init),
+                (self.action_dim,),
+            )
+            if self.clip_global_logstd:
+                actor_logstd = jnp.clip(actor_logstd, self.logstd_min, self.logstd_max)
+
+        if return_intermediates:
+            return {
+                "actor_mean": actor_mean,
+                "actor_logstd": actor_logstd,
+                "Dense_0": hidden_0,
+                "Dense_1": actor_mean,
             }
         return actor_mean, actor_logstd
 
@@ -849,6 +1067,7 @@ if __name__ == "__main__":
             raise ValueError("--slippery-schedule-seed must be non-negative.")
         if args.slippery_probe_only and args.slippery_probe_steps <= 0:
             raise ValueError("--slippery-probe-only requires --slippery-probe-steps > 0.")
+    args.base_optimizer = resolve_base_optimizer(args.base_optimizer)
     args.heads_optimizer = resolve_heads_optimizer(args.heads_optimizer)
     args.batch_size = int(args.n_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -880,10 +1099,13 @@ if __name__ == "__main__":
     print(f"num envs: {args.n_envs}")
     print(f"learning rate: {args.learning_rate}")
     print(f"adam_eps: {args.adam_eps}")
+    print(f"base_optimizer: {args.base_optimizer}")
+    print(f"weight_decay: {args.weight_decay}")
     print(f"seed: {args.seed}")
     print(f"num_updates: {args.num_updates}")
     print(f"minibatch_size: {args.minibatch_size}")
     print(f"actor_critic_activation: {args.actor_critic_activation}")
+    print(f"network_arch: {args.network_arch}")
     print(f"reward_normalize: {args.reward_normalize}")
     print(f"obs_normalize: {args.obs_normalize}")
     print(f"obs_norm_clip: {args.obs_norm_clip}")
@@ -962,14 +1184,21 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     # Initialize networks
-    if args.use_crate_network:
+    if args.network_arch == "lop":
+        if args.use_crate_network or args.use_crate_head:
+            raise ValueError("--network-arch=lop does not support CRATE trunk/head options.")
+        network = IdentityNetwork()
+        print("Using lop-jax style identity state trunk")
+    elif args.network_arch == "ppo" and args.use_crate_network:
         network = CRATENetwork(
             activation=args.actor_critic_activation,
             crate_step_size=args.network_crate_step_size,
         )
         print(f"Using CRATE state trunk with step_size={args.network_crate_step_size}")
-    else:
+    elif args.network_arch == "ppo":
         network = Network(activation=args.actor_critic_activation)
+    else:
+        raise ValueError(f"Unsupported --network-arch={args.network_arch!r}; expected 'ppo' or 'lop'.")
     actor_kwargs = dict(
         action_dim=action_dim,
         activation=args.actor_critic_activation,
@@ -981,7 +1210,11 @@ if __name__ == "__main__":
         actor_mean_tanh=args.actor_mean_tanh,
         actor_mean_scale=args.actor_mean_scale,
     )
-    if args.use_crate_head:
+    if args.network_arch == "lop":
+        actor = LopActor(**actor_kwargs)
+        critic = LopCritic(activation=args.actor_critic_activation)
+        print("Using lop-jax style shallow actor/critic heads")
+    elif args.use_crate_head:
         actor = CRATEActor(crate_step_size=args.crate_step_size, **actor_kwargs)
         critic = CRATECritic(
             crate_step_size=args.crate_step_size,
@@ -1008,6 +1241,8 @@ if __name__ == "__main__":
     print(f"  critic_stiefel: {optimizer_counts['critic_stiefel']:,}")
     print(f"  actor_stiefel_admm: {optimizer_counts['actor_stiefel_admm']:,}")
     print(f"  critic_stiefel_admm: {optimizer_counts['critic_stiefel_admm']:,}")
+    print(f"  actor_stiefel_online: {optimizer_counts['actor_stiefel_online']:,}")
+    print(f"  critic_stiefel_online: {optimizer_counts['critic_stiefel_online']:,}")
     print(f"  actor_aurora: {optimizer_counts['actor_aurora']:,}")
     print(f"  critic_aurora: {optimizer_counts['critic_aurora']:,}")
     
@@ -1017,6 +1252,8 @@ if __name__ == "__main__":
         tx=create_optimizer(
             linear_schedule if args.anneal_lr else args.learning_rate,
             adam_eps=args.adam_eps,
+            base_optimizer=args.base_optimizer,
+            weight_decay=args.weight_decay,
             max_grad_norm=args.max_grad_norm,
             heads_optimizer=args.heads_optimizer,
             heads_stiefel_lr=args.heads_stiefel_lr,
@@ -1337,6 +1574,12 @@ if __name__ == "__main__":
             sps = int(global_step / (time.time() - start_time))
             sps_update = int(args.n_envs * args.num_steps / (time.time() - iteration_time_start))
             slippery_metrics = latest_slippery_metrics(rollout_info, args) if args.slippery else None
+            stiefel_online_metrics = (
+                online_stiefel_constraint_metrics(agent_state.opt_state)
+                if args.heads_optimizer == "stiefel_online"
+                else {}
+            )
+            matrix_metrics = matrix_constraint_metrics(agent_state.params)
             
             base_msg = (
                 f"update={iteration} step={global_step} "
@@ -1349,6 +1592,20 @@ if __name__ == "__main__":
                 base_msg += (
                     f" friction={slippery_metrics['slippery/friction_slide_first_env']:.4g}"
                     f" phase={slippery_metrics['slippery/phase_first_env']}"
+                )
+            if stiefel_online_metrics:
+                base_msg += (
+                    " stiefel_online_constraint="
+                    f"{stiefel_online_metrics['optim/stiefel_online_constraint_max']:.4g}"
+                    " stiefel_online_constraint_rms="
+                    f"{stiefel_online_metrics['optim/stiefel_online_constraint_rms_max']:.4g}"
+                )
+            if matrix_metrics:
+                base_msg += (
+                    " matrix_constraint="
+                    f"{matrix_metrics['optim/matrix_constraint_max']:.4g}"
+                    " matrix_constraint_rms="
+                    f"{matrix_metrics['optim/matrix_constraint_rms_max']:.4g}"
                 )
             print(base_msg)
             
@@ -1370,6 +1627,8 @@ if __name__ == "__main__":
 
                 if slippery_metrics is not None:
                     log_dict.update(slippery_metrics)
+                log_dict.update(matrix_metrics)
+                log_dict.update(stiefel_online_metrics)
 
                 wandb.log(log_dict, step=global_step)
 

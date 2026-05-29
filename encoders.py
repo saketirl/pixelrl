@@ -1228,19 +1228,32 @@ class MLPEncoder(nn.Module):
     tanh_scale: float = 0.5
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, return_intermediates: bool = False):
         x = x.astype(jnp.float32) / 255.0
         x = x.reshape((x.shape[0], -1))
 
-        for _ in range(3):
-            x = nn.Dense(1024, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-            x = nn.LayerNorm()(x)
+        intermediates = {}
+        for i in range(3):
+            dense_pre_ln = nn.Dense(
+                1024,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(x)
+            x = nn.LayerNorm()(dense_pre_ln)
             x = nn.relu(x)
+            intermediates[f"Dense_{i}"] = x
+            intermediates[f"Dense_{i}_pre"] = dense_pre_ln
 
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.LayerNorm()(x)
-        x = nn.tanh(self.tanh_scale * x)
-        return x
+        dense_pre_ln = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.LayerNorm()(dense_pre_ln)
+        hidden = nn.tanh(self.tanh_scale * x)
+        if return_intermediates:
+            intermediates["Dense_3"] = hidden
+            intermediates["Dense_3_pre"] = dense_pre_ln
+            intermediates["hidden"] = hidden
+            intermediates["dense_pre_ln"] = dense_pre_ln
+            return intermediates
+        return hidden
 
 
 
