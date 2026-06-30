@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """
-PPO for Brax environments with state observations - CleanRL style adaptation.
-Adapted from CleanRL's PPO implementation for continuous control with state observations.
-This serves as a baseline to verify the algorithm works before testing pixel observations.
-#To continue this session, run codex resume 019dac51-812f-7023-bfdd-553feaa73809
+PixelRL PPO entrypoint for a single rlopt_lop-aligned Adam Slippery Ant run.
+
+This copy keeps the PixelRL/CleanRL-style PPO objective from ppo_brax.py, while
+defaulting the run shape, network, policy parameterization, and reward handling
+to the rlopt_lop BP baseline.
 """
 import os
 import random
@@ -64,19 +65,19 @@ class Args:
     """the entity (team) of wandb's project"""
 
     # Environment arguments
-    env_name: str = "halfcheetah"
+    env_name: str = "ant"
     """the name of the environment"""
-    backend: str = "spring"
+    backend: str = "positional"
     """the physics backend (spring, generalized, positional)"""
-    n_envs: int = 512
+    n_envs: int = 1
     """the number of parallel game environments"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 10000000
+    total_timesteps: int = 20_000_000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
-    adam_eps: float = 1e-5
+    adam_eps: float = 1e-8
     """epsilon parameter for Adam"""
     base_optimizer: str = "adam"
     """Optimizer for Adam-managed params: adam or adamw"""
@@ -96,7 +97,7 @@ class Args:
     """Maximum gradient norm for actor Stiefel params"""
     critic_stiefel_max_grad_norm: float = 1.0
     """Maximum gradient norm for critic Stiefel params"""
-    num_steps: int = 256
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
@@ -104,9 +105,9 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 32
+    num_minibatches: int = 16
     """the number of mini-batches"""
-    update_epochs: int = 4
+    update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -114,21 +115,23 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function"""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0
     """coefficient of the entropy"""
-    vf_coef: float = 0.5
+    vf_coef: float = 1.0
     """coefficient of the value function"""
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 1_000_000_000.0
     """the maximum norm for the gradient clipping"""
     max_action: float = 1.0
     """maximum action value for clipping"""
+    clip_actions: bool = False
+    """If true, clip sampled actions before stepping the environment."""
     log_interval: int = 10
     """logging interval (in updates)"""
-    actor_critic_activation: str = "swish"
+    actor_critic_activation: str = "relu"
     """Activation for all MLP hidden layers: swish or relu"""
-    network_arch: str = "ppo"
+    network_arch: str = "lop_reference"
     """Network architecture: ppo, lop, or lop_reference."""
-    reward_normalize: bool = True
+    reward_normalize: bool = False
     """Normalize rewards using discounted-return RMS statistics"""
     obs_normalize: bool = False
     """Normalize state observations with running mean and variance."""
@@ -164,11 +167,11 @@ class Args:
     """Number of times to repeat each action (frame skip)"""
 
     # Slippery friction schedule
-    slippery: bool = False
+    slippery: bool = True
     """Use the CSV-backed slippery friction schedule."""
     slippery_ant: bool = False
     """Deprecated alias for --slippery."""
-    slippery_change_every: int = 100_000
+    slippery_change_every: int = 2_000_000
     """Number of underlying per-env timesteps between slippery friction changes."""
     slippery_schedule_seed: Optional[int] = None
     """CSV row used for slippery friction phases; defaults to the training seed."""
@@ -1216,6 +1219,7 @@ if __name__ == "__main__":
     print(f"obs_normalize: {args.obs_normalize}")
     print(f"obs_norm_clip: {args.obs_norm_clip}")
     print(f"anneal_lr: {args.anneal_lr}")
+    print(f"clip_actions: {args.clip_actions}")
     print(f"actor_logstd_min: {args.actor_logstd_min}")
     print(f"actor_logstd_max: {args.actor_logstd_max}")
     print(f"clip_global_logstd: {args.clip_global_logstd}")
@@ -1402,8 +1406,8 @@ if __name__ == "__main__":
         logprob = pi.log_prob(action)
         value = critic.apply(agent_state.params['critic'], hidden)
         
-        # Clip action
-        action = jnp.clip(action, -args.max_action, args.max_action)
+        if args.clip_actions:
+            action = jnp.clip(action, -args.max_action, args.max_action)
         
         return action, logprob, value.squeeze(-1), key
 

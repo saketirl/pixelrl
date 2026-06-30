@@ -4,10 +4,11 @@
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=06:00:00
+#SBATCH --time=24:00:00
 #SBATCH --mem=64GB
-#SBATCH --gres=gpu:1
+#SBATCH -p gpu --gres=gpu:1
 #SBATCH --array=0-11%6
+#SBATCH --constraint=geforce3090
 
 set -euo pipefail
 
@@ -21,7 +22,7 @@ set -euo pipefail
 #   base LR 3e-5, regular Stiefel head LR 1e-3.
 
 WANDB_PROJECT="${1:-continual_brax}"
-WANDB_ENTITY="${2:-rl-power}"
+WANDB_ENTITY="${2:-enyan_zhang1-brown-university}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-${TASK_ID:-0}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
