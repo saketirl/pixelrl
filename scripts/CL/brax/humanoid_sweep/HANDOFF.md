@@ -1,6 +1,6 @@
 # Humanoid Sweep Handoff
 
-Last updated: 2026-05-26
+Last updated: 2026-06-30
 
 ## Scope
 
@@ -163,6 +163,33 @@ sbatch --parsable --gres=none --mem=16GB --time=06:00:00 --array=0-11%6 \
   --export=ALL,JAX_PLATFORMS=cpu \
   scripts/CL/brax/humanoid_sweep/ant_lop_final_adam_vs_stiefel_6seeds.sh continual_brax rl-power
 ```
+
+## PixelRL Slippery Ant LOP Entrypoint
+
+New PixelRL/CleanRL-style PPO entrypoint:
+
+```bash
+ppo_slippery_ant_loss_of_plasticity_adam.py
+```
+
+This is a new entrypoint for the original PixelRL PPO objective that induces loss of plasticity on Slippery Ant using the rlopt-lop-aligned plain Adam configuration.
+
+Six-seed launcher:
+
+```bash
+scripts/CL/brax/humanoid_sweep/ant_lop_plain_adam_6seeds.sh
+```
+
+Launch command:
+
+```bash
+sbatch --array=0-5%6 scripts/CL/brax/humanoid_sweep/ant_lop_plain_adam_6seeds.sh
+```
+
+Mapping:
+
+- tasks `0..5`: training seeds `0..5`
+- `SLIPPERY_SCHEDULE_SEED` defaults to `0`
 
 ## Trainer Changes In `ppo_brax.py`
 
