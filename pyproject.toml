@@ -24,6 +24,7 @@ dependencies = [
     "pillow>=11.3.0",
     "scipy>=1.13.1",
     "tqdm>=4.67.1",
+    "tueplots>=0.2.4",
     "tyro>=1.0.2",
     "wandb==0.17.2",
 ]
