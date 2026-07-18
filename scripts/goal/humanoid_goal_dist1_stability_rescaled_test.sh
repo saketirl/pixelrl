@@ -1,35 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=hum-goal-cratecnn-stiefel
-#SBATCH --output=slurm_logs/humanoid_goal_cratecnn_crateheads_bestreward_stiefel_single_%j.out
-#SBATCH -N 1
-#SBATCH --ntasks=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --time=08:00:00
-#SBATCH --mem=96GB
-#SBATCH --gres=gpu:1
 
 set -euo pipefail
 
-# humanoid_goal with CRATE-CNN encoder + CRATE heads, Stiefel optimizer, single seed.
-# One process per GPU.
-# Reward: 20 * progress - 0.1 * dist + healthy - ctrl + 50 * success
+GPU_ID="${1:-0}"
+WANDB_PROJECT="${2:-benchmark}"
+WANDB_ENTITY="${3:-saketirl}"
+TOTAL_TIMESTEPS="${4:-10000000}"
+SEED="${5:-0}"
+BACKEND="${6:-spring}"
+ACTION_REPEAT="${7:-4}"
+JAX_MEM_FRACTION="${8:-0.9}"
 
-WANDB_PROJECT="${1:-benchmark}"
-WANDB_ENTITY="${2:-saketirl}"
-TOTAL_TIMESTEPS="${3:-10000000}"
-SEED="${4:-0}"
-BACKEND="${5:-spring}"
-ACTION_REPEAT="${6:-4}"
-JAX_MEM_FRACTION="${7:-0.9}"
+export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-REPO_ROOT="${SLURM_SUBMIT_DIR:-${SCRIPT_REPO_ROOT}}"
-if [[ ! -f "${REPO_ROOT}/ppo_pixelbrax.py" || ! -f "${REPO_ROOT}/encoders.py" ]]; then
-  REPO_ROOT="${SCRIPT_REPO_ROOT}"
-fi
-
-mkdir -p "${REPO_ROOT}/slurm_logs"
+REPO_ROOT="${SCRIPT_REPO_ROOT}"
 
 if [[ -d "${REPO_ROOT}/pixelbrax/brax/brax" ]]; then
   BRAX_PYTHONPATH="${REPO_ROOT}/pixelbrax/brax"
@@ -38,15 +24,7 @@ else
 fi
 export PYTHONPATH="${BRAX_PYTHONPATH}:${PYTHONPATH:-}"
 
-ALT_REPO_ROOT="${REPO_ROOT}"
-if [[ "${REPO_ROOT}" == *"/.worktrees/"* ]]; then
-  ALT_REPO_ROOT="$(cd "${REPO_ROOT}/../.." && pwd)"
-fi
-
 WANDB_KEY_FILE="${REPO_ROOT}/secrets/wandb_api_key.txt"
-if [[ ! -f "${WANDB_KEY_FILE}" && -f "${ALT_REPO_ROOT}/secrets/wandb_api_key.txt" ]]; then
-  WANDB_KEY_FILE="${ALT_REPO_ROOT}/secrets/wandb_api_key.txt"
-fi
 if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
   export WANDB_API_KEY="$(tr -d '\r\n' < "${WANDB_KEY_FILE}")"
 fi
@@ -54,9 +32,15 @@ uv run wandb login
 
 HEADS_OPTIMIZER="stiefel"
 
-CONFIG_NAME="progress20_dist0p1_success50"
-PROGRESS_SCALE="20"
-DISTANCE_SCALE="0.1"
+# Rescaled: progress 20->60, heading 1.0->0.3, distance 0.1->0.5, stability kept at 1.0
+# Rationale: standing+facing earns ~500/ep from heading+stability at old scales,
+# vs only ~150/ep from walking. Reducing heading and boosting progress/distance
+# makes locomotion competitive with the stability reward.
+CONFIG_NAME="progress60_dist0p5_heading0p3_success50_goaldist1_stability1"
+STABILITY_SCALE="1.0"
+HEADING_SCALE="0.3"
+PROGRESS_SCALE="60"
+DISTANCE_SCALE="0.5"
 SUCCESS_REWARD="50"
 
 CRATE_STEP_SIZE="0.1"
@@ -66,18 +50,16 @@ ACTOR_LOGSTD_INIT="-2.0"
 ACTOR_LOGSTD_MIN="-5.0"
 ACTOR_LOGSTD_MAX="-1.4"
 
-GROUP_ID="${SLURM_JOB_ID:-local}"
-GROUP_NAME="humanoid_goal_cratecnn_crateheads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_s${SEED}_ar${ACTION_REPEAT}_${GROUP_ID}"
+GROUP_NAME="humanoid_goal_cratecnn_crateheads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_s${SEED}_ar${ACTION_REPEAT}_test"
 GIF_DIR="${REPO_ROOT}/outputs/goal_reward_sweep/${GROUP_NAME}"
 mkdir -p "${GIF_DIR}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_ENTITY="${WANDB_ENTITY}"
 
 EXP_NAME="ppo_goal_reward_${CONFIG_NAME}_cratecnn_crateheads_${HEADS_OPTIMIZER}_ar${ACTION_REPEAT}_humanoid_goal_b${BACKEND}_s${SEED}"
-TAGS="goal,pixel_goal,humanoid_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_humanoid_goal,backend_${BACKEND},seed_${SEED},encoder_crate_cnn,headarch_crate,opt_${HEADS_OPTIMIZER},single_seed,one_per_gpu,mem_fraction_${JAX_MEM_FRACTION},gif_every_1m"
+TAGS="goal,pixel_goal,humanoid_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},heading_${HEADING_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_humanoid_goal,backend_${BACKEND},seed_${SEED},encoder_crate_cnn,headarch_crate,opt_${HEADS_OPTIMIZER},upright_reward,fixed_goal_dist1,no_terminate_unhealthy,stability_reward_1,rescaled_rewards,test"
 
 echo "Config=${CONFIG_NAME} optimizer=${HEADS_OPTIMIZER} seed=${SEED}"
-echo "Project=${WANDB_PROJECT} total_timesteps=${TOTAL_TIMESTEPS} backend=${BACKEND} action_repeat=${ACTION_REPEAT}"
+echo "Project=${WANDB_PROJECT} entity=${WANDB_ENTITY} total_timesteps=${TOTAL_TIMESTEPS} backend=${BACKEND} action_repeat=${ACTION_REPEAT}"
 echo "GIF dir=${GIF_DIR}"
 echo "Exp: ${EXP_NAME}"
 
@@ -92,6 +74,7 @@ uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   --n-envs 128 \
   --track \
   --wandb-project-name "${WANDB_PROJECT}" \
+  --wandb-entity "${WANDB_ENTITY}" \
   --hw 84 \
   --total-timesteps "${TOTAL_TIMESTEPS}" \
   --num-steps 10 \
@@ -117,6 +100,9 @@ uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
   --actor-logstd-init="${ACTOR_LOGSTD_INIT}" \
   --actor-logstd-min="${ACTOR_LOGSTD_MIN}" \
   --actor-logstd-max="${ACTOR_LOGSTD_MAX}" \
+  --humanoid-goal-dist 1.0 \
+  --humanoid-heading-reward-scale "${HEADING_SCALE}" \
+  --humanoid-upright-stability-scale "${STABILITY_SCALE}" \
   --goal-progress-reward-scale "${PROGRESS_SCALE}" \
   --goal-distance-reward-scale "${DISTANCE_SCALE}" \
   --goal-success-reward "${SUCCESS_REWARD}" \

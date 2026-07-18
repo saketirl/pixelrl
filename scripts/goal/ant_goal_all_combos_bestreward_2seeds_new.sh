@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=ant-goal-allcombos
-#SBATCH --output=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_all_combos_bestreward_4seeds_%A_%a.out
-#SBATCH --error=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_all_combos_bestreward_4seeds_%A_%a.err
+#SBATCH --job-name=ant-goal-allcombos-2seeds
+#SBATCH --output=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_all_combos_bestreward_2seeds_new_%A_%a.out
+#SBATCH --error=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_all_combos_bestreward_2seeds_new_%A_%a.err
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
@@ -12,13 +12,13 @@
 
 set -euo pipefail
 
-# ant_goal sweep over all encoder/head/optimizer combos, 4 seeds per task.
+# ant_goal sweep over all encoder/head/optimizer combos, 2 new seeds per task.
 # Reward: 20 * progress - 0.1 * dist + healthy - ctrl + 50 * success
 #
-# Task 0: crate_cnn encoder + crate heads + adam,    seeds 0..3
-# Task 1: crate_cnn encoder + crate heads + stiefel, seeds 0..3
-# Task 2: cnn encoder      + mlp heads   + adam,    seeds 0..3
-# Task 3: cnn encoder      + mlp heads   + stiefel, seeds 0..3
+# Task 0: crate_cnn encoder + crate heads + adam,    seeds 4..5
+# Task 1: crate_cnn encoder + crate heads + stiefel, seeds 4..5
+# Task 2: cnn encoder      + mlp heads   + adam,    seeds 4..5
+# Task 3: cnn encoder      + mlp heads   + stiefel, seeds 4..5
 
 WANDB_PROJECT="${1:-benchmark}"
 WANDB_ENTITY="${2:-saketirl}"
@@ -73,7 +73,7 @@ ENCODER_TYPE="${ENCODER_BY_TASK[$TASK_ID]}"
 HEAD_ARCH="${HEADARCH_BY_TASK[$TASK_ID]}"
 HEADS_OPTIMIZER="${OPTIMIZER_BY_TASK[$TASK_ID]}"
 
-SEEDS=(0 1 2 3)
+SEEDS=(4 5)
 
 CONFIG_NAME="progress20_dist0p1_success50"
 PROGRESS_SCALE="20"
@@ -89,7 +89,7 @@ ACTOR_LOGSTD_MIN="-5.0"
 ACTOR_LOGSTD_MAX="-1.4"
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="ant_goal_${ENCODER_TYPE}_${HEAD_ARCH}heads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_4seeds_ar${ACTION_REPEAT}_${GROUP_ID}"
+GROUP_NAME="ant_goal_${ENCODER_TYPE}_${HEAD_ARCH}heads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_2seeds_new_ar${ACTION_REPEAT}_${GROUP_ID}"
 GIF_DIR="${REPO_ROOT}/outputs/goal_reward_sweep/${GROUP_NAME}"
 mkdir -p "${GIF_DIR}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"

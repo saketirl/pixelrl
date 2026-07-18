@@ -23,6 +23,7 @@ set -euo pipefail
 # 2 x 2 = 4 configs
 
 WANDB_PROJECT="${1:-benchmark}"
+echo $WANDB_PROJECT
 TOTAL_TIMESTEPS="${2:-10000000}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 

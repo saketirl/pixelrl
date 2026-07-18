@@ -1,24 +1,29 @@
 #!/bin/bash
-#SBATCH --job-name=ant-goal-allcombos
-#SBATCH --output=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_all_combos_bestreward_4seeds_%A_%a.out
-#SBATCH --error=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_all_combos_bestreward_4seeds_%A_%a.err
+#SBATCH --job-name=ant-goal-rerun9
+#SBATCH --output=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_bestreward_rerun9_%A_%a.out
+#SBATCH --error=/home/guests/saket/pixelenvs/pixelrl/logs/ant_goal_bestreward_rerun9_%A_%a.err
 #SBATCH -N 1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=08:00:00
 #SBATCH --mem=96GB
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-3
+#SBATCH --array=0-8
 
 set -euo pipefail
 
-# ant_goal sweep over all encoder/head/optimizer combos, 4 seeds per task.
+# Reruns for 9 terminated ant_goal runs.
 # Reward: 20 * progress - 0.1 * dist + healthy - ctrl + 50 * success
 #
-# Task 0: crate_cnn encoder + crate heads + adam,    seeds 0..3
-# Task 1: crate_cnn encoder + crate heads + stiefel, seeds 0..3
-# Task 2: cnn encoder      + mlp heads   + adam,    seeds 0..3
-# Task 3: cnn encoder      + mlp heads   + stiefel, seeds 0..3
+# Task 0: crate_cnn + crate + stiefel, seed 0
+# Task 1: crate_cnn + crate + stiefel, seed 1
+# Task 2: crate_cnn + crate + stiefel, seed 2
+# Task 3: crate_cnn + crate + stiefel, seed 3
+# Task 4: crate_cnn + crate + adam,    seed 3
+# Task 5: cnn       + mlp   + stiefel, seed 0
+# Task 6: cnn       + mlp   + stiefel, seed 1
+# Task 7: cnn       + mlp   + stiefel, seed 2
+# Task 8: cnn       + mlp   + stiefel, seed 3
 
 WANDB_PROJECT="${1:-benchmark}"
 WANDB_ENTITY="${2:-saketirl}"
@@ -26,7 +31,6 @@ TOTAL_TIMESTEPS="${3:-10000000}"
 BACKEND="${4:-spring}"
 ACTION_REPEAT="${5:-4}"
 JAX_MEM_FRACTION="${6:-0.22}"
-START_STAGGER_SECONDS="${7:-15}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,12 +63,13 @@ if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
 fi
 uv run wandb login
 
-# Task → (encoder, head_arch, optimizer)
-ENCODER_BY_TASK=(crate_cnn crate_cnn cnn cnn)
-HEADARCH_BY_TASK=(crate    crate    mlp mlp)
-OPTIMIZER_BY_TASK=(adam    stiefel  adam stiefel)
+# Task → (encoder, head_arch, optimizer, seed)
+ENCODER_BY_TASK=(crate_cnn crate_cnn crate_cnn crate_cnn crate_cnn cnn cnn cnn cnn)
+HEADARCH_BY_TASK=(crate    crate    crate    crate    crate    mlp mlp mlp mlp)
+OPTIMIZER_BY_TASK=(stiefel stiefel  stiefel  stiefel  adam     stiefel stiefel stiefel stiefel)
+SEED_BY_TASK=(0 1 2 3 3 0 1 2 3)
 
-if (( TASK_ID < 0 || TASK_ID >= ${#OPTIMIZER_BY_TASK[@]} )); then
+if (( TASK_ID < 0 || TASK_ID >= ${#SEED_BY_TASK[@]} )); then
   echo "Invalid TASK_ID=${TASK_ID}" >&2
   exit 1
 fi
@@ -72,8 +77,7 @@ fi
 ENCODER_TYPE="${ENCODER_BY_TASK[$TASK_ID]}"
 HEAD_ARCH="${HEADARCH_BY_TASK[$TASK_ID]}"
 HEADS_OPTIMIZER="${OPTIMIZER_BY_TASK[$TASK_ID]}"
-
-SEEDS=(0 1 2 3)
+SEED="${SEED_BY_TASK[$TASK_ID]}"
 
 CONFIG_NAME="progress20_dist0p1_success50"
 PROGRESS_SCALE="20"
@@ -89,11 +93,21 @@ ACTOR_LOGSTD_MIN="-5.0"
 ACTOR_LOGSTD_MAX="-1.4"
 
 GROUP_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
-GROUP_NAME="ant_goal_${ENCODER_TYPE}_${HEAD_ARCH}heads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_4seeds_ar${ACTION_REPEAT}_${GROUP_ID}"
+GROUP_NAME="ant_goal_${ENCODER_TYPE}_${HEAD_ARCH}heads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_rerun9_ar${ACTION_REPEAT}_${GROUP_ID}"
 GIF_DIR="${REPO_ROOT}/outputs/goal_reward_sweep/${GROUP_NAME}"
 mkdir -p "${GIF_DIR}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
 export WANDB_ENTITY="${WANDB_ENTITY}"
+
+EXP_NAME="ppo_goal_reward_${CONFIG_NAME}_${ENCODER_TYPE}_${HEAD_ARCH}heads_${HEADS_OPTIMIZER}_ar${ACTION_REPEAT}_ant_goal_b${BACKEND}_s${SEED}"
+TAGS="goal,pixel_goal,ant_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_ant_goal,backend_${BACKEND},seed_${SEED},encoder_${ENCODER_TYPE},headarch_${HEAD_ARCH},opt_${HEADS_OPTIMIZER},episode_length_1000,mem_fraction_${JAX_MEM_FRACTION},gif_every_1m,rerun"
+
+echo "encoder=${ENCODER_TYPE} heads=${HEAD_ARCH} optimizer=${HEADS_OPTIMIZER} seed=${SEED}"
+echo "Project=${WANDB_PROJECT} total_timesteps=${TOTAL_TIMESTEPS} backend=${BACKEND} action_repeat=${ACTION_REPEAT}"
+echo "GIF dir=${GIF_DIR}"
+echo "Exp: ${EXP_NAME}"
+
+cd "${REPO_ROOT}"
 
 COMMON_ARGS=(
   --env-name ant_goal
@@ -133,13 +147,15 @@ COMMON_ARGS=(
   --rollout-gif-dir "${GIF_DIR}"
   --rollout-gif-steps 250
   --rollout-gif-fps 20
+  --seed "${SEED}"
+  --heads-optimizer "${HEADS_OPTIMIZER}"
+  --exp-name "${EXP_NAME}"
 )
 
 if [[ -n "${WANDB_ENTITY}" ]]; then
   COMMON_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
 fi
 
-# Architecture args depend on encoder/head combo
 if [[ "${ENCODER_TYPE}" == "crate_cnn" ]]; then
   ARCH_ARGS=(
     --encoder-type crate_cnn
@@ -163,46 +179,9 @@ else
   )
 fi
 
-run_seed() {
-  local seed="$1"
-  local exp_name="ppo_goal_reward_${CONFIG_NAME}_${ENCODER_TYPE}_${HEAD_ARCH}heads_${HEADS_OPTIMIZER}_ar${ACTION_REPEAT}_ant_goal_b${BACKEND}_s${seed}"
-  local tags="goal,pixel_goal,ant_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_ant_goal,backend_${BACKEND},seed_${seed},encoder_${ENCODER_TYPE},headarch_${HEAD_ARCH},opt_${HEADS_OPTIMIZER},episode_length_1000,mem_fraction_${JAX_MEM_FRACTION},gif_every_1m"
-
-  echo "Running encoder=${ENCODER_TYPE} heads=${HEAD_ARCH} opt=${HEADS_OPTIMIZER} seed=${seed}"
-  echo "Exp: ${exp_name}"
-
-  WANDB_TAGS="${tags}" \
-  XLA_PYTHON_CLIENT_PREALLOCATE=false \
-  XLA_PYTHON_CLIENT_MEM_FRACTION="${JAX_MEM_FRACTION}" \
-  uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
-    "${COMMON_ARGS[@]}" \
-    "${ARCH_ARGS[@]}" \
-    --seed "${seed}" \
-    --heads-optimizer "${HEADS_OPTIMIZER}" \
-    --exp-name "${exp_name}"
-}
-
-echo "encoder=${ENCODER_TYPE} heads=${HEAD_ARCH} optimizer=${HEADS_OPTIMIZER}"
-echo "Project=${WANDB_PROJECT} total_timesteps=${TOTAL_TIMESTEPS} backend=${BACKEND} action_repeat=${ACTION_REPEAT}"
-echo "GIF dir=${GIF_DIR}"
-
-cd "${REPO_ROOT}"
-
-pids=()
-labels=()
-for seed in "${SEEDS[@]}"; do
-  run_seed "${seed}" &
-  pids+=("$!")
-  labels+=("${HEADS_OPTIMIZER}/seed${seed}")
-  sleep "${START_STAGGER_SECONDS}"
-done
-
-status=0
-for i in "${!pids[@]}"; do
-  if ! wait "${pids[$i]}"; then
-    echo "Run failed: ${labels[$i]}" >&2
-    status=1
-  fi
-done
-
-exit "${status}"
+WANDB_TAGS="${TAGS}" \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_MEM_FRACTION="${JAX_MEM_FRACTION}" \
+uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
+  "${COMMON_ARGS[@]}" \
+  "${ARCH_ARGS[@]}"

@@ -235,7 +235,7 @@ def make_pixel_brax(
     if env_kwargs is None:
         env_kwargs = {}
     create_kwargs = {}
-    if env_name == "ant_goal":
+    if env_name in ["ant_goal", "humanoid_goal"]:
         create_kwargs["episode_length"] = 1000
     env = envs.create(
         env_name=env_name,

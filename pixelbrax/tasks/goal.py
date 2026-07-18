@@ -291,6 +291,8 @@ class HumanoidGoal(PipelineEnv):
         progress_reward_scale=10.0,
         success_reward=25.0,
         distance_reward_scale=0.0,
+        heading_reward_scale=0.0,
+        upright_stability_scale=0.0,
         **kwargs,
     ):
         sys = mjcf.loads(_goal_xml("humanoid.xml", target_z=HUMANOID_TARGET_Z))
@@ -348,6 +350,8 @@ class HumanoidGoal(PipelineEnv):
         self._max_goal_dist = max_goal_dist
         self._max_goal_angle = max_goal_angle
         self._goal_pos = jp.array(goal_pos, dtype=float)
+        self._heading_reward_scale = heading_reward_scale
+        self._upright_stability_scale = upright_stability_scale
         self._progress_reward_scale = progress_reward_scale
         self._success_reward = success_reward
         self._distance_reward_scale = distance_reward_scale
@@ -377,6 +381,8 @@ class HumanoidGoal(PipelineEnv):
             "reward_progress": zero,
             "reward_success": zero,
             "reward_distance": zero,
+            "reward_heading": zero,
+            "reward_stability": zero,
             "progress": zero,
             "prev_dist": zero,
             "x_position": zero,
@@ -407,11 +413,8 @@ class HumanoidGoal(PipelineEnv):
         min_z, max_z = self._healthy_z_range
         is_healthy = jp.where(pipeline_state.x.pos[0, 2] < min_z, 0.0, 1.0)
         is_healthy = jp.where(pipeline_state.x.pos[0, 2] > max_z, 0.0, is_healthy)
-        healthy_reward = (
-            self._healthy_reward
-            if self._terminate_when_unhealthy
-            else self._healthy_reward * is_healthy
-        )
+        torso_z = pipeline_state.x.pos[0, 2]
+        upright_reward = 0.1 * self._healthy_reward * jp.clip(torso_z / min_z, 0.0, 1.0)
         ctrl_cost = self._ctrl_cost_weight * jp.sum(jp.square(action))
 
         obs = self._get_obs(pipeline_state, action)
@@ -424,12 +427,30 @@ class HumanoidGoal(PipelineEnv):
         progress_reward = self._progress_reward_scale * progress
         success_reward = self._success_reward * success
         distance_reward = -self._distance_reward_scale * dist
+
+        # Heading reward: dot product of facing direction with goal direction
+        root_quat = pipeline_state.q[3:7]
+        facing_world = math.rotate(jp.array([1.0, 0.0, 0.0]), root_quat)
+        facing_dir = facing_world[:2] / (jp.linalg.norm(facing_world[:2]) + 1e-8)
+        goal_vec = pipeline_state.x.pos[-1][:2] - com_after[:2]
+        goal_dir = goal_vec / (jp.linalg.norm(goal_vec) + 1e-8)
+        heading_reward = self._heading_reward_scale * jp.dot(facing_dir, goal_dir)
+
+        # Upright stability: orientation alignment + angular velocity penalty
+        up_world = math.rotate(jp.array([0.0, 0.0, 1.0]), root_quat)
+        orientation_reward = self._upright_stability_scale * jp.clip(up_world[2], 0.0, 1.0)
+        root_ang_vel = pipeline_state.qd[3:6]
+        ang_vel_penalty = self._upright_stability_scale * 0.1 * jp.sum(jp.square(root_ang_vel))
+        stability_reward = orientation_reward - ang_vel_penalty
+
         reward = (
             progress_reward
-            + healthy_reward
+            + upright_reward
             - ctrl_cost
             + success_reward
             + distance_reward
+            + heading_reward
+            + stability_reward
         )
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
@@ -437,11 +458,13 @@ class HumanoidGoal(PipelineEnv):
             forward_reward=forward_reward,
             reward_linvel=forward_reward,
             reward_quadctrl=-ctrl_cost,
-            reward_alive=healthy_reward,
+            reward_alive=upright_reward,
             reward_goal=progress_reward,
             reward_progress=progress_reward,
             reward_success=success_reward,
             reward_distance=distance_reward,
+            reward_heading=heading_reward,
+            reward_stability=stability_reward,
             progress=progress,
             prev_dist=prev_dist,
             x_position=com_after[0],

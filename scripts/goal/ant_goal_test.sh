@@ -1,19 +1,3 @@
-#!/bin/bash
-#SBATCH --job-name=hum-goal-cratecnn-stiefel
-#SBATCH --output=slurm_logs/humanoid_goal_cratecnn_crateheads_bestreward_stiefel_single_%j.out
-#SBATCH -N 1
-#SBATCH --ntasks=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --time=08:00:00
-#SBATCH --mem=96GB
-#SBATCH --gres=gpu:1
-
-set -euo pipefail
-
-# humanoid_goal with CRATE-CNN encoder + CRATE heads, Stiefel optimizer, single seed.
-# One process per GPU.
-# Reward: 20 * progress - 0.1 * dist + healthy - ctrl + 50 * success
-
 WANDB_PROJECT="${1:-benchmark}"
 WANDB_ENTITY="${2:-saketirl}"
 TOTAL_TIMESTEPS="${3:-10000000}"
@@ -67,14 +51,13 @@ ACTOR_LOGSTD_MIN="-5.0"
 ACTOR_LOGSTD_MAX="-1.4"
 
 GROUP_ID="${SLURM_JOB_ID:-local}"
-GROUP_NAME="humanoid_goal_cratecnn_crateheads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_s${SEED}_ar${ACTION_REPEAT}_${GROUP_ID}"
+GROUP_NAME="ant_goal_cratecnn_crateheads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_s${SEED}_ar${ACTION_REPEAT}_${GROUP_ID}"
 GIF_DIR="${REPO_ROOT}/outputs/goal_reward_sweep/${GROUP_NAME}"
 mkdir -p "${GIF_DIR}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
-export WANDB_ENTITY="${WANDB_ENTITY}"
 
-EXP_NAME="ppo_goal_reward_${CONFIG_NAME}_cratecnn_crateheads_${HEADS_OPTIMIZER}_ar${ACTION_REPEAT}_humanoid_goal_b${BACKEND}_s${SEED}"
-TAGS="goal,pixel_goal,humanoid_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_humanoid_goal,backend_${BACKEND},seed_${SEED},encoder_crate_cnn,headarch_crate,opt_${HEADS_OPTIMIZER},single_seed,one_per_gpu,mem_fraction_${JAX_MEM_FRACTION},gif_every_1m"
+EXP_NAME="ppo_goal_reward_${CONFIG_NAME}_cratecnn_crateheads_${HEADS_OPTIMIZER}_ar${ACTION_REPEAT}_ant_goal_b${BACKEND}_s${SEED}"
+TAGS="goal,pixel_goal,ant_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_ant_goal,backend_${BACKEND},seed_${SEED},encoder_crate_cnn,headarch_crate,opt_${HEADS_OPTIMIZER},single_seed,one_per_gpu,mem_fraction_${JAX_MEM_FRACTION},gif_every_1m,episode_length_1000"
 
 echo "Config=${CONFIG_NAME} optimizer=${HEADS_OPTIMIZER} seed=${SEED}"
 echo "Project=${WANDB_PROJECT} total_timesteps=${TOTAL_TIMESTEPS} backend=${BACKEND} action_repeat=${ACTION_REPEAT}"
@@ -87,11 +70,12 @@ WANDB_TAGS="${TAGS}" \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 XLA_PYTHON_CLIENT_MEM_FRACTION="${JAX_MEM_FRACTION}" \
 uv run python "${REPO_ROOT}/ppo_pixelbrax.py" \
-  --env-name humanoid_goal \
+  --env-name ant_goal \
   --backend "${BACKEND}" \
   --n-envs 128 \
   --track \
   --wandb-project-name "${WANDB_PROJECT}" \
+  --wandb-entity "${WANDB_ENTITY}" \
   --hw 84 \
   --total-timesteps "${TOTAL_TIMESTEPS}" \
   --num-steps 10 \

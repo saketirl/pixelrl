@@ -12,7 +12,7 @@ import random
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal
+from typing import Literal, Optional
 
 import flax
 import flax.linen as nn
@@ -95,7 +95,7 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "benchmark"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
 
     # Environment arguments
@@ -113,6 +113,12 @@ class Args:
     """success bonus for *_goal envs; negative uses env default"""
     goal_distance_reward_scale: float = 0.0
     """reserved distance reward scale tag for *_goal sweeps; current env ignores it unless implemented"""
+    humanoid_goal_dist: float = -1.0
+    """distance of fixed goal from origin for humanoid_goal; negative uses env default (5.0 at pi/4)"""
+    humanoid_heading_reward_scale: float = 0.0
+    """scale for heading alignment reward in humanoid_goal; 0 disables it"""
+    humanoid_upright_stability_scale: float = 0.0
+    """scale for orientation+angular_velocity stability reward in humanoid_goal; 0 disables it"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
@@ -1351,6 +1357,14 @@ def make_pixelbrax_envs(args):
             env_kwargs["success_reward"] = args.goal_success_reward
         if args.goal_distance_reward_scale != 0:
             env_kwargs["distance_reward_scale"] = args.goal_distance_reward_scale
+    if args.env_name == "humanoid_goal" and args.humanoid_goal_dist > 0:
+        import math as _math
+        d = args.humanoid_goal_dist
+        env_kwargs["goal_pos"] = (d * _math.cos(_math.pi / 4), d * _math.sin(_math.pi / 4))
+    if args.env_name == "humanoid_goal" and args.humanoid_heading_reward_scale != 0:
+        env_kwargs["heading_reward_scale"] = args.humanoid_heading_reward_scale
+    if args.env_name == "humanoid_goal" and args.humanoid_upright_stability_scale != 0:
+        env_kwargs["upright_stability_scale"] = args.humanoid_upright_stability_scale
 
     envs, _, _ = make_pixel_brax(
         backend=args.backend,
@@ -1408,10 +1422,14 @@ if __name__ == "__main__":
     run_name = f"{args.env_name}__{args.exp_name}__{run_seed_tag}__{int(time.time())}"
 
     if args.track:
+        import os
         import wandb
+        entity = args.wandb_entity or os.environ.get("WANDB_ENTITY") or None
+        entity = entity if entity else None
+        print(f"wandb.init: project={args.wandb_project_name} entity={entity}")
         wandb.init(
             project=args.wandb_project_name,
-            entity=args.wandb_entity,
+            entity=entity,
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,

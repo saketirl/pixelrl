@@ -15,7 +15,7 @@ set -euo pipefail
 # Reward: 20 * progress - 0.1 * dist + healthy - ctrl + 50 * success
 
 WANDB_PROJECT="${1:-benchmark}"
-WANDB_ENTITY="${2:-}"
+WANDB_ENTITY="${2:-saketirl}"
 TOTAL_TIMESTEPS="${3:-10000000}"
 SEED="${4:-0}"
 BACKEND="${5:-spring}"
@@ -71,6 +71,7 @@ GROUP_NAME="ant_goal_cratecnn_crateheads_${CONFIG_NAME}_${HEADS_OPTIMIZER}_s${SE
 GIF_DIR="${REPO_ROOT}/outputs/goal_reward_sweep/${GROUP_NAME}"
 mkdir -p "${GIF_DIR}"
 export WANDB_RUN_GROUP="${GROUP_NAME}"
+export WANDB_ENTITY="${WANDB_ENTITY}"
 
 EXP_NAME="ppo_goal_reward_${CONFIG_NAME}_cratecnn_crateheads_${HEADS_OPTIMIZER}_ar${ACTION_REPEAT}_ant_goal_b${BACKEND}_s${SEED}"
 TAGS="goal,pixel_goal,ant_goal,reward_focus,${CONFIG_NAME},progress_${PROGRESS_SCALE},distance_${DISTANCE_SCALE},success_${SUCCESS_REWARD},action_repeat_${ACTION_REPEAT},env_ant_goal,backend_${BACKEND},seed_${SEED},encoder_crate_cnn,headarch_crate,opt_${HEADS_OPTIMIZER},single_seed,one_per_gpu,mem_fraction_${JAX_MEM_FRACTION},gif_every_1m,episode_length_1000"
