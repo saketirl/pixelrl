@@ -16,20 +16,25 @@ Two head families are supported:
 * structured:
     pi(z) = K z
     V(z) = z.T P z + b.T z + c
-    Psi(z, a) = z.T Z a + r.T a - a.T R a
+    Psi(z, a) = z.T Z a + r.T a - c_R a.T R a
 * mlp:
-    independent tanh MLPs for pi, V, and learned Psi residual, with the
-    same known -a.T R a control-cost curvature
+    independent tanh MLPs for pi, V, and the learned part of Psi,
+    Psi(z, a) = MLP_A([z,c_a a]) - c_R a.T R a
+
+The curvature-assisted Stage 1 sets c_R=1. The pure-MLP Stage 2 sets c_R=0;
+the coefficient is explicit in every saved configuration and CSV row.
 
 The centered advantage rate is always
 
     psi(z, a) = Psi(z, a) - Psi(z, pi(z)).
 
-Value and advantage parameters receive separate partial gradients of the same
-multistep [r-psi] martingale residual. The code does not regress an
-instantaneous advantage rate onto an accumulated residual. Stiefel encoders
-use Cayley updates, head parameters use matched Adam states, and actor updates
-begin after a critic warm-up.
+By default, value and advantage parameters receive separate partial gradients
+of the same full-window multistep [r-psi] martingale loss. A labeled
+initial_semigradient ablation uses the paper's initial-time martingale test
+function but reports the same residual loss. Neither mode regresses an
+instantaneous rate onto an accumulated target. Stiefel encoders use Cayley
+updates, heads use matched Adam states, and actor updates begin after a critic
+warm-up.
 
 Two training couplings are available. shared_batch applies both updates to one
 downstairs-behavior batch and directly tests the conditional update identity.
@@ -64,7 +69,17 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import jax
 
@@ -209,6 +224,9 @@ def init_heads(
     da: int,
     hidden_dim: int,
     seed: int,
+    policy_output_scale: float = 0.1,
+    value_output_scale: float = 0.1,
+    advantage_output_scale: float = 0.1,
 ) -> Dict[str, Any]:
     """Initialize policy, value, and raw-advantage head parameters.
 
@@ -216,7 +234,8 @@ def init_heads(
         Structured heads represent pi(z) = K z,
         V(z) = z.T P z + b.T z + c, and the learned part
         z.T Z a + r.T a of Psi(z,a). MLP heads map k to da, k to 1,
-        and k+da to 1. The common term -a.T R a is added later.
+        and k+da to 1. The three output scales multiply the corresponding
+        final-layer initialization. The optional -c_R a.T R a is added later.
     Code map:
         Return keys pi, v, and a contain the parameters for h_pi, h_v,
         and h_a respectively; z has size k and a has size da.
@@ -236,16 +255,28 @@ def init_heads(
             },
             "a": {
                 # Z and r learn the state-action part of the Hamiltonian.
-                # The known -a.T R a curvature is added in make_head_ops.
+                # Optional -c_R a.T R a curvature is added in make_head_ops.
                 "Z": jnp.zeros((k, da), dtype=jnp.float64),
                 "r": jnp.zeros((da,), dtype=jnp.float64),
             },
         }
     if head_type == "mlp":
         return {
-            "pi": init_mlp((k, hidden_dim, hidden_dim, da), rng),
-            "v": init_mlp((k, hidden_dim, hidden_dim, 1), rng),
-            "a": init_mlp((k + da, hidden_dim, hidden_dim, 1), rng),
+            "pi": init_mlp(
+                (k, hidden_dim, hidden_dim, da),
+                rng,
+                output_scale=policy_output_scale,
+            ),
+            "v": init_mlp(
+                (k, hidden_dim, hidden_dim, 1),
+                rng,
+                output_scale=value_output_scale,
+            ),
+            "a": init_mlp(
+                (k + da, hidden_dim, hidden_dim, 1),
+                rng,
+                output_scale=advantage_output_scale,
+            ),
         }
     raise ValueError(f"Unknown head type: {head_type}")
 
@@ -280,6 +311,9 @@ def init_matched_models(
     head_type: str,
     hidden_dim: int,
     seed: int,
+    policy_output_scale: float = 0.1,
+    value_output_scale: float = 0.1,
+    advantage_output_scale: float = 0.1,
 ) -> Tuple[Params, Params]:
     """Initialize exactly matched downstairs and upstairs models.
 
@@ -295,7 +329,16 @@ def init_matched_models(
     x_pi = stiefel_init(problem.ds, k, rng)
     x_v = stiefel_init(problem.ds, k, rng)
     x_a = stiefel_init(problem.ds, k, rng)
-    heads = init_heads(head_type, k, problem.da, hidden_dim, seed + 1000)
+    heads = init_heads(
+        head_type,
+        k,
+        problem.da,
+        hidden_dim,
+        seed + 1000,
+        policy_output_scale=policy_output_scale,
+        value_output_scale=value_output_scale,
+        advantage_output_scale=advantage_output_scale,
+    )
 
     down = {
         "x_pi": jnp.asarray(x_pi),
@@ -343,13 +386,20 @@ def lift_downstairs_model(down: Params, M: Array) -> Params:
 def make_head_ops(
     head_type: str,
     action_cost: Array,
+    action_curvature_scale: float = 1.0,
+    policy_action_limit: float = 0.0,
+    advantage_gradient: str = "full_window",
+    advantage_action_input_scale: float = 1.0,
 ) -> Dict[str, Callable[..., Any]]:
     """Build differentiable operations for one head parameterization.
 
     Math:
         z_b = X_b.T x for b in (pi, v, a),
         psi(z_a,a) = Psi(z_a,a) - Psi(z_a,pi(z_pi)),
-        and the known action curvature is -a.T R a.
+        and the optional known action curvature is
+        -action_curvature_scale a.T R a.
+        For B = policy_action_limit > 0, pi(z) = B tanh(h_pi(z)/B);
+        B = 0 leaves the head output unbounded.
     Code map:
         Batches store samples as rows, so z_b is observations @ x_b. The
         argument action_cost is R. Returned callables are vectorized, JIT
@@ -364,7 +414,10 @@ def make_head_ops(
             Code map: head["K"] has shape (da,k), z has shape (k,), and
             the returned action has shape (da,).
             """
-            return head["K"] @ z
+            raw_action = head["K"] @ z
+            if policy_action_limit > 0.0:
+                return policy_action_limit * jnp.tanh(raw_action / policy_action_limit)
+            return raw_action
 
         def value(head: Mapping[str, JaxArray], z: JaxArray) -> JaxArray:
             """Evaluate V(z) = z.T P_sym z + b.T z + c.
@@ -384,15 +437,17 @@ def make_head_ops(
             """Evaluate structured Psi(z,a) before policy centering.
 
             Math:
-                Psi(z,a) = z.T Z a + r.T a - a.T R a.
+                Psi(z,a) = z.T Z a + r.T a
+                           - c_R a.T R a.
             Code map:
-                head stores Z and r; action_cost_jax is R. The caller later
-                subtracts Psi(z,pi(z)) to form the centered rate psi.
+                head stores Z and r; action_cost_jax is R and
+                action_curvature_scale is c_R. The caller later subtracts
+                Psi(z,pi(z)) to form the centered rate psi.
             """
             return (
                 z @ head["Z"] @ action
                 + head["r"] @ action
-                - action @ action_cost_jax @ action
+                - action_curvature_scale * action @ action_cost_jax @ action
             )
 
     elif head_type == "mlp":
@@ -403,7 +458,10 @@ def make_head_ops(
             Code map: head is theta_pi, z has shape (k,), and the output has
             shape (da,).
             """
-            return apply_mlp(head, z)
+            raw_action = apply_mlp(head, z)
+            if policy_action_limit > 0.0:
+                return policy_action_limit * jnp.tanh(raw_action / policy_action_limit)
+            return raw_action
 
         def value(head: Any, z: JaxArray) -> JaxArray:
             """Evaluate the nonlinear scalar value V_theta(z) = MLP_V(z).
@@ -417,16 +475,25 @@ def make_head_ops(
             """Evaluate nonlinear Psi_theta(z,a) before policy centering.
 
             Math:
-                Psi_theta(z,a) = MLP_A(concat(z,a)) - a.T R a.
+                Psi_theta(z,a) = MLP_A(concat(z,c_a a)) - c_R a.T R a.
+
+                Stage 1 uses c_R = 1; the pure-MLP Stage 2 uses c_R = 0.
             Code map:
-                head is theta_A and action_cost_jax is R. The caller later
-                subtracts Psi_theta(z,pi(z)).
+                head is theta_A, action_cost_jax is R, and
+                action_curvature_scale is c_R. advantage_action_input_scale
+                is c_a and only rescales the learned MLP input. The caller
+                later subtracts Psi_theta(z,pi(z)).
             """
             learned = jnp.squeeze(
-                apply_mlp(head, jnp.concatenate((z, action), axis=-1)),
+                apply_mlp(
+                    head,
+                    jnp.concatenate(
+                        (z, advantage_action_input_scale * action), axis=-1
+                    ),
+                ),
                 axis=-1,
             )
-            return learned - action @ action_cost_jax @ action
+            return learned - action_curvature_scale * action @ action_cost_jax @ action
 
     else:
         raise ValueError(f"Unknown head type: {head_type}")
@@ -473,17 +540,21 @@ def make_head_ops(
         h_v: Any,
         observations: JaxArray,
         targets: JaxArray,
+        sample_weights: JaxArray,
     ) -> JaxArray:
         """Compute the detached-target value semigradient loss.
 
         Math:
-            L_V = (1 / (2 B)) sum_i (V_hv(X_v.T x_i) - target_i)^2.
+            L_V = [1 / (2 sum_i w_i)]
+                  sum_i w_i (V_hv(X_v.T x_i) - target_i)^2.
         Code map:
             observations @ x_v forms the B row latents. Only x_v and h_v
-            are differentiation arguments; targets is treated as constant.
+            are differentiation arguments; targets is treated as constant and
+            sample_weights contains w_i.
         """
         values = value_batch(h_v, observations @ x_v)
-        return 0.5 * jnp.mean(jnp.square(values - targets))
+        squared_error = jnp.square(values - targets)
+        return 0.5 * jnp.sum(sample_weights * squared_error) / jnp.sum(sample_weights)
 
     def advantage_loss(
         x_a: JaxArray,
@@ -492,6 +563,7 @@ def make_head_ops(
         actions: JaxArray,
         policy_actions: JaxArray,
         base_residual: JaxArray,
+        start_weights: JaxArray,
         weights: JaxArray,
         dt: JaxArray,
     ) -> JaxArray:
@@ -500,10 +572,16 @@ def make_head_ops(
         Math:
             psi_t = Psi(X_a.T x_t,a_t) - Psi(X_a.T x_t,pi_t),
             I_psi,t = dt sum_(l=0)^(L-1) gamma^l psi_(t+l),
-            L_A = (1 / (2 B)) sum_t (base_t + I_psi,t)^2.
+            L_A = [1 / (2 sum_t rho_t)]
+                  sum_t rho_t (base_t + I_psi,t)^2.
+            Full-window mode uses grad L_A. Initial-time mode uses
+            g_A = [1 / sum_t rho_t]
+                  sum_t rho_t stopgrad(e_t) grad psi_t.
         Code map:
-            weights[l] is gamma^l and base_residual is the detached
-            V_t - I_r,t - gamma^L V_(t+L). Gradients target x_a and h_a.
+            start_weights[t] is rho_t, weights[l] is gamma^l, and
+            base_residual is the detached
+            V_t - I_r,t - gamma^L V_(t+L). advantage_gradient selects the
+            gradient estimator; both branches report the same L_A value.
         """
         z_a = observations[:-1] @ x_a
         psi = raw_advantage_batch(h_a, z_a, actions) - raw_advantage_batch(
@@ -514,7 +592,18 @@ def make_head_ops(
         # spurious q -> 0 fixed point.
         integrated_psi = jnp.convolve(psi, weights[::-1], mode="valid") * dt
         residual = base_residual + integrated_psi
-        return 0.5 * jnp.mean(jnp.square(residual))
+        reported_loss = (
+            0.5 * jnp.sum(start_weights * jnp.square(residual)) / jnp.sum(start_weights)
+        )
+        if advantage_gradient == "full_window":
+            return reported_loss
+        if advantage_gradient == "initial_semigradient":
+            initial_psi = psi[: base_residual.shape[0]]
+            surrogate = jnp.sum(
+                start_weights * jax.lax.stop_gradient(residual) * initial_psi
+            ) / jnp.sum(start_weights)
+            return jax.lax.stop_gradient(reported_loss - surrogate) + surrogate
+        raise ValueError(f"Unknown advantage gradient: {advantage_gradient}")
 
     def actor_objective(
         x_pi: JaxArray,
@@ -522,12 +611,14 @@ def make_head_ops(
         observations: JaxArray,
         x_a: JaxArray,
         h_a: Any,
+        sample_weights: JaxArray,
     ) -> JaxArray:
         """Compute the deterministic-policy semigradient objective.
 
         Math:
-            J_pi = (1 / B) sum_i Psi_hA(X_a.T x_i,
-                                        pi_hpi(X_pi.T x_i)).
+            J_pi = (1 / sum_i rho_i)
+                   sum_i rho_i Psi_hA(X_a.T x_i,
+                                      pi_hpi(X_pi.T x_i)).
         Code map:
             Row latents are observations @ x_pi and observations @ x_a.
             Gradients are requested only for x_pi and h_pi; x_a and h_a
@@ -540,7 +631,8 @@ def make_head_ops(
         z_pi = observations @ x_pi
         z_a = observations @ x_a
         actions = policy_batch(h_pi, z_pi)
-        return jnp.mean(raw_advantage_batch(h_a, z_a, actions))
+        raw_advantages = raw_advantage_batch(h_a, z_a, actions)
+        return jnp.sum(sample_weights * raw_advantages) / jnp.sum(sample_weights)
 
     return {
         "policy_batch": jax.jit(policy_batch),
@@ -713,6 +805,9 @@ def ctddpg_update(
     eta_critic: float,
     eta_advantage: float,
     update_actor: bool = True,
+    update_critic: bool = True,
+    encoder_lr_scale: float = 1.0,
+    start_time_weighting: str = "uniform",
 ) -> Tuple[Params, Dict[str, float]]:
     """Perform one CT-DDPG martingale update for a single model.
 
@@ -722,10 +817,15 @@ def ctddpg_update(
         The value and advantage branches descend partial gradients of
         mean(e_t^2)/2. The actor ascends
         J_pi = mean_t Psi(X_a.T x_t, pi(X_pi.T x_t)).
+        Multiplying the corresponding parameter increments by indicators
+        I_critic and I_actor permits exclusive update windows without changing
+        the measured losses. If I_critic = I_actor = 0, theta_plus = theta.
     Code map:
-        x_v and x_a take Cayley descent steps; h_v and h_a take Adam
-        descent steps. If update_actor is true, x_pi and h_pi take ascent
-        steps. The actor uses the newly updated advantage critic.
+        The Stiefel matrices use Cayley rates eta_X = encoder_lr_scale eta;
+        head Adam rates remain eta. update_critic guards every value/advantage
+        Cayley and Adam assignment, while update_actor guards every policy
+        assignment. The actor uses the newly updated advantage critic when
+        available and the unchanged critic otherwise.
     """
     (
         targets,
@@ -745,6 +845,13 @@ def ctddpg_update(
         horizon,
     )
     n_samples = targets.shape[0]
+    if start_time_weighting == "discounted":
+        start_weights = np.exp(-beta * dt * np.arange(n_samples))
+    elif start_time_weighting == "uniform":
+        start_weights = np.ones(n_samples)
+    else:
+        raise ValueError(f"Unknown start-time weighting: {start_time_weighting}")
+    start_weights_jax = jnp.asarray(start_weights)
     obs_fit = jnp.asarray(observations[:n_samples])
 
     value_loss, (grad_x_v, grad_h_v) = ops["value_grad"](
@@ -752,6 +859,7 @@ def ctddpg_update(
         params["h_v"],
         obs_fit,
         jnp.asarray(targets),
+        start_weights_jax,
     )
     advantage_loss, (grad_x_a, grad_h_a) = ops["advantage_grad"](
         params["x_a"],
@@ -760,39 +868,45 @@ def ctddpg_update(
         jnp.asarray(actions),
         jnp.asarray(pi_actions[:-1]),
         jnp.asarray(base_residual),
+        start_weights_jax,
         jnp.asarray(weights),
         jnp.asarray(dt),
     )
 
     updated = dict(params)
-    updated["x_v"] = cayley_ascent(params["x_v"], -grad_x_v, eta_critic)
-    (
-        updated["h_v"],
-        updated["adam_m_v"],
-        updated["adam_v_v"],
-        updated["adam_step_v"],
-    ) = tree_adam_step(
-        params["h_v"],
-        grad_h_v,
-        params["adam_m_v"],
-        params["adam_v_v"],
-        params["adam_step_v"],
-        eta_critic,
-    )
-    updated["x_a"] = cayley_ascent(params["x_a"], -grad_x_a, eta_advantage)
-    (
-        updated["h_a"],
-        updated["adam_m_a"],
-        updated["adam_v_a"],
-        updated["adam_step_a"],
-    ) = tree_adam_step(
-        params["h_a"],
-        grad_h_a,
-        params["adam_m_a"],
-        params["adam_v_a"],
-        params["adam_step_a"],
-        eta_advantage,
-    )
+    if update_critic:
+        updated["x_v"] = cayley_ascent(
+            params["x_v"], -grad_x_v, eta_critic * encoder_lr_scale
+        )
+        (
+            updated["h_v"],
+            updated["adam_m_v"],
+            updated["adam_v_v"],
+            updated["adam_step_v"],
+        ) = tree_adam_step(
+            params["h_v"],
+            grad_h_v,
+            params["adam_m_v"],
+            params["adam_v_v"],
+            params["adam_step_v"],
+            eta_critic,
+        )
+        updated["x_a"] = cayley_ascent(
+            params["x_a"], -grad_x_a, eta_advantage * encoder_lr_scale
+        )
+        (
+            updated["h_a"],
+            updated["adam_m_a"],
+            updated["adam_v_a"],
+            updated["adam_step_a"],
+        ) = tree_adam_step(
+            params["h_a"],
+            grad_h_a,
+            params["adam_m_a"],
+            params["adam_v_a"],
+            params["adam_step_a"],
+            eta_advantage,
+        )
 
     actor_objective, (grad_x_pi, grad_h_pi) = ops["actor_grad"](
         params["x_pi"],
@@ -800,9 +914,12 @@ def ctddpg_update(
         obs_fit,
         updated["x_a"],
         updated["h_a"],
+        start_weights_jax,
     )
     if update_actor:
-        updated["x_pi"] = cayley_ascent(params["x_pi"], grad_x_pi, eta_actor)
+        updated["x_pi"] = cayley_ascent(
+            params["x_pi"], grad_x_pi, eta_actor * encoder_lr_scale
+        )
         (
             updated["h_pi"],
             updated["adam_m_pi"],
@@ -827,6 +944,7 @@ def ctddpg_update(
         "grad_v_norm": float(jnp.linalg.norm(grad_x_v)),
         "grad_a_norm": float(jnp.linalg.norm(grad_x_a)),
         "actor_updated": float(update_actor),
+        "critic_updated": float(update_critic),
     }
 
 
@@ -838,11 +956,13 @@ def policy_numpy(
     """Evaluate the represented policy on a row batch of observations.
 
     Math:
-        z_i = X_pi.T x_i and a_i = h_pi(z_i).
+        z_i = X_pi.T x_i and a_i = pi_theta(z_i), where
+        pi_theta(z) = h_pi(z) for B=0 and
+        pi_theta(z) = B tanh(h_pi(z) / B) for B>0.
     Code map:
         observations is the row matrix O, params["x_pi"] is X_pi, so
-        O @ X_pi forms all z_i. ops["policy_batch"] is h_pi, and the
-        returned JAX actions are converted to NumPy.
+        O @ X_pi forms all z_i. ops["policy_batch"] applies pi_theta, and
+        the returned JAX actions are converted to NumPy.
     """
     z = jnp.asarray(observations) @ params["x_pi"]
     return np.asarray(ops["policy_batch"](params["h_pi"], z))
@@ -861,6 +981,7 @@ def collect_shared_batch(
     process_rng: np.random.Generator,
     exploration_rng: np.random.Generator,
     observation_rng: np.random.Generator,
+    initial_state: Optional[Array] = None,
 ) -> Tuple[Array, Array, Array, Array]:
     """Simulate one downstairs-behavior trajectory shared by both models.
 
@@ -872,14 +993,24 @@ def collect_shared_batch(
                   + transition_noise sqrt(dt) xi_s,t.
     Code map:
         process_rng, exploration_rng, and observation_rng draw xi_s, xi_a,
-        and xi_o. Return the same states, actions, and rewards used by both
-        learners, plus the upstairs observations.
+        and xi_o. initial_state supplies a shared s_0; None retains the legacy
+        s_0 = 0.5 * 1. Return the same states, actions, and rewards used by
+        both learners, plus the upstairs observations.
     """
     states = np.zeros((n_steps + 1, problem.ds))
     upstairs_observations = np.zeros((n_steps + 1, problem.d))
     actions = np.zeros((n_steps, problem.da))
     rewards = np.zeros((n_steps,))
-    states[0] = 0.5
+    if initial_state is None:
+        states[0] = 0.5
+    else:
+        initial_state_array = np.asarray(initial_state, dtype=float)
+        if initial_state_array.shape != (problem.ds,):
+            raise ValueError(
+                "initial_state must have shape "
+                f"({problem.ds},), got {initial_state_array.shape}"
+            )
+        states[0] = initial_state_array
 
     for t in range(n_steps):
         s = states[t]
@@ -920,11 +1051,12 @@ def collect_independent_batches(
     process_rng: np.random.Generator,
     exploration_rng: np.random.Generator,
     observation_rng: np.random.Generator,
+    initial_state: Optional[Array] = None,
 ) -> Dict[str, Array]:
     """Collect separate closed-loop batches using common exogenous noise.
 
     Math:
-        Both trajectories start at s_down,0 = s_up,0 = 0.5. Each model
+        Both trajectories start at a shared s_down,0 = s_up,0. Each model
         independently forms pi_down(s_down,t) and
         pi_up(M s_up,t + epsilon xi_o,t). Executed actions are
         a_b,t = clip(pi_b + exploration_std xi_a,t), for b in (down,up),
@@ -933,7 +1065,8 @@ def collect_independent_batches(
     Code map:
         Return separate underlying states, observations, deterministic policy
         actions, executed actions, and rewards. probe_up_observations lifts the
-        downstairs path for the unchanged shared-data one-step probe.
+        downstairs path for the unchanged shared-data one-step probe. A None
+        initial_state retains the legacy s_0 = 0.5 * 1.
     """
     down_states = np.zeros((n_steps + 1, problem.ds))
     up_states = np.zeros((n_steps + 1, problem.ds))
@@ -944,8 +1077,17 @@ def collect_independent_batches(
     up_actions = np.zeros((n_steps, problem.da))
     down_rewards = np.zeros((n_steps,))
     up_rewards = np.zeros((n_steps,))
-    down_states[0] = 0.5
-    up_states[0] = 0.5
+    if initial_state is None:
+        initial_state_array = np.full(problem.ds, 0.5)
+    else:
+        initial_state_array = np.asarray(initial_state, dtype=float)
+        if initial_state_array.shape != (problem.ds,):
+            raise ValueError(
+                "initial_state must have shape "
+                f"({problem.ds},), got {initial_state_array.shape}"
+            )
+    down_states[0] = initial_state_array
+    up_states[0] = initial_state_array
 
     process_innovations = process_rng.standard_normal((n_steps, problem.ds))
     exploration_innovations = exploration_rng.standard_normal((n_steps, problem.da))
@@ -1076,6 +1218,77 @@ def mean_reward(rewards: Array) -> float:
         unlike discounted_return, it has neither discount weights nor dt.
     """
     return float(np.mean(rewards))
+
+
+def actor_learning_rate(
+    base_rate: float,
+    head_type: str,
+    iteration: int,
+    warmup_iters: int,
+    total_iters: int,
+    mlp_schedule: str,
+    decay_start_iters: Optional[int] = None,
+    decay_end_iters: Optional[int] = None,
+) -> float:
+    """Resolve the deterministic actor step size at one iteration.
+
+    Math:
+        For the constant schedule, eta_pi(t) = eta_pi. For MLP cosine
+        decay on the half-open interval [t_start, t_end),
+
+            u_t = clip((t - t_start) / (t_end - 1 - t_start), 0, 1),
+            eta_pi(t) = eta_pi [1 + cos(pi u_t)] / 2.
+
+        When the optional endpoints are unset, t_start = t_warm and
+        t_end = T, exactly preserving the legacy schedule. Structured heads
+        retain their constant step. Applying the same scalar eta_pi(t)
+        upstairs and downstairs preserves Cayley equivariance.
+    Code map:
+        base_rate already includes mlp_actor_lr_scale. The returned rate is
+        passed to both the Stiefel encoder and Adam head actor steps.
+    """
+    if head_type != "mlp" or mlp_schedule == "constant":
+        return base_rate
+    if mlp_schedule != "cosine":
+        raise ValueError(f"Unknown MLP actor learning-rate schedule: {mlp_schedule}")
+    decay_start = warmup_iters if decay_start_iters is None else decay_start_iters
+    decay_end = total_iters if decay_end_iters is None else decay_end_iters
+    denominator = max(decay_end - 1 - decay_start, 1)
+    progress = np.clip((iteration - decay_start) / denominator, 0.0, 1.0)
+    return float(base_rate * 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+
+def exploration_standard_deviation(
+    initial_std: float,
+    final_std: float,
+    iteration: int,
+    decay_end_iters: int,
+    schedule: str,
+) -> float:
+    """Resolve behavior exploration at one outer iteration.
+
+    Math:
+        The constant schedule has sigma(t) = sigma_0. For cosine decay on
+        the half-open interval [0, t_end),
+
+            u_t = clip(t / (t_end - 1), 0, 1),
+            sigma(t) = sigma_f + (sigma_0 - sigma_f)
+                       [1 + cos(pi u_t)] / 2.
+
+        Thus iteration zero uses sigma_0 and the last iteration before the
+        exclusive decay end uses sigma_f.
+    Code map:
+        The returned scalar multiplies the common exploration innovation in
+        both upstairs and downstairs rollouts.
+    """
+    if schedule == "constant":
+        return initial_std
+    if schedule != "cosine":
+        raise ValueError(f"Unknown exploration schedule: {schedule}")
+    denominator = max(decay_end_iters - 1, 1)
+    progress = np.clip(iteration / denominator, 0.0, 1.0)
+    cosine_weight = 0.5 * (1.0 + np.cos(np.pi * progress))
+    return float(final_std + (initial_std - final_std) * cosine_weight)
 
 
 def discounted_returns(rewards: Array, beta: float, dt: float) -> Array:
@@ -1480,6 +1693,10 @@ def run_condition(
         independent_actions mode each model forms its own action, reward, and
         state path while sharing only exploration and process innovations:
         delta s_(t+1) = (I+dt G) delta s_t + dt H delta a_t.
+        With exclusive stop times t_pi and t_C, the update indicators are
+        I_pi(t) = 1[t < t_pi] and I_C(t) = 1[t < t_C]; a zero indicator
+        preserves that branch's full parameter and optimizer state while its
+        loss is still evaluated.
     Code map:
         The independent mode never synchronizes parameters. trajectory_gaps
         measures its pathwise state/action divergence; actual_update measures
@@ -1492,12 +1709,16 @@ def run_condition(
         head_type,
         args.hidden_dim,
         args.init_seed,
+        policy_output_scale=args.mlp_policy_output_scale,
+        value_output_scale=args.mlp_value_output_scale,
+        advantage_output_scale=args.mlp_advantage_output_scale,
     )
     n_steps = int(round(args.T / args.dt))
     condition_seed = args.noise_seed
     process_rng = np.random.default_rng(condition_seed)
     exploration_rng = np.random.default_rng(condition_seed + 1)
     observation_rng = np.random.default_rng(condition_seed + 2)
+    initial_state_rng = np.random.default_rng(condition_seed + 3)
     rows: List[Dict[str, float]] = []
     eta_actor = args.eta_actor
     if head_type == "mlp":
@@ -1540,6 +1761,24 @@ def run_condition(
     eval_return_zero, eval_return_zero_se = mean_and_standard_error(zero_returns)
 
     for iteration in range(args.iters):
+        if args.train_initial_state_std > 0.0:
+            initial_state = (
+                0.5
+                + args.train_initial_state_std
+                * initial_state_rng.standard_normal(problem.ds)
+            )
+        else:
+            # Preserve the exact legacy initial state and avoid an unnecessary
+            # random draw when randomization is disabled.
+            initial_state = np.full(problem.ds, 0.5)
+        current_exploration_std = exploration_standard_deviation(
+            args.exploration_std,
+            args.exploration_final_std,
+            iteration,
+            args.exploration_decay_end_iters,
+            args.exploration_schedule,
+        )
+
         if args.training_coupling == "shared_batch":
             states, upstairs_obs, actions, rewards = collect_shared_batch(
                 down,
@@ -1548,12 +1787,13 @@ def run_condition(
                 epsilon,
                 args.dt,
                 n_steps,
-                args.exploration_std,
+                current_exploration_std,
                 args.transition_noise,
                 args.action_clip,
                 process_rng,
                 exploration_rng,
                 observation_rng,
+                initial_state=initial_state,
             )
             down_states = states
             up_states = states
@@ -1573,12 +1813,13 @@ def run_condition(
                 epsilon,
                 args.dt,
                 n_steps,
-                args.exploration_std,
+                current_exploration_std,
                 args.transition_noise,
                 args.action_clip,
                 process_rng,
                 exploration_rng,
                 observation_rng,
+                initial_state=initial_state,
             )
             down_states = batches["down_states"]
             up_states = batches["up_states"]
@@ -1600,11 +1841,30 @@ def run_condition(
             up_actions,
         )
 
-        update_actor = iteration >= args.actor_warmup_iters
+        update_actor = iteration >= args.actor_warmup_iters and (
+            args.actor_stop_iters is None or iteration < args.actor_stop_iters
+        )
         if head_type == "mlp" and update_actor:
             update_actor = (
                 iteration - args.actor_warmup_iters
             ) % args.mlp_actor_update_every == 0
+        update_critic = (
+            args.critic_stop_iters is None or iteration < args.critic_stop_iters
+        )
+        current_eta_actor = actor_learning_rate(
+            eta_actor,
+            head_type,
+            iteration,
+            args.actor_warmup_iters,
+            args.iters,
+            args.mlp_actor_lr_schedule,
+            decay_start_iters=args.mlp_actor_lr_decay_start_iters,
+            decay_end_iters=(
+                args.actor_stop_iters
+                if args.mlp_actor_lr_decay_start_iters is not None
+                else None
+            ),
+        )
         down_before = down
         up_before = up
         down_after, down_stats = ctddpg_update(
@@ -1616,10 +1876,13 @@ def run_condition(
             args.beta,
             args.dt,
             args.n_steps,
-            eta_actor,
+            current_eta_actor,
             args.eta_critic,
             args.eta_advantage,
             update_actor,
+            update_critic=update_critic,
+            encoder_lr_scale=args.encoder_lr_scale,
+            start_time_weighting=args.start_time_weighting,
         )
         up_after, up_stats = ctddpg_update(
             up_before,
@@ -1630,10 +1893,13 @@ def run_condition(
             args.beta,
             args.dt,
             args.n_steps,
-            eta_actor,
+            current_eta_actor,
             args.eta_critic,
             args.eta_advantage,
             update_actor,
+            update_critic=update_critic,
+            encoder_lr_scale=args.encoder_lr_scale,
+            start_time_weighting=args.start_time_weighting,
         )
 
         # Counterfactual local probe: lift the downstairs model and batch.
@@ -1648,10 +1914,13 @@ def run_condition(
             args.beta,
             args.dt,
             args.n_steps,
-            eta_actor,
+            current_eta_actor,
             args.eta_critic,
             args.eta_advantage,
             update_actor,
+            update_critic=update_critic,
+            encoder_lr_scale=args.encoder_lr_scale,
+            start_time_weighting=args.start_time_weighting,
         )
         probe_update = update_discrepancy(
             down_before,
@@ -1749,6 +2018,16 @@ def run_condition(
         row = {
             "training_coupling": args.training_coupling,
             "head_type": head_type,
+            "action_curvature_scale": args.action_curvature_scale,
+            "encoder_lr_scale": args.encoder_lr_scale,
+            "policy_action_limit": (
+                args.mlp_policy_action_limit if head_type == "mlp" else 0.0
+            ),
+            "start_time_weighting": args.start_time_weighting,
+            "advantage_gradient": args.advantage_gradient,
+            "advantage_action_input_scale": (
+                args.mlp_advantage_action_input_scale if head_type == "mlp" else 1.0
+            ),
             "epsilon": float(epsilon),
             "iteration": iteration,
             # Backward-compatible alias used by existing aggregate scripts.
@@ -1777,6 +2056,9 @@ def run_condition(
             "down_martingale_residual_rms": down_stats["martingale_residual_rms"],
             "up_martingale_residual_rms": up_stats["martingale_residual_rms"],
             "actor_updated": down_stats["actor_updated"],
+            "critic_updated": down_stats["critic_updated"],
+            "actor_learning_rate": float(current_eta_actor if update_actor else 0.0),
+            "exploration_std_current": float(current_exploration_std),
             # DDPG maximizes actor_objective, so expose its negative using the
             # conventional minimization-oriented "policy loss" name.
             "down_policy_loss": -down_stats["actor_objective"],
@@ -1827,6 +2109,12 @@ def run_condition(
 CSV_FIELDS = (
     "training_coupling",
     "head_type",
+    "action_curvature_scale",
+    "encoder_lr_scale",
+    "policy_action_limit",
+    "start_time_weighting",
+    "advantage_gradient",
+    "advantage_action_input_scale",
     "epsilon",
     "iteration",
     "train_return",
@@ -1874,6 +2162,9 @@ CSV_FIELDS = (
     "down_martingale_residual_rms",
     "up_martingale_residual_rms",
     "actor_updated",
+    "critic_updated",
+    "actor_learning_rate",
+    "exploration_std_current",
     "critic_gradient_cosine",
     "critic_gradient_norm_ratio",
     "critic_gradient_mse",
@@ -1947,7 +2238,8 @@ def independent_action_summary(
 
     Math:
         Report final and maximum E_state, E_action, and E_rep, together with
-        mean last-50 training returns J_down and J_up and their paired gap.
+        mean last-50 discounted returns J_down and J_up, rollout mean rewards
+        r_bar_down and r_bar_up, and their paired gaps.
     Code map:
         Only epsilon=0 independent_actions rows enter. Fixed-bank returns are
         included at their final evaluated checkpoint.
@@ -2586,10 +2878,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument(
+        "--mlp-policy-output-scale",
+        type=float,
+        default=0.1,
+        help="Initialization scale of the MLP policy output layer.",
+    )
+    parser.add_argument(
+        "--mlp-value-output-scale",
+        type=float,
+        default=0.1,
+        help="Initialization scale of the MLP value output layer.",
+    )
+    parser.add_argument(
+        "--mlp-advantage-output-scale",
+        type=float,
+        default=0.1,
+        help="Initialization scale of the MLP advantage output layer.",
+    )
+    parser.add_argument(
+        "--mlp-advantage-action-input-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale c_a applied to the action only at the learned MLP_A input; "
+            "the physical action and -c_R a.T R a term are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--mlp-policy-action-limit",
+        type=float,
+        default=0.0,
+        help=(
+            "If positive, use B*tanh(raw/B) inside the MLP policy; zero "
+            "preserves the unbounded legacy policy."
+        ),
+    )
+    parser.add_argument(
         "--head-types",
         choices=("structured", "mlp"),
         nargs="+",
         default=("structured", "mlp"),
+    )
+    parser.add_argument(
+        "--action-curvature-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Coefficient c_R in Psi(z,a)=MLP_A([z,c_a a])-c_R a.T R a; "
+            "use 1 for curvature-assisted Stage 1 and 0 for pure-MLP Stage 2."
+        ),
     )
     parser.add_argument(
         "--training-coupling",
@@ -2616,6 +2953,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         help="Bootstrapping horizon in environment steps.",
     )
+    parser.add_argument(
+        "--start-time-weighting",
+        choices=("uniform", "discounted"),
+        default="uniform",
+        help=(
+            "Weight rollout start times uniformly (legacy replay view) or "
+            "by exp(-beta*t) (discounted time-zero objective)."
+        ),
+    )
+    parser.add_argument(
+        "--advantage-gradient",
+        choices=("full_window", "initial_semigradient"),
+        default="full_window",
+        help=(
+            "Differentiate the full Algorithm-1 martingale window or use "
+            "the paper's initial-time martingale-moment semigradient ablation."
+        ),
+    )
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--eta-actor", type=float, default=0.01)
     parser.add_argument(
@@ -2623,6 +2978,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="Multiplier on eta-actor for the more sensitive MLP policy.",
+    )
+    parser.add_argument(
+        "--mlp-actor-lr-schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+        help=(
+            "Schedule for the MLP actor rate after critic warm-up; cosine "
+            "decays smoothly to zero at the final iteration."
+        ),
+    )
+    parser.add_argument(
+        "--mlp-actor-lr-decay-start-iters",
+        type=int,
+        default=None,
+        help=(
+            "Optional absolute iteration at which MLP cosine actor decay "
+            "begins. When set, decay ends at actor-stop-iters (exclusive), "
+            "or iters if the actor has no stop. Omitted preserves the legacy "
+            "warmup-to-iters cosine schedule."
+        ),
     )
     parser.add_argument("--eta-critic", type=float, default=0.01)
     parser.add_argument(
@@ -2632,10 +3007,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Learning rate for the integrated advantage martingale gradient.",
     )
     parser.add_argument(
+        "--encoder-lr-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on all Stiefel Cayley step sizes; corresponding "
+            "head Adam learning rates are unchanged."
+        ),
+    )
+    parser.add_argument(
         "--mlp-actor-update-every",
         type=int,
-        default=8,
-        help="Delayed-policy-update interval for the MLP actor.",
+        default=16,
+        help=(
+            "Delayed-policy-update interval for the MLP actor; larger values "
+            "give the advantage critic more updates between actor moves."
+        ),
     )
     parser.add_argument(
         "--actor-warmup-iters",
@@ -2643,7 +3030,56 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         help="Critic-only iterations before deterministic policy updates.",
     )
+    parser.add_argument(
+        "--actor-stop-iters",
+        type=int,
+        default=None,
+        help=(
+            "Freeze the actor at this iteration while continuing critic "
+            "updates; omitted means update through the full run."
+        ),
+    )
+    parser.add_argument(
+        "--critic-stop-iters",
+        type=int,
+        default=None,
+        help=(
+            "Freeze all value/advantage Cayley and Adam state at this exclusive "
+            "iteration while continuing rollout and loss diagnostics; omitted "
+            "means update through the full run."
+        ),
+    )
     parser.add_argument("--exploration-std", type=float, default=0.1)
+    parser.add_argument(
+        "--exploration-schedule",
+        choices=("constant", "cosine"),
+        default="constant",
+        help="Behavior-exploration schedule; constant preserves legacy runs.",
+    )
+    parser.add_argument(
+        "--exploration-final-std",
+        type=float,
+        default=0.1,
+        help="Final behavior-exploration standard deviation for cosine decay.",
+    )
+    parser.add_argument(
+        "--exploration-decay-end-iters",
+        type=int,
+        default=None,
+        help=(
+            "Exclusive cosine-decay endpoint; defaults to critic-stop-iters "
+            "when positive, otherwise iters."
+        ),
+    )
+    parser.add_argument(
+        "--train-initial-state-std",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-iteration isotropic standard deviation around the legacy "
+            "training initial state 0.5; zero exactly preserves legacy runs."
+        ),
+    )
     parser.add_argument("--eval-exploration-std", type=float, default=0.0)
     parser.add_argument("--transition-noise", type=float, default=0.1)
     parser.add_argument("--action-clip", type=float, default=20.0)
@@ -2695,7 +3131,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
     Math:
         Require 1 <= k <= ds, dt > 0, T > 0, all learning rates > 0,
-        round(T/dt) >= n_steps, and every epsilon >= 0.
+        round(T/dt) >= n_steps, and every epsilon >= 0. For exclusive stop
+        times, require 0 <= t_C <= iters and t_warm < t_pi <= t_C when the
+        corresponding times are defined.
     Code map:
         If args.k is omitted it becomes ds. Invalid iteration, evaluation,
         delay, or warm-up counts also raise ValueError.
@@ -2713,6 +3151,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("all learning rates must be positive")
     if args.mlp_actor_lr_scale <= 0.0:
         raise ValueError("mlp-actor-lr-scale must be positive")
+    if args.encoder_lr_scale <= 0.0:
+        raise ValueError("encoder-lr-scale must be positive")
+    if args.action_curvature_scale < 0.0:
+        raise ValueError("action-curvature-scale must be nonnegative")
+    if args.mlp_policy_action_limit < 0.0:
+        raise ValueError("mlp-policy-action-limit must be nonnegative")
+    if args.mlp_advantage_action_input_scale <= 0.0:
+        raise ValueError("mlp-advantage-action-input-scale must be positive")
+    output_scales = (
+        args.mlp_policy_output_scale,
+        args.mlp_value_output_scale,
+        args.mlp_advantage_output_scale,
+    )
+    if any(scale < 0.0 for scale in output_scales):
+        raise ValueError("MLP output initialization scales must be nonnegative")
     if args.mlp_actor_update_every < 1:
         raise ValueError("mlp-actor-update-every must be positive")
     if int(round(args.T / args.dt)) < args.n_steps:
@@ -2721,6 +3174,59 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("iters must be positive")
     if args.actor_warmup_iters < 0:
         raise ValueError("actor-warmup-iters must be nonnegative")
+    if args.actor_stop_iters is not None and not (
+        args.actor_warmup_iters < args.actor_stop_iters <= args.iters
+    ):
+        raise ValueError("actor-stop-iters must be after warm-up and at most iters")
+    if args.critic_stop_iters is not None and not (
+        0 <= args.critic_stop_iters <= args.iters
+    ):
+        raise ValueError("critic-stop-iters must be between zero and iters")
+    if (
+        args.actor_stop_iters is not None
+        and args.critic_stop_iters is not None
+        and args.actor_stop_iters > args.critic_stop_iters
+    ):
+        raise ValueError("actor-stop-iters must not exceed critic-stop-iters")
+    if (
+        not np.isfinite(args.train_initial_state_std)
+        or args.train_initial_state_std < 0.0
+    ):
+        raise ValueError("train-initial-state-std must be finite and nonnegative")
+    exploration_stds = (args.exploration_std, args.exploration_final_std)
+    if any(not np.isfinite(value) or value < 0.0 for value in exploration_stds):
+        raise ValueError(
+            "exploration standard deviations must be finite and nonnegative"
+        )
+    if args.exploration_decay_end_iters is None:
+        args.exploration_decay_end_iters = (
+            args.critic_stop_iters
+            if args.critic_stop_iters is not None and args.critic_stop_iters > 0
+            else args.iters
+        )
+    if not 1 <= args.exploration_decay_end_iters <= args.iters:
+        raise ValueError("exploration-decay-end-iters must be between one and iters")
+    if args.exploration_schedule == "cosine" and args.exploration_decay_end_iters < 2:
+        raise ValueError(
+            "cosine exploration requires an exclusive decay end of at least two"
+        )
+    if args.mlp_actor_lr_decay_start_iters is not None:
+        if args.mlp_actor_lr_schedule != "cosine":
+            raise ValueError(
+                "mlp-actor-lr-decay-start-iters requires the cosine schedule"
+            )
+        actor_decay_end = (
+            args.actor_stop_iters if args.actor_stop_iters is not None else args.iters
+        )
+        if not (
+            args.actor_warmup_iters
+            <= args.mlp_actor_lr_decay_start_iters
+            < actor_decay_end - 1
+        ):
+            raise ValueError(
+                "mlp-actor-lr-decay-start-iters must be at or after warm-up "
+                "and at least two iterations before the exclusive actor end"
+            )
     if args.eval_every < 1 or args.log_every < 1:
         raise ValueError("eval-every and log-every must be positive")
     if args.eval_episodes < 1:
@@ -2774,7 +3280,18 @@ def main() -> None:
 
     all_rows: List[Dict[str, float]] = []
     for head_type in args.head_types:
-        ops = make_head_ops(head_type, problem.R)
+        ops = make_head_ops(
+            head_type,
+            problem.R,
+            action_curvature_scale=args.action_curvature_scale,
+            policy_action_limit=(
+                args.mlp_policy_action_limit if head_type == "mlp" else 0.0
+            ),
+            advantage_gradient=args.advantage_gradient,
+            advantage_action_input_scale=(
+                args.mlp_advantage_action_input_scale if head_type == "mlp" else 1.0
+            ),
+        )
         for epsilon in args.observation_noises:
             all_rows.extend(
                 run_condition(
